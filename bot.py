@@ -4,16 +4,20 @@ import asyncio
 import logging
 import threading
 import time
+import json
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
+
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
 )
+
 from telegram.constants import ParseMode
+
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -23,6 +27,7 @@ from telegram.ext import (
     filters,
 )
 
+
 # ============================================================
 # SOZLAMALAR
 # ============================================================
@@ -31,11 +36,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-
 PORT = int(os.getenv("PORT", "10000"))
-
-# PlayPay
-PLAYPAY_BASE_URL = "https://playpay.uz/api/v1"
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -44,13 +45,12 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================
-# SQLITE
-# ============================================================
-
 db_lock = threading.Lock()
 
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def db():
     conn = sqlite3.connect(
@@ -58,7 +58,9 @@ def db():
         check_same_thread=False,
         timeout=30
     )
+
     conn.row_factory = sqlite3.Row
+
     return conn
 
 
@@ -111,6 +113,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL UNIQUE,
                 api_key TEXT NOT NULL,
+                api_url TEXT DEFAULT '',
                 active INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -145,15 +148,21 @@ def init_db():
             )
         """)
 
-        # Default settings
         defaults = {
             "payment_card": "",
             "payment_name": "",
+            "price_1_day": "5000",
+            "price_3_day": "13000",
+            "price_7_day": "25000",
+            "price_1_month": "43000"
         }
 
         for key, value in defaults.items():
             conn.execute(
-                "INSERT OR IGNORE INTO settings(key, value) VALUES(?, ?)",
+                """
+                INSERT OR IGNORE INTO settings(key, value)
+                VALUES(?, ?)
+                """,
                 (key, value)
             )
 
@@ -162,20 +171,48 @@ def init_db():
 
 
 # ============================================================
-# YORDAMCHI FUNKSIYALAR
+# VAQT
 # ============================================================
 
-def now_str():
-    return datetime.now(timezone.utc).isoformat()
+def now_dt():
+    return datetime.now(timezone.utc)
 
+
+def now_str():
+    return now_dt().isoformat()
+
+
+def parse_dt(value):
+    try:
+        return datetime.fromisoformat(value)
+    except Exception:
+        return None
+
+
+def format_dt(value):
+    dt = parse_dt(value)
+
+    if not dt:
+        return value
+
+    return dt.astimezone(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
 
 def get_setting(key, default=""):
     with db_lock:
         conn = db()
+
         row = conn.execute(
             "SELECT value FROM settings WHERE key=?",
             (key,)
         ).fetchone()
+
         conn.close()
 
     if row:
@@ -187,21 +224,34 @@ def get_setting(key, default=""):
 def set_setting(key, value):
     with db_lock:
         conn = db()
-        conn.execute("""
+
+        conn.execute(
+            """
             INSERT INTO settings(key, value)
             VALUES(?, ?)
             ON CONFLICT(key)
             DO UPDATE SET value=excluded.value
-        """, (key, str(value)))
+            """,
+            (key, str(value))
+        )
+
         conn.commit()
         conn.close()
 
 
+# ============================================================
+# USERS
+# ============================================================
+
 def save_user(user):
+    if not user:
+        return
+
     with db_lock:
         conn = db()
 
-        conn.execute("""
+        conn.execute(
+            """
             INSERT INTO users(
                 user_id,
                 username,
@@ -210,16 +260,19 @@ def save_user(user):
                 created_at
             )
             VALUES(?, ?, ?, 0, ?)
+
             ON CONFLICT(user_id)
             DO UPDATE SET
                 username=excluded.username,
                 first_name=excluded.first_name
-        """, (
-            user.id,
-            user.username or "",
-            user.first_name or "",
-            now_str()
-        ))
+            """,
+            (
+                user.id,
+                user.username or "",
+                user.first_name or "",
+                now_str()
+            )
+        )
 
         conn.commit()
         conn.close()
@@ -228,10 +281,16 @@ def save_user(user):
 def get_user(user_id):
     with db_lock:
         conn = db()
+
         row = conn.execute(
-            "SELECT * FROM users WHERE user_id=?",
+            """
+            SELECT *
+            FROM users
+            WHERE user_id=?
+            """,
             (user_id,)
         ).fetchone()
+
         conn.close()
 
     return row
@@ -239,8 +298,10 @@ def get_user(user_id):
 
 def get_balance(user_id):
     row = get_user(user_id)
+
     if not row:
         return 0
+
     return int(row["balance"])
 
 
@@ -249,7 +310,11 @@ def change_balance(user_id, amount):
         conn = db()
 
         conn.execute(
-            "UPDATE users SET balance=balance+? WHERE user_id=?",
+            """
+            UPDATE users
+            SET balance=balance+?
+            WHERE user_id=?
+            """,
             (amount, user_id)
         )
 
@@ -257,18 +322,34 @@ def change_balance(user_id, amount):
         conn.close()
 
 
+# ============================================================
+# STATE
+# ============================================================
+
 def set_state(user_id, state, data=""):
     with db_lock:
         conn = db()
 
-        conn.execute("""
-            INSERT INTO user_states(user_id, state, data)
+        conn.execute(
+            """
+            INSERT INTO user_states(
+                user_id,
+                state,
+                data
+            )
             VALUES(?, ?, ?)
+
             ON CONFLICT(user_id)
             DO UPDATE SET
                 state=excluded.state,
                 data=excluded.data
-        """, (user_id, state, data))
+            """,
+            (
+                user_id,
+                state,
+                data
+            )
+        )
 
         conn.commit()
         conn.close()
@@ -279,7 +360,11 @@ def get_state(user_id):
         conn = db()
 
         row = conn.execute(
-            "SELECT * FROM user_states WHERE user_id=?",
+            """
+            SELECT *
+            FROM user_states
+            WHERE user_id=?
+            """,
             (user_id,)
         ).fetchone()
 
@@ -296,7 +381,10 @@ def clear_state(user_id):
         conn = db()
 
         conn.execute(
-            "DELETE FROM user_states WHERE user_id=?",
+            """
+            DELETE FROM user_states
+            WHERE user_id=?
+            """,
             (user_id,)
         )
 
@@ -305,7 +393,184 @@ def clear_state(user_id):
 
 
 # ============================================================
-# MENU
+# SUBSCRIPTION
+# ============================================================
+
+PLANS = {
+    "1_day": {
+        "name": "1 kun",
+        "days": 1,
+        "price_key": "price_1_day"
+    },
+    "3_day": {
+        "name": "3 kun",
+        "days": 3,
+        "price_key": "price_3_day"
+    },
+    "7_day": {
+        "name": "7 kun",
+        "days": 7,
+        "price_key": "price_7_day"
+    },
+    "1_month": {
+        "name": "1 oy",
+        "days": 30,
+        "price_key": "price_1_month"
+    }
+}
+
+
+def plan_price(plan):
+    if plan not in PLANS:
+        return 0
+
+    return int(
+        get_setting(
+            PLANS[plan]["price_key"],
+            "0"
+        )
+    )
+
+
+def expire_old_subscriptions():
+    current = now_dt().isoformat()
+
+    with db_lock:
+        conn = db()
+
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET status='expired'
+            WHERE status='active'
+            AND end_at<=?
+            """,
+            (current,)
+        )
+
+        conn.commit()
+        conn.close()
+
+
+def get_active_subscription(user_id):
+    expire_old_subscriptions()
+
+    with db_lock:
+        conn = db()
+
+        row = conn.execute(
+            """
+            SELECT *
+            FROM subscriptions
+            WHERE user_id=?
+            AND status='active'
+            AND end_at>?
+            ORDER BY end_at DESC
+            LIMIT 1
+            """,
+            (
+                user_id,
+                now_str()
+            )
+        ).fetchone()
+
+        conn.close()
+
+    return row
+
+
+def create_subscription(user_id, plan):
+    if plan not in PLANS:
+        return False, "Noto‘g‘ri tarif."
+
+    price = plan_price(plan)
+
+    if price <= 0:
+        return False, "Tarif narxi sozlanmagan."
+
+    balance = get_balance(user_id)
+
+    if balance < price:
+        return False, "BALANCE_LOW"
+
+    current = now_dt()
+
+    active = get_active_subscription(user_id)
+
+    if active:
+        old_end = parse_dt(active["end_at"])
+
+        if old_end and old_end > current:
+            start = old_end
+        else:
+            start = current
+    else:
+        start = current
+
+    end = start + timedelta(
+        days=PLANS[plan]["days"]
+    )
+
+    with db_lock:
+        conn = db()
+
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET status='expired'
+            WHERE user_id=?
+            AND status='active'
+            """,
+            (user_id,)
+        )
+
+        conn.execute(
+            """
+            INSERT INTO subscriptions(
+                user_id,
+                plan,
+                price,
+                start_at,
+                end_at,
+                status,
+                created_at
+            )
+            VALUES(?, ?, ?, ?, ?, 'active', ?)
+            """,
+            (
+                user_id,
+                plan,
+                price,
+                start.isoformat(),
+                end.isoformat(),
+                now_str()
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance=balance-?
+            WHERE user_id=?
+            """,
+            (
+                price,
+                user_id
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    return True, {
+        "price": price,
+        "start": start.isoformat(),
+        "end": end.isoformat()
+    }
+
+
+# ============================================================
+# MAIN MENU
 # ============================================================
 
 def main_menu():
@@ -368,6 +633,41 @@ def settings_menu():
     ])
 
 
+def subscription_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                f"1 kun — {plan_price('1_day'):,} so‘m",
+                callback_data="buy_1_day"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"3 kun — {plan_price('3_day'):,} so‘m",
+                callback_data="buy_3_day"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"7 kun — {plan_price('7_day'):,} so‘m",
+                callback_data="buy_7_day"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"1 oy — {plan_price('1_month'):,} so‘m",
+                callback_data="buy_1_month"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "⬅️ Orqaga",
+                callback_data="back_main"
+            )
+        ]
+    ])
+
+
 def admin_menu():
     return InlineKeyboardMarkup([
         [
@@ -404,6 +704,12 @@ def admin_menu():
         ],
         [
             InlineKeyboardButton(
+                "💵 Narxlar",
+                callback_data="admin_prices"
+            )
+        ],
+        [
+            InlineKeyboardButton(
                 "⬅️ Bosh menyu",
                 callback_data="back_main"
             )
@@ -424,17 +730,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user(user)
     clear_state(user.id)
 
-    text = (
+    await update.message.reply_text(
         "Assalomu Aleykum! 👋\n\n"
         "🤖 Telegram bot platformasiga xush kelibsiz.\n\n"
-        "Quyidagi menyudan kerakli bo‘limni tanlang:"
+        "Kerakli bo‘limni tanlang:",
+        reply_markup=main_menu()
     )
-
-    if update.message:
-        await update.message.reply_text(
-            text,
-            reply_markup=main_menu()
-        )
 
 
 # ============================================================
@@ -446,6 +747,8 @@ async def show_profile(query):
 
     row = get_user(user_id)
 
+    subscription = get_active_subscription(user_id)
+
     if not row:
         text = "Profil topilmadi."
     else:
@@ -455,8 +758,18 @@ async def show_profile(query):
             "👤 <b>Profil</b>\n\n"
             f"🆔 ID: <code>{user_id}</code>\n"
             f"👤 Username: @{username}\n"
-            f"💰 Balans: <b>{row['balance']:,} so‘m</b>"
+            f"💰 Balans: <b>{row['balance']:,} so‘m</b>\n\n"
         )
+
+        if subscription:
+            text += (
+                "💳 <b>Obuna</b>\n"
+                f"📦 Tarif: {PLANS.get(subscription['plan'], {}).get('name', subscription['plan'])}\n"
+                f"🟢 Boshlanishi: {format_dt(subscription['start_at'])}\n"
+                f"🔴 Tugashi: {format_dt(subscription['end_at'])}"
+            )
+        else:
+            text += "❌ Aktiv obuna yo‘q."
 
     await query.edit_message_text(
         text,
@@ -470,17 +783,11 @@ async def show_profile(query):
 # ============================================================
 
 async def show_balance(query):
-    user_id = query.from_user.id
-
-    balance = get_balance(user_id)
-
-    text = (
-        "💰 <b>Balansingiz</b>\n\n"
-        f"💵 {balance:,} so‘m"
-    )
+    balance = get_balance(query.from_user.id)
 
     await query.edit_message_text(
-        text,
+        "💰 <b>Balansingiz</b>\n\n"
+        f"💵 {balance:,} so‘m",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu()
     )
@@ -491,16 +798,13 @@ async def show_balance(query):
 # ============================================================
 
 async def show_help(query):
-    text = (
-        "ℹ️ <b>Yordam</b>\n\n"
-        "🤖 Bot yaratish — o‘zingizning Telegram botingizni ulash.\n\n"
-        "⚙️ Botni sozlash — API ulash va botlarni ko‘rish.\n\n"
-        "🔌 API ulash — PlayPay API Key ulash.\n\n"
-        "💳 Obuna sotib olish — hozircha ishlamaydi."
-    )
-
     await query.edit_message_text(
-        text,
+        "ℹ️ <b>Yordam</b>\n\n"
+        "🤖 Bot yaratish — Telegram botingizni ulash.\n\n"
+        "⚙️ Botni sozlash — API ulash va botlarni ko‘rish.\n\n"
+        "🔌 API ulash — o‘zingiz ishlatadigan API ma’lumotlarini ulash.\n\n"
+        "💳 Obuna sotib olish — platformadan foydalanish obunasini olish.\n\n"
+        "💰 Balans — hisobingizdagi mablag‘ni ko‘rish.",
         parse_mode=ParseMode.HTML,
         reply_markup=main_menu()
     )
@@ -511,50 +815,21 @@ async def show_help(query):
 # ============================================================
 
 async def start_api_connection(query):
-    user_id = query.from_user.id
-
-    set_state(user_id, "waiting_api_key")
-
-    text = (
-        "🔌 <b>API ulash</b>\n\n"
-        "PlayPay API Key'ingizni yuboring.\n\n"
-        "Masalan:\n"
-        "<code>pp_xxxxxxxxx</code>\n\n"
-        "❗ Secret Key kerak emas.\n"
-        "❗ Status endpoint kerak emas.\n"
-        "❗ Services endpoint kerak emas.\n\n"
-        "Faqat API Key yuboring."
+    set_state(
+        query.from_user.id,
+        "waiting_api_key"
     )
 
     await query.edit_message_text(
-        text,
+        "🔌 <b>API ulash</b>\n\n"
+        "API Key'ingizni yuboring.\n\n"
+        "Faqat o‘zingizga tegishli API Key'ni yuboring.\n\n"
+        "❗ Secret Key so‘ralmaydi.",
         parse_mode=ParseMode.HTML
     )
 
 
-def check_playpay_api_key(api_key):
-    """
-    PlayPay API Key bilan /games endpointini tekshiradi.
-    """
-
-    try:
-        response = requests.get(
-            f"{PLAYPAY_BASE_URL}/games",
-            headers={
-                "X-API-Key": api_key,
-                "Accept": "application/json"
-            },
-            timeout=15
-        )
-
-        return response
-
-    except requests.RequestException as e:
-        logger.error("PlayPay API error: %s", e)
-        return None
-
-
-async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_api_key(update, context):
     user_id = update.effective_user.id
 
     state, _ = get_state(user_id)
@@ -562,7 +837,9 @@ async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state != "waiting_api_key":
         return False
 
-    api_key = (update.message.text or "").strip()
+    api_key = (
+        update.message.text or ""
+    ).strip()
 
     if not api_key:
         await update.message.reply_text(
@@ -570,112 +847,68 @@ async def receive_api_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return True
 
-    if len(api_key) < 8:
-        await update.message.reply_text(
-            "❌ API Key noto‘g‘ri ko‘rinmoqda.\n\n"
-            "PlayPay API Key'ni qayta yuboring."
-        )
-        return True
+    with db_lock:
+        conn = db()
 
-    await update.message.reply_text(
-        "⏳ API Key tekshirilmoqda..."
-    )
+        current = now_str()
 
-    response = await asyncio.to_thread(
-        check_playpay_api_key,
-        api_key
-    )
-
-    if response is None:
-        await update.message.reply_text(
-            "❌ PlayPay serveriga ulanib bo‘lmadi.\n"
-            "Keyinroq qayta urinib ko‘ring."
-        )
-        return True
-
-    if response.status_code == 200:
-        with db_lock:
-            conn = db()
-
-            current_time = now_str()
-
-            conn.execute("""
-                INSERT INTO api_connections(
-                    user_id,
-                    api_key,
-                    active,
-                    created_at,
-                    updated_at
-                )
-                VALUES(?, ?, 1, ?, ?)
-                ON CONFLICT(user_id)
-                DO UPDATE SET
-                    api_key=excluded.api_key,
-                    active=1,
-                    updated_at=excluded.updated_at
-            """, (
+        conn.execute(
+            """
+            INSERT INTO api_connections(
                 user_id,
                 api_key,
-                current_time,
-                current_time
-            ))
+                api_url,
+                active,
+                created_at,
+                updated_at
+            )
+            VALUES(?, ?, '', 1, ?, ?)
 
-            conn.commit()
-            conn.close()
-
-        clear_state(user_id)
-
-        await update.message.reply_text(
-            "✅ <b>API muvaffaqiyatli ulandi!</b>\n\n"
-            "PlayPay API Key saqlandi.\n\n"
-            "Endi bu API Key sizning akkauntingizga tegishli.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=settings_menu()
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                api_key=excluded.api_key,
+                active=1,
+                updated_at=excluded.updated_at
+            """,
+            (
+                user_id,
+                api_key,
+                current,
+                current
+            )
         )
 
-        return True
+        conn.commit()
+        conn.close()
 
-    if response.status_code == 401:
-        await update.message.reply_text(
-            "❌ <b>API Key noto‘g‘ri yoki faol emas.</b>\n\n"
-            "PlayPay bergan faol <code>pp_...</code> API Key'ni yuboring.",
-            parse_mode=ParseMode.HTML
-        )
-        return True
-
-    try:
-        body = response.text[:500]
-    except Exception:
-        body = ""
+    clear_state(user_id)
 
     await update.message.reply_text(
-        f"❌ API xatosi: <b>{response.status_code}</b>\n\n"
-        f"<code>{body}</code>",
-        parse_mode=ParseMode.HTML
+        "✅ <b>API muvaffaqiyatli ulandi!</b>\n\n"
+        "API ma’lumotingiz saqlandi.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=settings_menu()
     )
 
     return True
 
 
 # ============================================================
-# BOT YARATISH
+# BOT TOKEN
 # ============================================================
 
 async def start_create_bot(query):
-    user_id = query.from_user.id
+    set_state(
+        query.from_user.id,
+        "waiting_bot_token"
+    )
 
-    set_state(user_id, "waiting_bot_token")
-
-    text = (
+    await query.edit_message_text(
         "🤖 <b>Bot yaratish</b>\n\n"
         "BotFather'dan olgan bot tokeningizni yuboring.\n\n"
         "Masalan:\n"
         "<code>123456789:AA...</code>\n\n"
-        "⚠️ Tokenni boshqa odamga yubormang."
-    )
-
-    await query.edit_message_text(
-        text,
+        "⚠️ Tokenni hech kimga bermang.",
         parse_mode=ParseMode.HTML
     )
 
@@ -698,7 +931,11 @@ def get_bot_info(token):
         return data.get("result")
 
     except Exception as e:
-        logger.error("getMe error: %s", e)
+        logger.error(
+            "getMe error: %s",
+            e
+        )
+
         return None
 
 
@@ -707,7 +944,11 @@ def bot_token_exists(token):
         conn = db()
 
         row = conn.execute(
-            "SELECT id FROM user_bots WHERE bot_token=?",
+            """
+            SELECT id
+            FROM user_bots
+            WHERE bot_token=?
+            """,
             (token,)
         ).fetchone()
 
@@ -716,7 +957,7 @@ def bot_token_exists(token):
     return row is not None
 
 
-async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_bot_token(update, context):
     user_id = update.effective_user.id
 
     state, _ = get_state(user_id)
@@ -724,11 +965,13 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if state != "waiting_bot_token":
         return False
 
-    token = (update.message.text or "").strip()
+    token = (
+        update.message.text or ""
+    ).strip()
 
     if not token:
         await update.message.reply_text(
-            "❌ Token yuboring."
+            "❌ Bot token yuboring."
         )
         return True
 
@@ -736,8 +979,7 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_state(user_id)
 
         await update.message.reply_text(
-            "❌ <b>Bu bot allaqachon qo‘shilgan.</b>\n\n"
-            "Bitta bot tokenini ikkinchi marta ulash mumkin emas.",
+            "❌ <b>Bu bot allaqachon qo‘shilgan.</b>",
             parse_mode=ParseMode.HTML,
             reply_markup=settings_menu()
         )
@@ -755,18 +997,22 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not info:
         await update.message.reply_text(
-            "❌ Bot token noto‘g‘ri yoki bot ishlamayapti.\n\n"
+            "❌ Bot token noto‘g‘ri.\n\n"
             "BotFather bergan tokenni qayta yuboring."
         )
         return True
 
-    bot_username = info.get("username", "")
+    username = info.get(
+        "username",
+        ""
+    )
 
     with db_lock:
         conn = db()
 
         try:
-            conn.execute("""
+            conn.execute(
+                """
                 INSERT INTO user_bots(
                     user_id,
                     bot_token,
@@ -775,12 +1021,14 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     active
                 )
                 VALUES(?, ?, ?, ?, 1)
-            """, (
-                user_id,
-                token,
-                bot_username,
-                now_str()
-            ))
+                """,
+                (
+                    user_id,
+                    token,
+                    username,
+                    now_str()
+                )
+            )
 
             conn.commit()
 
@@ -788,7 +1036,7 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.close()
 
             await update.message.reply_text(
-                "❌ Bu bot tokeni allaqachon tizimda mavjud."
+                "❌ Bu bot allaqachon tizimda mavjud."
             )
 
             return True
@@ -799,8 +1047,8 @@ async def receive_bot_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "✅ <b>Bot muvaffaqiyatli qo‘shildi!</b>\n\n"
-        f"🤖 @{bot_username}\n\n"
-        "Endi botingiz tizimga saqlandi.",
+        f"🤖 @{username}\n\n"
+        "Bot ma’lumotlari saqlandi.",
         parse_mode=ParseMode.HTML,
         reply_markup=settings_menu()
     )
@@ -818,19 +1066,22 @@ async def show_my_bots(query):
     with db_lock:
         conn = db()
 
-        rows = conn.execute("""
+        rows = conn.execute(
+            """
             SELECT *
             FROM user_bots
             WHERE user_id=?
             ORDER BY id DESC
-        """, (user_id,)).fetchall()
+            """,
+            (user_id,)
+        ).fetchall()
 
         conn.close()
 
     if not rows:
         text = (
             "🤖 <b>Mening botlarim</b>\n\n"
-            "Hozircha hech qanday bot qo‘shilmagan."
+            "Hozircha bot qo‘shilmagan."
         )
     else:
         lines = [
@@ -838,9 +1089,13 @@ async def show_my_bots(query):
         ]
 
         for row in rows:
-            username = row["bot_username"] or "Noma'lum"
+            username = row["bot_username"] or "Noma’lum"
 
-            status = "🟢 Aktiv" if row["active"] else "🔴 O‘chirilgan"
+            status = (
+                "🟢 Aktiv"
+                if row["active"]
+                else "🔴 O‘chirilgan"
+            )
 
             lines.append(
                 f"• @{username} — {status}"
@@ -857,33 +1112,376 @@ async def show_my_bots(query):
 
 # ============================================================
 # SUBSCRIPTION
-# HOZIRCHA ISHLAMAYDI
 # ============================================================
 
-async def subscription_disabled(query):
-    await query.answer(
-        "💳 Obuna sotib olish hozircha ishlamaydi.",
-        show_alert=True
+async def show_subscription(query):
+    active = get_active_subscription(
+        query.from_user.id
+    )
+
+    if active:
+        text = (
+            "💳 <b>Aktiv obuna mavjud</b>\n\n"
+            f"📦 Tarif: "
+            f"{PLANS.get(active['plan'], {}).get('name', active['plan'])}\n"
+            f"🟢 Boshlanishi: "
+            f"{format_dt(active['start_at'])}\n"
+            f"🔴 Tugashi: "
+            f"{format_dt(active['end_at'])}\n\n"
+            "Yangi obuna olsangiz, muddati "
+            "mavjud obunadan keyin davom etadi."
+        )
+    else:
+        text = (
+            "💳 <b>Obuna sotib olish</b>\n\n"
+            "Kerakli muddatni tanlang:"
+        )
+
+    await query.edit_message_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=subscription_menu()
+    )
+
+
+async def buy_subscription(query, plan):
+    user_id = query.from_user.id
+
+    price = plan_price(plan)
+
+    balance = get_balance(user_id)
+
+    if balance < price:
+        card = get_setting(
+            "payment_card",
+            ""
+        )
+
+        name = get_setting(
+            "payment_name",
+            ""
+        )
+
+        set_state(
+            user_id,
+            "waiting_payment_amount",
+            str(price)
+        )
+
+        text = (
+            "❌ <b>Balans yetarli emas.</b>\n\n"
+            f"📦 Tarif: {PLANS[plan]['name']}\n"
+            f"💵 Kerak: {price:,} so‘m\n"
+            f"💰 Balansingiz: {balance:,} so‘m\n\n"
+        )
+
+        if card:
+            text += (
+                "💳 <b>To‘lov uchun karta:</b>\n"
+                f"<code>{card}</code>\n"
+            )
+
+            if name:
+                text += f"👤 {name}\n"
+
+            text += (
+                "\nTo‘lovni amalga oshiring va "
+                "chek rasmini shu botga yuboring."
+            )
+        else:
+            text += (
+                "⚠️ Karta hali admin tomonidan "
+                "o‘rnatilmagan."
+            )
+
+        await query.edit_message_text(
+            text,
+            parse_mode=ParseMode.HTML
+        )
+
+        return
+
+    ok, result = create_subscription(
+        user_id,
+        plan
+    )
+
+    if not ok:
+        await query.answer(
+            result,
+            show_alert=True
+        )
+        return
+
+    clear_state(user_id)
+
+    await query.edit_message_text(
+        "✅ <b>Obuna muvaffaqiyatli olindi!</b>\n\n"
+        f"📦 Tarif: {PLANS[plan]['name']}\n"
+        f"💵 Narx: {result['price']:,} so‘m\n"
+        f"🟢 Boshlanishi: {format_dt(result['start'])}\n"
+        f"🔴 Tugashi: {format_dt(result['end'])}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu()
     )
 
 
 # ============================================================
-# ADMIN
+# RECEIPT
 # ============================================================
 
-async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def receive_receipt(update, context):
     user_id = update.effective_user.id
 
-    if user_id != ADMIN_ID:
+    state, data = get_state(user_id)
+
+    if state != "waiting_payment_amount":
+        return False
+
+    if not update.message.photo:
         await update.message.reply_text(
-            "❌ Siz admin emassiz."
+            "❌ Iltimos, to‘lov chekini rasm ko‘rinishida yuboring."
+        )
+        return True
+
+    try:
+        amount = int(data)
+    except Exception:
+        amount = 0
+
+    photo_id = update.message.photo[-1].file_id
+
+    with db_lock:
+        conn = db()
+
+        cursor = conn.execute(
+            """
+            INSERT INTO payments(
+                user_id,
+                amount,
+                photo_id,
+                status,
+                created_at
+            )
+            VALUES(?, ?, ?, 'pending', ?)
+            """,
+            (
+                user_id,
+                amount,
+                photo_id,
+                now_str()
+            )
+        )
+
+        payment_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+
+    clear_state(user_id)
+
+    await update.message.reply_text(
+        "✅ <b>Chek qabul qilindi.</b>\n\n"
+        f"💵 Summa: {amount:,} so‘m\n"
+        f"🧾 To‘lov №{payment_id}\n\n"
+        "Admin tekshirganidan keyin balansingizga "
+        "qo‘shiladi.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu()
+    )
+
+    if ADMIN_ID:
+        try:
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Tasdiqlash",
+                        callback_data=f"approve_payment_{payment_id}"
+                    ),
+                    InlineKeyboardButton(
+                        "❌ Rad etish",
+                        callback_data=f"reject_payment_{payment_id}"
+                    )
+                ]
+            ])
+
+            await context.bot.send_photo(
+                chat_id=ADMIN_ID,
+                photo=photo_id,
+                caption=(
+                    "💳 <b>Yangi to‘lov</b>\n\n"
+                    f"🧾 To‘lov: #{payment_id}\n"
+                    f"👤 User ID: <code>{user_id}</code>\n"
+                    f"💵 Summa: <b>{amount:,} so‘m</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard
+            )
+
+        except Exception as e:
+            logger.error(
+                "Admin receipt error: %s",
+                e
+            )
+
+    return True
+
+
+# ============================================================
+# ADMIN PAYMENT APPROVAL
+# ============================================================
+
+async def approve_payment(query):
+    try:
+        payment_id = int(
+            query.data.split("_")[-1]
+        )
+    except Exception:
+        await query.answer(
+            "Xato payment ID.",
+            show_alert=True
         )
         return
 
-    await update.message.reply_text(
-        "👑 <b>Admin panel</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_menu()
+    with db_lock:
+        conn = db()
+
+        payment = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE id=?
+            """,
+            (payment_id,)
+        ).fetchone()
+
+        if not payment:
+            conn.close()
+
+            await query.answer(
+                "To‘lov topilmadi.",
+                show_alert=True
+            )
+            return
+
+        if payment["status"] != "pending":
+            conn.close()
+
+            await query.answer(
+                "Bu to‘lov allaqachon ko‘rib chiqilgan.",
+                show_alert=True
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE payments
+            SET status='approved',
+                approved_at=?
+            WHERE id=?
+            """,
+            (
+                now_str(),
+                payment_id
+            )
+        )
+
+        conn.execute(
+            """
+            UPDATE users
+            SET balance=balance+?
+            WHERE user_id=?
+            """,
+            (
+                payment["amount"],
+                payment["user_id"]
+            )
+        )
+
+        conn.commit()
+        conn.close()
+
+    await query.edit_message_caption(
+        caption=(
+            "✅ <b>To‘lov tasdiqlandi.</b>\n\n"
+            f"🧾 #{payment_id}\n"
+            f"👤 {payment['user_id']}\n"
+            f"💵 {payment['amount']:,} so‘m"
+        ),
+        parse_mode=ParseMode.HTML
+    )
+
+    await query.answer(
+        "To‘lov tasdiqlandi."
+    )
+
+
+async def reject_payment(query):
+    try:
+        payment_id = int(
+            query.data.split("_")[-1]
+        )
+    except Exception:
+        await query.answer(
+            "Xato payment ID.",
+            show_alert=True
+        )
+        return
+
+    with db_lock:
+        conn = db()
+
+        payment = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            WHERE id=?
+            """,
+            (payment_id,)
+        ).fetchone()
+
+        if not payment:
+            conn.close()
+
+            await query.answer(
+                "To‘lov topilmadi.",
+                show_alert=True
+            )
+            return
+
+        if payment["status"] != "pending":
+            conn.close()
+
+            await query.answer(
+                "Bu to‘lov allaqachon ko‘rib chiqilgan.",
+                show_alert=True
+            )
+            return
+
+        conn.execute(
+            """
+            UPDATE payments
+            SET status='rejected'
+            WHERE id=?
+            """,
+            (payment_id,)
+        )
+
+        conn.commit()
+        conn.close()
+
+    await query.edit_message_caption(
+        caption=(
+            "❌ <b>To‘lov rad etildi.</b>\n\n"
+            f"🧾 #{payment_id}\n"
+            f"👤 {payment['user_id']}\n"
+            f"💵 {payment['amount']:,} so‘m"
+        ),
+        parse_mode=ParseMode.HTML
+    )
+
+    await query.answer(
+        "To‘lov rad etildi."
     )
 
 
@@ -892,43 +1490,89 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 
 async def admin_card(query):
-    card = get_setting("payment_card", "")
-
-    name = get_setting("payment_name", "")
-
-    text = (
-        "💳 <b>Karta</b>\n\n"
-        f"💳 Karta: <code>{card or 'O‘rnatilmagan'}</code>\n"
-        f"👤 Ism: {name or 'O‘rnatilmagan'}"
+    card = get_setting(
+        "payment_card",
+        ""
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "✏️ Karta o‘zgartirish",
-                callback_data="admin_set_card"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Admin panel",
-                callback_data="admin_panel"
-            )
-        ]
-    ])
+    name = get_setting(
+        "payment_name",
+        ""
+    )
 
     await query.edit_message_text(
-        text,
+        "💳 <b>Karta</b>\n\n"
+        f"💳 Karta: <code>{card or 'O‘rnatilmagan'}</code>\n"
+        f"👤 Ism: {name or 'O‘rnatilmagan'}",
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "✏️ Karta o‘zgartirish",
+                    callback_data="admin_set_card"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin_panel"
+                )
+            ]
+        ])
     )
 
 
 async def admin_set_card(query):
-    set_state(query.from_user.id, "admin_card")
+    set_state(
+        query.from_user.id,
+        "admin_card"
+    )
 
     await query.edit_message_text(
         "💳 Yangi karta raqamini yuboring."
+    )
+
+
+# ============================================================
+# ADMIN PRICES
+# ============================================================
+
+async def admin_prices(query):
+    await query.edit_message_text(
+        "💵 <b>Obuna narxlari</b>\n\n"
+        f"1 kun: {plan_price('1_day'):,} so‘m\n"
+        f"3 kun: {plan_price('3_day'):,} so‘m\n"
+        f"7 kun: {plan_price('7_day'):,} so‘m\n"
+        f"1 oy: {plan_price('1_month'):,} so‘m",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(
+                    "1 kun",
+                    callback_data="admin_price_1"
+                ),
+                InlineKeyboardButton(
+                    "3 kun",
+                    callback_data="admin_price_3"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "7 kun",
+                    callback_data="admin_price_7"
+                ),
+                InlineKeyboardButton(
+                    "1 oy",
+                    callback_data="admin_price_30"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "⬅️ Admin panel",
+                    callback_data="admin_panel"
+                )
+            ]
+        ])
     )
 
 
@@ -946,13 +1590,9 @@ async def admin_users(query):
 
         conn.close()
 
-    text = (
-        "👤 <b>Foydalanuvchilar</b>\n\n"
-        f"Jami: <b>{total}</b>"
-    )
-
     await query.edit_message_text(
-        text,
+        "👤 <b>Foydalanuvchilar</b>\n\n"
+        f"Jami: <b>{total}</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=admin_menu()
     )
@@ -974,23 +1614,75 @@ async def admin_stats(query):
             "SELECT COUNT(*) AS c FROM payments"
         ).fetchone()["c"]
 
+        approved = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS s
+            FROM payments
+            WHERE status='approved'
+            """
+        ).fetchone()["s"]
+
         bots = conn.execute(
             "SELECT COUNT(*) AS c FROM user_bots"
         ).fetchone()["c"]
 
-        api_count = conn.execute(
-            "SELECT COUNT(*) AS c FROM api_connections WHERE active=1"
+        subscriptions = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM subscriptions
+            WHERE status='active'
+            """
         ).fetchone()["c"]
 
         conn.close()
 
-    text = (
+    await query.edit_message_text(
         "📊 <b>Statistika</b>\n\n"
         f"👤 Foydalanuvchilar: {users}\n"
         f"💳 To‘lovlar: {payments}\n"
+        f"💵 Tasdiqlangan to‘lov: {approved:,} so‘m\n"
         f"🤖 Botlar: {bots}\n"
-        f"🔌 Aktiv API: {api_count}"
+        f"💳 Aktiv obunalar: {subscriptions}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_menu()
     )
+
+
+# ============================================================
+# ADMIN PAYMENTS
+# ============================================================
+
+async def admin_payments(query):
+    with db_lock:
+        conn = db()
+
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM payments
+            ORDER BY id DESC
+            LIMIT 20
+            """
+        ).fetchall()
+
+        conn.close()
+
+    if not rows:
+        text = "💳 To‘lovlar yo‘q."
+    else:
+        lines = [
+            "💳 <b>To‘lovlar</b>\n"
+        ]
+
+        for row in rows:
+            lines.append(
+                f"#{row['id']} | "
+                f"ID: {row['user_id']} | "
+                f"{row['amount']:,} so‘m | "
+                f"{row['status']}"
+            )
+
+        text = "\n".join(lines)
 
     await query.edit_message_text(
         text,
@@ -1014,57 +1706,28 @@ async def admin_balance_start(query, mode):
     )
 
 
-async def admin_payments(query):
-    with db_lock:
-        conn = db()
-
-        rows = conn.execute("""
-            SELECT *
-            FROM payments
-            ORDER BY id DESC
-            LIMIT 10
-        """).fetchall()
-
-        conn.close()
-
-    if not rows:
-        text = "💳 To‘lovlar yo‘q."
-    else:
-        lines = ["💳 <b>Oxirgi to‘lovlar</b>\n"]
-
-        for row in rows:
-            lines.append(
-                f"#{row['id']} | "
-                f"ID: {row['user_id']} | "
-                f"{row['amount']:,} so‘m | "
-                f"{row['status']}"
-            )
-
-        text = "\n".join(lines)
-
-    await query.edit_message_text(
-        text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_menu()
-    )
-
-
 # ============================================================
-# ADMIN MESSAGE STATE
+# ADMIN STATE
 # ============================================================
 
-async def process_admin_state(update: Update):
+async def process_admin_state(update):
     user_id = update.effective_user.id
 
     if user_id != ADMIN_ID:
         return False
 
-    state, _ = get_state(user_id)
+    state, data = get_state(user_id)
 
-    text = (update.message.text or "").strip()
+    text = (
+        update.message.text or ""
+    ).strip()
 
     if state == "admin_card":
-        set_setting("payment_card", text)
+        set_setting(
+            "payment_card",
+            text
+        )
+
         clear_state(user_id)
 
         await update.message.reply_text(
@@ -1074,44 +1737,76 @@ async def process_admin_state(update: Update):
 
         return True
 
-    if state == "admin_balance_plus":
+    if state.startswith("admin_price_"):
         try:
-            target_id = int(text)
+            amount = int(text)
 
-            set_state(
-                user_id,
-                "admin_balance_plus_amount",
-                str(target_id)
+            if amount <= 0:
+                raise ValueError
+
+            mapping = {
+                "admin_price_1": "price_1_day",
+                "admin_price_3": "price_3_day",
+                "admin_price_7": "price_7_day",
+                "admin_price_30": "price_1_month"
+            }
+
+            key = mapping.get(state)
+
+            if not key:
+                return True
+
+            set_setting(
+                key,
+                amount
             )
 
+            clear_state(user_id)
+
             await update.message.reply_text(
-                "💰 Endi qo‘shiladigan summani yuboring."
+                "✅ Narx saqlandi.",
+                reply_markup=admin_menu()
             )
 
         except ValueError:
             await update.message.reply_text(
-                "❌ Telegram ID raqam bo‘lishi kerak."
+                "❌ Narx raqam bo‘lishi kerak."
             )
 
         return True
 
-    if state == "admin_balance_minus":
+    if state in (
+        "admin_balance_plus",
+        "admin_balance_minus"
+    ):
         try:
             target_id = int(text)
 
+            if not get_user(target_id):
+                await update.message.reply_text(
+                    "❌ Bunday foydalanuvchi topilmadi."
+                )
+                return True
+
+            next_state = (
+                "admin_balance_plus_amount"
+                if state == "admin_balance_plus"
+                else "admin_balance_minus_amount"
+            )
+
             set_state(
                 user_id,
-                "admin_balance_minus_amount",
+                next_state,
                 str(target_id)
             )
 
             await update.message.reply_text(
-                "💰 Endi ayriladigan summani yuboring."
+                "💰 Summani yuboring."
             )
 
         except ValueError:
             await update.message.reply_text(
-                "❌ Telegram ID raqam bo‘lishi kerak."
+                "❌ ID raqam bo‘lishi kerak."
             )
 
         return True
@@ -1126,38 +1821,39 @@ async def process_admin_state(update: Update):
             if amount <= 0:
                 raise ValueError
 
-            _, data = get_state(user_id)
-
             target_id = int(data)
 
-            if not get_user(target_id):
-                clear_state(user_id)
+            if state == "admin_balance_plus_amount":
 
-                await update.message.reply_text(
-                    "❌ Bunday foydalanuvchi topilmadi."
+                change_balance(
+                    target_id,
+                    amount
                 )
 
-                return True
-
-            if state == "admin_balance_plus_amount":
-                change_balance(target_id, amount)
-
                 result = (
-                    f"✅ {target_id} balansiga "
-                    f"{amount:,} so‘m qo‘shildi."
+                    "✅ Balans qo‘shildi.\n\n"
+                    f"🆔 {target_id}\n"
+                    f"💰 +{amount:,} so‘m"
                 )
 
             else:
-                current = get_balance(target_id)
+
+                current = get_balance(
+                    target_id
+                )
 
                 if amount > current:
                     amount = current
 
-                change_balance(target_id, -amount)
+                change_balance(
+                    target_id,
+                    -amount
+                )
 
                 result = (
-                    f"✅ {target_id} balansidan "
-                    f"{amount:,} so‘m ayrildi."
+                    "✅ Balans ayrildi.\n\n"
+                    f"🆔 {target_id}\n"
+                    f"💰 -{amount:,} so‘m"
                 )
 
             clear_state(user_id)
@@ -1178,10 +1874,10 @@ async def process_admin_state(update: Update):
 
 
 # ============================================================
-# CALLBACKLAR
+# CALLBACKS
 # ============================================================
 
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def callbacks(update, context):
     query = update.callback_query
 
     await query.answer()
@@ -1192,10 +1888,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = query.data
 
-    # ----------------------------
     # MAIN
-    # ----------------------------
-
     if data == "back_main":
         clear_state(user_id)
 
@@ -1207,42 +1900,27 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    # ----------------------------
     # PROFILE
-    # ----------------------------
-
     if data == "profile":
         await show_profile(query)
         return
 
-    # ----------------------------
     # BALANCE
-    # ----------------------------
-
     if data == "balance":
         await show_balance(query)
         return
 
-    # ----------------------------
     # HELP
-    # ----------------------------
-
     if data == "help":
         await show_help(query)
         return
 
-    # ----------------------------
     # CREATE BOT
-    # ----------------------------
-
     if data == "create_bot":
         await start_create_bot(query)
         return
 
-    # ----------------------------
     # SETTINGS
-    # ----------------------------
-
     if data == "settings":
         await query.edit_message_text(
             "⚙️ <b>Botni sozlash</b>",
@@ -1251,34 +1929,37 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ----------------------------
-    # CONNECT API
-    # ----------------------------
-
+    # API
     if data == "connect_api":
         await start_api_connection(query)
         return
 
-    # ----------------------------
     # MY BOTS
-    # ----------------------------
-
     if data == "my_bots":
         await show_my_bots(query)
         return
 
-    # ----------------------------
     # SUBSCRIPTION
-    # ----------------------------
-
     if data == "subscription":
-        await subscription_disabled(query)
+        await show_subscription(query)
         return
 
-    # ----------------------------
-    # ADMIN
-    # ----------------------------
+    if data.startswith("buy_"):
+        plan = data.replace(
+            "buy_",
+            "",
+            1
+        )
 
+        if plan in PLANS:
+            await buy_subscription(
+                query,
+                plan
+            )
+
+        return
+
+    # ADMIN ONLY
     if user_id != ADMIN_ID:
         return
 
@@ -1290,6 +1971,7 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML,
             reply_markup=admin_menu()
         )
+
         return
 
     if data == "admin_card":
@@ -1298,6 +1980,10 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "admin_set_card":
         await admin_set_card(query)
+        return
+
+    if data == "admin_prices":
+        await admin_prices(query)
         return
 
     if data == "admin_users":
@@ -1326,12 +2012,33 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("approve_payment_"):
+        await approve_payment(query)
+        return
+
+    if data.startswith("reject_payment_"):
+        await reject_payment(query)
+        return
+
+    if data.startswith("admin_price_"):
+        set_state(
+            user_id,
+            data
+        )
+
+        await query.edit_message_text(
+            "💵 Yangi narxni yuboring.\n\n"
+            "Masalan: 5000"
+        )
+
+        return
+
 
 # ============================================================
-# TEXT HANDLER
+# PHOTO HANDLER
 # ============================================================
 
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def photo_handler(update, context):
     user = update.effective_user
 
     if not user:
@@ -1339,22 +2046,63 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     save_user(user)
 
-    # Admin state
+    handled = await receive_receipt(
+        update,
+        context
+    )
+
+    if handled:
+        return
+
+
+# ============================================================
+# TEXT HANDLER
+# ============================================================
+
+async def text_handler(update, context):
+    user = update.effective_user
+
+    if not user:
+        return
+
+    save_user(user)
+
+    # ADMIN STATE
     if user.id == ADMIN_ID:
-        handled = await process_admin_state(update)
+
+        handled = await process_admin_state(
+            update
+        )
 
         if handled:
             return
 
-    # User state
-    state, _ = get_state(user.id)
+    state, _ = get_state(
+        user.id
+    )
 
+    # API
     if state == "waiting_api_key":
-        await receive_api_key(update, context)
+        await receive_api_key(
+            update,
+            context
+        )
         return
 
+    # BOT TOKEN
     if state == "waiting_bot_token":
-        await receive_bot_token(update, context)
+        await receive_bot_token(
+            update,
+            context
+        )
+        return
+
+    # Payment amount state
+    if state == "waiting_payment_amount":
+        await update.message.reply_text(
+            "❗ Avval to‘lovni amalga oshiring va "
+            "chek rasmini yuboring."
+        )
         return
 
 
@@ -1362,8 +2110,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ADMIN COMMAND
 # ============================================================
 
-async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_command(update, context):
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text(
+            "❌ Siz admin emassiz."
+        )
         return
 
     await update.message.reply_text(
@@ -1374,17 +2125,34 @@ async def admin_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# RENDER HEALTH SERVER
+# SUBSCRIPTION EXPIRY CHECK
+# ============================================================
+
+async def subscription_checker(context):
+    try:
+        expire_old_subscriptions()
+    except Exception as e:
+        logger.error(
+            "Subscription checker error: %s",
+            e
+        )
+
+
+# ============================================================
+# RENDER HEALTH
 # ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
+
         self.send_response(200)
+
         self.send_header(
             "Content-Type",
             "text/plain; charset=utf-8"
         )
+
         self.end_headers()
 
         self.wfile.write(
@@ -1396,9 +2164,14 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+
     try:
+
         server = HTTPServer(
-            ("0.0.0.0", PORT),
+            (
+                "0.0.0.0",
+                PORT
+            ),
             HealthHandler
         )
 
@@ -1410,6 +2183,7 @@ def start_health_server():
         server.serve_forever()
 
     except Exception as e:
+
         logger.error(
             "Health server error: %s",
             e
@@ -1423,11 +2197,13 @@ def start_health_server():
 def main():
 
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN Render Environment Variables'da yo‘q!"
         )
 
     if ADMIN_ID == 0:
+
         raise RuntimeError(
             "ADMIN_ID Render Environment Variables'da noto‘g‘ri!"
         )
@@ -1446,21 +2222,37 @@ def main():
         .build()
     )
 
-    # Commands
+    # COMMANDS
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler(
+            "start",
+            start
+        )
     )
 
     application.add_handler(
-        CommandHandler("admin", admin_command)
+        CommandHandler(
+            "admin",
+            admin_command
+        )
     )
 
-    # Callback buttons
+    # CALLBACKS
     application.add_handler(
-        CallbackQueryHandler(callbacks)
+        CallbackQueryHandler(
+            callbacks
+        )
     )
 
-    # Text messages
+    # PHOTOS / CHEKS
+    application.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            photo_handler
+        )
+    )
+
+    # TEXT
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1468,13 +2260,26 @@ def main():
         )
     )
 
-    logger.info("Bot ishga tushmoqda...")
+    # OBUNA TEKSHIRUVI
+    application.job_queue.run_repeating(
+        subscription_checker,
+        interval=60,
+        first=10
+    )
+
+    logger.info(
+        "Bot ishga tushmoqda..."
+    )
 
     application.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES
     )
 
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
