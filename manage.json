@@ -1,0 +1,12 @@
+{
+  "payment_card": "",
+  "payment_name": "",
+  "prices": {
+    "1_day": 5000,
+    "3_day": 13000,
+    "7_day": 25000,
+    "1_month": 43000
+  },
+  "welcome_text": "Assalomu Aleykum!",
+  "support_text": "Yordam uchun administratorga murojaat qiling."
+}
