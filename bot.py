@@ -686,21 +686,20 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --------------------------------------------------------
     # CREATE BOT
-    # --------------------------------------------------------
-
+    # -------------------------------------------------
     if data == "create_bot":
-        context.user_data["state"] = "waiting_bot_token"
+    context.user_data["state"] = "waiting_bot_token"
 
-        await query.edit_message_text(
-            "🤖 <b>Bot yaratish</b>\n\n"
-            "BotFather orqali bot yarating va "
-            "bot tokenini shu yerga yuboring.\n\n"
-            "Masalan:\n"
-            "<code>123456:ABC...</code>",
-            parse_mode="HTML",
-            reply_markup=back_menu(),
-        )
-        return
+    await query.edit_message_text(
+        "🤖 <b>Bot yaratish</b>\n\n"
+        "1️⃣ Telegram'da @BotFather orqali bot yarating.\n"
+        "2️⃣ BotFather bergan TOKENni oling.\n"
+        "3️⃣ Shu yerga TOKENni yuboring.\n\n"
+        "⚠️ Tokenni boshqa odamlarga bermang.",
+        parse_mode="HTML",
+        reply_markup=back_menu(),
+    )
+    return
 
     # --------------------------------------------------------
     # BOT SETTINGS
