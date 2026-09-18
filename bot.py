@@ -3,14 +3,18 @@ import json
 import sqlite3
 import asyncio
 import logging
-import threading
-from datetime import datetime, timedelta, timezone
+import uuid
+from decimal import Decimal, InvalidOperation
+from datetime import datetime
+from threading import Thread
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import requests
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    BotCommand,
 )
 from telegram.ext import (
     Application,
@@ -21,83 +25,43 @@ from telegram.ext import (
     filters,
 )
 
-
 # ============================================================
-# CONFIG
-# ============================================================
-
-MAIN_BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-
-try:
-    ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-except Exception:
-    ADMIN_ID = 0
-
-PAYMENT_CARD = os.getenv(
-    "PAYMENT_CARD",
-    "KARTA_RAQAMINI_RENDER_ENVGA_QOYING"
-).strip()
-
-DB_PATH = os.getenv(
-    "DB_PATH",
-    os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "bots.db"
-    )
-)
-
-try:
-    PORT = int(os.getenv("PORT", "10000"))
-except Exception:
-    PORT = 10000
-
-
-# ============================================================
-# SUBSCRIPTION PRICES
+# SOZLAMALAR
 # ============================================================
 
-SUBSCRIPTIONS = {
-    "1d": {
-        "name": "1 kun",
-        "days": 1,
-        "price": 5000,
-    },
-    "3d": {
-        "name": "3 kun",
-        "days": 3,
-        "price": 13000,
-    },
-    "7d": {
-        "name": "7 kun",
-        "days": 7,
-        "price": 25000,
-    },
-    "1m": {
-        "name": "1 oy",
-        "days": 30,
-        "price": 43000,
-    },
-}
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-
-# ============================================================
-# LOGGING
-# ============================================================
+DB_FILE = "bot.db"
+CONFIG_FILE = "manage.json"
 
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
-
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# RUNNING CHILD BOTS
+# RENDER HEALTH SERVER
 # ============================================================
 
-running_bots = {}
-running_tasks = {}
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"API ORDER BOT OK")
+
+    def log_message(self, format, *args):
+        return
+
+
+def start_health_server():
+    port = int(os.getenv("PORT", "10000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info("Health server started on port %s", port)
+    server.serve_forever()
 
 
 # ============================================================
@@ -105,2652 +69,1849 @@ running_tasks = {}
 # ============================================================
 
 def db():
-    conn = sqlite3.connect(
-        DB_PATH,
-        timeout=30
-    )
+    conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db():
-
-    db_dir = os.path.dirname(
-        os.path.abspath(DB_PATH)
-    )
-
-    os.makedirs(
-        db_dir,
-        exist_ok=True
-    )
-
     conn = db()
+    cur = conn.cursor()
 
-    # --------------------------------------------------------
-    # USERS
-    # --------------------------------------------------------
-
-    conn.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
-            username TEXT DEFAULT '',
-            first_name TEXT DEFAULT '',
-            balance INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            username TEXT,
+            first_name TEXT,
+            created_at TEXT NOT NULL
         )
     """)
 
-    # Existing DB migration
-    try:
-        conn.execute(
-            "ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0"
-        )
-    except sqlite3.OperationalError:
-        pass
-
-    # --------------------------------------------------------
-    # BOTS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS bots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            owner_id INTEGER NOT NULL,
-            token TEXT NOT NULL UNIQUE,
-            bot_id INTEGER,
-            username TEXT DEFAULT '',
-            name TEXT DEFAULT '',
-            start_text TEXT DEFAULT 'Assalomu Aleykum! 👋',
-            active INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS admins (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            added_at TEXT NOT NULL
         )
     """)
 
-    # --------------------------------------------------------
-    # SERVICES
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS services (
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS api_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
             name TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            price INTEGER NOT NULL DEFAULT 0,
+            base_url TEXT NOT NULL,
+            api_key TEXT NOT NULL,
+            balance_url TEXT DEFAULT '',
+            catalog_url TEXT DEFAULT '',
+            order_url TEXT DEFAULT '',
+            markup_uzs INTEGER DEFAULT 0,
             active INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT NOT NULL
         )
     """)
 
-    # --------------------------------------------------------
-    # CUSTOM BUTTONS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS custom_buttons (
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS products (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            text TEXT NOT NULL,
-            active INTEGER DEFAULT 1
-        )
-    """)
-
-    # --------------------------------------------------------
-    # BOT SETTINGS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS bot_settings (
-            bot_id INTEGER PRIMARY KEY,
-            welcome_text TEXT DEFAULT 'Assalomu Aleykum! 👋'
-        )
-    """)
-
-    # --------------------------------------------------------
-    # PAYMENTS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            bot_db_id INTEGER DEFAULT 0,
-            amount INTEGER NOT NULL DEFAULT 0,
-            photo_id TEXT DEFAULT '',
-            status TEXT DEFAULT 'pending',
-            source TEXT DEFAULT 'main',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            processed_at TEXT DEFAULT '',
-            processed_by INTEGER DEFAULT 0
-        )
-    """)
-
-    # --------------------------------------------------------
-    # SUBSCRIPTIONS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bot_db_id INTEGER NOT NULL UNIQUE,
-            owner_id INTEGER NOT NULL,
-            plan TEXT NOT NULL,
-            start_at TEXT NOT NULL,
-            end_at TEXT NOT NULL,
+            api_id INTEGER NOT NULL,
+            external_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            api_price REAL DEFAULT 0,
+            sale_price REAL DEFAULT 0,
             active INTEGER DEFAULT 1,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            UNIQUE(api_id, external_id)
         )
     """)
 
-    # --------------------------------------------------------
-    # BALANCE HISTORY
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS balance_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            description TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    # --------------------------------------------------------
-    # ORDERS
-    # --------------------------------------------------------
-
-    conn.execute("""
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            bot_db_id INTEGER NOT NULL,
-            service_id INTEGER NOT NULL,
-            amount INTEGER NOT NULL,
-            status TEXT DEFAULT 'paid',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            api_id INTEGER,
+            product_id INTEGER,
+            product_name TEXT,
+            external_product_id TEXT,
+            player_data TEXT,
+            delivery_type TEXT,
+            api_price REAL DEFAULT 0,
+            sale_price REAL DEFAULT 0,
+            status TEXT DEFAULT 'pending',
+            provider_order_id TEXT DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         )
     """)
-
-    # --------------------------------------------------------
-    # SETTINGS
-    # --------------------------------------------------------
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT DEFAULT ''
-        )
-    """)
-
-    # Save card if not exists
-    conn.execute("""
-        INSERT OR IGNORE INTO settings
-        (key, value)
-        VALUES ('payment_card', ?)
-    """, (PAYMENT_CARD,))
 
     conn.commit()
     conn.close()
 
 
 # ============================================================
-# TIME
+# CONFIG
 # ============================================================
 
-def now_utc():
-    return datetime.now(timezone.utc)
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {
+            "settings": {
+                "payment_card": "",
+                "payment_owner": ""
+            }
+        }
 
-
-def iso_now():
-    return now_utc().isoformat()
-
-
-def parse_time(value):
     try:
-        return datetime.fromisoformat(value)
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception:
-        return None
+        return {
+            "settings": {
+                "payment_card": "",
+                "payment_owner": ""
+            }
+        }
 
 
 # ============================================================
-# USER FUNCTIONS
+# USER
 # ============================================================
 
 def save_user(user):
-
     conn = db()
-
     conn.execute("""
-        INSERT INTO users
-        (
-            user_id,
-            username,
-            first_name
-        )
-        VALUES (?, ?, ?)
+        INSERT INTO users(user_id, username, first_name, created_at)
+        VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id) DO UPDATE SET
-            username = excluded.username,
-            first_name = excluded.first_name
+            username=excluded.username,
+            first_name=excluded.first_name
     """, (
         user.id,
         user.username or "",
         user.first_name or "",
+        datetime.now().isoformat()
     ))
-
     conn.commit()
     conn.close()
 
 
-def get_balance(user_id):
+def is_admin(user_id):
+    if user_id == ADMIN_ID:
+        return True
 
     conn = db()
-
-    row = conn.execute("""
-        SELECT balance
-        FROM users
-        WHERE user_id = ?
-    """, (user_id,)).fetchone()
-
+    row = conn.execute(
+        "SELECT 1 FROM admins WHERE user_id=?",
+        (user_id,)
+    ).fetchone()
     conn.close()
 
-    if not row:
-        return 0
-
-    return int(row["balance"] or 0)
-
-
-def change_balance(
-    user_id,
-    amount,
-    history_type,
-    description=""
-):
-
-    conn = db()
-
-    conn.execute("""
-        INSERT INTO users
-        (
-            user_id,
-            balance
-        )
-        VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            balance = balance + excluded.balance
-    """, (
-        user_id,
-        amount,
-    ))
-
-    conn.execute("""
-        INSERT INTO balance_history
-        (
-            user_id,
-            amount,
-            type,
-            description
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        user_id,
-        amount,
-        history_type,
-        description,
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return get_balance(user_id)
+    return row is not None
 
 
 # ============================================================
-# BOT DATABASE
+# COMMANDS
 # ============================================================
 
-def save_bot(
-    owner_id,
-    token,
-    bot_id,
-    username,
-    name
-):
+async def setup_commands(application):
+    user_commands = [
+        BotCommand("start", "Botni ishga tushirish"),
+        BotCommand("help", "Yordam"),
+        BotCommand("profile", "Profil"),
+        BotCommand("balance", "Balans"),
+        BotCommand("order", "Buyurtma"),
+    ]
+
+    admin_commands = [
+        BotCommand("start", "Botni ishga tushirish"),
+        BotCommand("help", "Yordam"),
+        BotCommand("profile", "Profil"),
+        BotCommand("balance", "Balans"),
+        BotCommand("admin", "Admin panel"),
+    ]
+
+    await application.bot.set_my_commands(user_commands)
+
+    # Telegram Bot API scope orqali admin uchun alohida command
+    for uid in get_all_admin_ids():
+        try:
+            from telegram import BotCommandScopeChat
+
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope=BotCommandScopeChat(uid)
+            )
+        except Exception as e:
+            logger.warning("Admin command scope error: %s", e)
+
+
+def get_all_admin_ids():
+    ids = {ADMIN_ID}
 
     conn = db()
-
-    conn.execute("""
-        INSERT INTO bots
-        (
-            owner_id,
-            token,
-            bot_id,
-            username,
-            name,
-            active
-        )
-        VALUES (?, ?, ?, ?, ?, 1)
-        ON CONFLICT(token) DO UPDATE SET
-            owner_id = excluded.owner_id,
-            bot_id = excluded.bot_id,
-            username = excluded.username,
-            name = excluded.name,
-            active = 1
-    """, (
-        owner_id,
-        token,
-        bot_id,
-        username or "",
-        name or "",
-    ))
-
-    conn.commit()
-
-    row = conn.execute("""
-        SELECT id
-        FROM bots
-        WHERE token = ?
-    """, (token,)).fetchone()
-
+    rows = conn.execute(
+        "SELECT user_id FROM admins"
+    ).fetchall()
     conn.close()
 
-    return row["id"]
+    for row in rows:
+        ids.add(row["user_id"])
 
-
-def get_bot(bot_db_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM bots
-        WHERE id = ?
-    """, (bot_db_id,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def get_user_bots(user_id):
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM bots
-        WHERE owner_id = ?
-        ORDER BY id DESC
-    """, (user_id,)).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def get_active_bots():
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM bots
-        WHERE active = 1
-    """).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def user_owns_bot(user_id, bot_db_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT id
-        FROM bots
-        WHERE id = ?
-        AND owner_id = ?
-    """, (
-        bot_db_id,
-        user_id,
-    )).fetchone()
-
-    conn.close()
-
-    return bool(row)
-
-
-# ============================================================
-# SUBSCRIPTION
-# ============================================================
-
-def get_subscription(bot_db_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM subscriptions
-        WHERE bot_db_id = ?
-    """, (bot_db_id,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def subscription_active(bot_db_id):
-
-    sub = get_subscription(bot_db_id)
-
-    if not sub:
-        return False
-
-    if not int(sub["active"] or 0):
-        return False
-
-    end = parse_time(sub["end_at"])
-
-    if not end:
-        return False
-
-    if end <= now_utc():
-
-        conn = db()
-
-        conn.execute("""
-            UPDATE subscriptions
-            SET active = 0
-            WHERE bot_db_id = ?
-        """, (bot_db_id,))
-
-        conn.commit()
-        conn.close()
-
-        return False
-
-    return True
-
-
-def subscription_text(bot_db_id):
-
-    sub = get_subscription(bot_db_id)
-
-    if not sub:
-        return (
-            "🔒 Obuna yo‘q.\n\n"
-            "Bot ishlashi uchun obuna sotib oling."
-        )
-
-    end = parse_time(sub["end_at"])
-
-    if not end or end <= now_utc():
-
-        return (
-            "🔴 Obuna muddati tugagan.\n\n"
-            "Bot ishlashi uchun yangi obuna oling."
-        )
-
-    remaining = end - now_utc()
-
-    days = remaining.days
-    hours = remaining.seconds // 3600
-
-    return (
-        f"🟢 Obuna faol\n\n"
-        f"📦 Tarif: {SUBSCRIPTIONS.get(sub['plan'], {}).get('name', sub['plan'])}\n"
-        f"📅 Tugash vaqti: {end.astimezone().strftime('%Y-%m-%d %H:%M')}\n"
-        f"⏳ Qolgan: {days} kun {hours} soat"
-    )
-
-
-def activate_subscription(
-    bot_db_id,
-    owner_id,
-    plan
-):
-
-    if plan not in SUBSCRIPTIONS:
-        return False, "Tarif topilmadi."
-
-    info = SUBSCRIPTIONS[plan]
-
-    current = get_subscription(bot_db_id)
-
-    current_end = None
-
-    if current:
-        current_end = parse_time(
-            current["end_at"]
-        )
-
-    current_now = now_utc()
-
-    if current_end and current_end > current_now:
-        start = current_end
-    else:
-        start = current_now
-
-    end = start + timedelta(
-        days=info["days"]
-    )
-
-    conn = db()
-
-    conn.execute("""
-        INSERT INTO subscriptions
-        (
-            bot_db_id,
-            owner_id,
-            plan,
-            start_at,
-            end_at,
-            active
-        )
-        VALUES (?, ?, ?, ?, ?, 1)
-        ON CONFLICT(bot_db_id) DO UPDATE SET
-            owner_id = excluded.owner_id,
-            plan = excluded.plan,
-            start_at = excluded.start_at,
-            end_at = excluded.end_at,
-            active = 1
-    """, (
-        bot_db_id,
-        owner_id,
-        plan,
-        start.isoformat(),
-        end.isoformat(),
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return True, end
-
-
-# ============================================================
-# SERVICES
-# ============================================================
-
-def get_services(bot_db_id):
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM services
-        WHERE bot_id = ?
-        AND active = 1
-        ORDER BY id ASC
-    """, (bot_db_id,)).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def get_all_services(bot_db_id):
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM services
-        WHERE bot_id = ?
-        ORDER BY id ASC
-    """, (bot_db_id,)).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def add_service(
-    bot_db_id,
-    name,
-    description,
-    price
-):
-
-    conn = db()
-
-    cur = conn.execute("""
-        INSERT INTO services
-        (
-            bot_id,
-            name,
-            description,
-            price
-        )
-        VALUES (?, ?, ?, ?)
-    """, (
-        bot_db_id,
-        name,
-        description,
-        price,
-    ))
-
-    conn.commit()
-
-    service_id = cur.lastrowid
-
-    conn.close()
-
-    return service_id
-
-
-def update_service(
-    service_id,
-    name,
-    description,
-    price
-):
-
-    conn = db()
-
-    conn.execute("""
-        UPDATE services
-        SET
-            name = ?,
-            description = ?,
-            price = ?
-        WHERE id = ?
-    """, (
-        name,
-        description,
-        price,
-        service_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-def delete_service(service_id):
-
-    conn = db()
-
-    conn.execute("""
-        DELETE FROM services
-        WHERE id = ?
-    """, (service_id,))
-
-    conn.commit()
-    conn.close()
-
-
-def get_service(service_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM services
-        WHERE id = ?
-        AND active = 1
-    """, (service_id,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-# ============================================================
-# CUSTOM BUTTONS
-# ============================================================
-
-def get_buttons(bot_db_id):
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT *
-        FROM custom_buttons
-        WHERE bot_id = ?
-        AND active = 1
-        ORDER BY id ASC
-    """, (bot_db_id,)).fetchall()
-
-    conn.close()
-
-    return rows
-
-
-def add_custom_button(
-    bot_db_id,
-    title,
-    text
-):
-
-    conn = db()
-
-    conn.execute("""
-        INSERT INTO custom_buttons
-        (
-            bot_id,
-            title,
-            text
-        )
-        VALUES (?, ?, ?)
-    """, (
-        bot_db_id,
-        title,
-        text,
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# START TEXT
-# ============================================================
-
-def get_start_text(bot_db_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT start_text
-        FROM bots
-        WHERE id = ?
-    """, (bot_db_id,)).fetchone()
-
-    conn.close()
-
-    if row and row["start_text"]:
-        return row["start_text"]
-
-    return "Assalomu Aleykum! 👋"
-
-
-def set_start_text(
-    bot_db_id,
-    text
-):
-
-    conn = db()
-
-    conn.execute("""
-        UPDATE bots
-        SET start_text = ?
-        WHERE id = ?
-    """, (
-        text,
-        bot_db_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# PAYMENT CARD
-# ============================================================
-
-def get_payment_card():
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT value
-        FROM settings
-        WHERE key = 'payment_card'
-    """).fetchone()
-
-    conn.close()
-
-    if row and row["value"]:
-        return row["value"]
-
-    return PAYMENT_CARD
-
-
-def set_payment_card(card):
-
-    conn = db()
-
-    conn.execute("""
-        INSERT INTO settings
-        (key, value)
-        VALUES ('payment_card', ?)
-        ON CONFLICT(key) DO UPDATE SET
-            value = excluded.value
-    """, (card,))
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# PAYMENTS
-# ============================================================
-
-def create_payment(
-    user_id,
-    bot_db_id,
-    amount,
-    photo_id,
-    source
-):
-
-    conn = db()
-
-    cur = conn.execute("""
-        INSERT INTO payments
-        (
-            user_id,
-            bot_db_id,
-            amount,
-            photo_id,
-            status,
-            source
-        )
-        VALUES (?, ?, ?, ?, 'pending', ?)
-    """, (
-        user_id,
-        bot_db_id,
-        amount,
-        photo_id,
-        source,
-    ))
-
-    conn.commit()
-
-    payment_id = cur.lastrowid
-
-    conn.close()
-
-    return payment_id
-
-
-def get_payment(payment_id):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM payments
-        WHERE id = ?
-    """, (payment_id,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def process_payment(
-    payment_id,
-    approve,
-    admin_id
-):
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM payments
-        WHERE id = ?
-    """, (payment_id,)).fetchone()
-
-    if not row:
-        conn.close()
-        return None, "not_found"
-
-    if row["status"] != "pending":
-        conn.close()
-        return row, "already_processed"
-
-    new_status = "approved" if approve else "rejected"
-
-    conn.execute("""
-        UPDATE payments
-        SET
-            status = ?,
-            processed_at = ?,
-            processed_by = ?
-        WHERE id = ?
-    """, (
-        new_status,
-        iso_now(),
-        admin_id,
-        payment_id,
-    ))
-
-    conn.commit()
-    conn.close()
-
-    if approve:
-        change_balance(
-            row["user_id"],
-            int(row["amount"]),
-            "payment",
-            f"To‘lov #{payment_id} tasdiqlandi"
-        )
-
-    return row, new_status
-
-
-# ============================================================
-# ORDERS
-# ============================================================
-
-def create_order(
-    user_id,
-    bot_db_id,
-    service_id,
-    amount
-):
-
-    conn = db()
-
-    cur = conn.execute("""
-        INSERT INTO orders
-        (
-            user_id,
-            bot_db_id,
-            service_id,
-            amount,
-            status
-        )
-        VALUES (?, ?, ?, ?, 'paid')
-    """, (
-        user_id,
-        bot_db_id,
-        service_id,
-        amount,
-    ))
-
-    conn.commit()
-
-    order_id = cur.lastrowid
-
-    conn.close()
-
-    return order_id
+    return list(ids)
 
 
 # ============================================================
 # MAIN MENU
 # ============================================================
 
-def main_menu():
-
+def user_menu():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton(
-                "🤖 Bot yaratish",
-                callback_data="create_bot"
-            )
+            InlineKeyboardButton("🔑 API ulash", callback_data="api_add")
         ],
         [
-            InlineKeyboardButton(
-                "📋 Mening botlarim",
-                callback_data="my_bots"
-            )
+            InlineKeyboardButton("🤖 APIlarim", callback_data="api_list"),
+            InlineKeyboardButton("💰 Balans", callback_data="my_balance")
         ],
         [
-            InlineKeyboardButton(
-                "💰 Balans",
-                callback_data="main_balance"
-            ),
-            InlineKeyboardButton(
-                "➕ Balans to‘ldirish",
-                callback_data="main_topup"
-            )
+            InlineKeyboardButton("📦 Buyurtma", callback_data="order")
         ],
         [
-            InlineKeyboardButton(
-                "💳 Obunalar",
-                callback_data="main_subscriptions"
-            )
+            InlineKeyboardButton("👤 Profil", callback_data="profile")
         ],
+        [
+            InlineKeyboardButton("❓ Yordam", callback_data="help")
+        ]
+    ])
+
+
+def admin_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("👥 Foydalanuvchilar", callback_data="admin_users")
+        ],
+        [
+            InlineKeyboardButton("📦 Buyurtmalar", callback_data="admin_orders")
+        ],
+        [
+            InlineKeyboardButton("👑 Adminlar", callback_data="admins")
+        ],
+        [
+            InlineKeyboardButton("➕ Admin qo‘shish", callback_data="admin_add")
+        ],
+        [
+            InlineKeyboardButton("➖ Admin olib tashlash", callback_data="admin_remove")
+        ],
+        [
+            InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")
+        ]
     ])
 
 
 # ============================================================
-# BOT SETTINGS MENU
+# /START
 # ============================================================
 
-def settings_menu(bot_id):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
 
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🛍 Xizmatlar",
-                callback_data=f"services:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "➕ Xizmat qo‘shish",
-                callback_data=f"add_service:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✏️ Xizmatni o‘zgartirish",
-                callback_data=f"edit_services:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗑 Xizmatni o‘chirish",
-                callback_data=f"delete_services:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "👋 Start xabar",
-                callback_data=f"start_text:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔘 Tugma qo‘shish",
-                callback_data=f"add_button:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💳 Obuna",
-                callback_data=f"bot_subscription:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💻 Kod orqali dasturlash",
-                callback_data=f"code_mode:{bot_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "⬅️ Orqaga",
-                callback_data="my_bots"
-            )
-        ],
-    ])
+    if is_admin(user.id):
+        text = (
+            "Assalomu Aleykum! 👋\n\n"
+            "👑 Admin paneliga xush kelibsiz."
+        )
+        await update.message.reply_text(
+            text,
+            reply_markup=admin_menu()
+        )
+    else:
+        text = (
+            "Assalomu Aleykum! 👋\n\n"
+            "🤖 API buyurtma botiga xush kelibsiz."
+        )
+        await update.message.reply_text(
+            text,
+            reply_markup=user_menu()
+        )
 
 
 # ============================================================
-# CHILD MENU
+# /HELP
 # ============================================================
 
-def child_menu(bot_db_id):
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+
+    text = (
+        "❓ Yordam\n\n"
+        "/start — Botni ishga tushirish\n"
+        "/help — Yordam\n"
+        "/profile — Profil\n"
+        "/balance — Balans\n"
+        "/order — Buyurtma\n"
+    )
+
+    if is_admin(user.id):
+        text += "/admin — Admin panel\n"
+
+    await update.message.reply_text(text)
+
+
+# ============================================================
+# /PROFILE
+# ============================================================
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    save_user(user)
+
+    conn = db()
+
+    api_count = conn.execute(
+        "SELECT COUNT(*) c FROM api_accounts WHERE user_id=? AND active=1",
+        (user.id,)
+    ).fetchone()["c"]
+
+    order_count = conn.execute(
+        "SELECT COUNT(*) c FROM orders WHERE user_id=?",
+        (user.id,)
+    ).fetchone()["c"]
+
+    conn.close()
+
+    text = (
+        "👤 Profil\n\n"
+        f"🆔 ID: {user.id}\n"
+        f"👤 Username: @{user.username or 'yo‘q'}\n"
+        f"🔑 APIlar: {api_count} ta\n"
+        f"📦 Buyurtmalar: {order_count} ta"
+    )
+
+    await update.message.reply_text(text)
+
+
+# ============================================================
+# /BALANCE
+# ============================================================
+
+async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_api_list_for_balance(update.effective_chat.id, context)
+
+
+async def show_api_list_for_balance(chat_id, context):
+    conn = db()
+    rows = conn.execute("""
+        SELECT id, name
+        FROM api_accounts
+        WHERE user_id=? AND active=1
+        ORDER BY id DESC
+    """, (chat_id,)).fetchall()
+    conn.close()
+
+    if not rows:
+        await context.bot.send_message(
+            chat_id,
+            "❌ Sizda hali API ulanmagan.\n\n"
+            "🔑 API ulash tugmasini bosing.",
+            reply_markup=user_menu()
+        )
+        return
+
+    buttons = []
+
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"💰 {row['name']} balans",
+                callback_data=f"api_balance:{row['id']}"
+            )
+        ])
+
+    await context.bot.send_message(
+        chat_id,
+        "💰 Qaysi API balansini ko‘rmoqchisiz?",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+# ============================================================
+# /ORDER
+# ============================================================
+
+async def order_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_order_apis(update.effective_chat.id, context)
+
+
+async def show_order_apis(chat_id, context):
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT id, name
+        FROM api_accounts
+        WHERE user_id=? AND active=1
+        ORDER BY id DESC
+    """, (chat_id,)).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await context.bot.send_message(
+            chat_id,
+            "❌ Avval API ulang.",
+            reply_markup=user_menu()
+        )
+        return
 
     buttons = [
         [
             InlineKeyboardButton(
-                "🛍 Xizmatlar",
-                callback_data=f"child_services:{bot_db_id}"
+                f"🤖 {r['name']}",
+                callback_data=f"order_api:{r['id']}"
             )
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 Balans",
-                callback_data=f"child_balance:{bot_db_id}"
-            ),
-            InlineKeyboardButton(
-                "➕ Balans to‘ldirish",
-                callback_data=f"child_topup:{bot_db_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💳 Obuna",
-                callback_data=f"child_subscription:{bot_db_id}"
-            )
-        ],
+        ]
+        for r in rows
     ]
 
-    custom = get_buttons(bot_db_id)
-
-    for button in custom:
-
-        buttons.append([
-            InlineKeyboardButton(
-                button["title"],
-                callback_data=(
-                    f"custom:{button['id']}:"
-                    f"{bot_db_id}"
-                )
-            )
-        ])
-
-    return InlineKeyboardMarkup(buttons)
-
-
-# ============================================================
-# SUBSCRIPTION MENU
-# ============================================================
-
-def subscription_menu(bot_db_id):
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "🗓 1 kun — 5 000 so‘m",
-                callback_data=f"buy_sub:1d:{bot_db_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗓 3 kun — 13 000 so‘m",
-                callback_data=f"buy_sub:3d:{bot_db_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗓 7 kun — 25 000 so‘m",
-                callback_data=f"buy_sub:7d:{bot_db_id}"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🗓 1 oy — 43 000 so‘m",
-                callback_data=f"buy_sub:1m:{bot_db_id}"
-            )
-        ],
-    ])
-
-
-# ============================================================
-# START
-# ============================================================
-
-async def start_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    user = update.effective_user
-
-    if user:
-        save_user(user)
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "Assalomu Aleykum! 👋\n\n"
-        "🤖 Bu platforma orqali o‘zingizga "
-        "Telegram bot yaratishingiz va sozlashingiz mumkin.",
-        reply_markup=main_menu()
-    )
-
-
-# ============================================================
-# CREATE BOT
-# ============================================================
-
-async def create_bot_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "waiting_bot_token"
-
-    await query.message.reply_text(
-        "🚀 Yangi bot yaratish\n\n"
-        "1️⃣ @BotFather ni oching.\n"
-        "2️⃣ /newbot yuboring.\n"
-        "3️⃣ Bot yarating.\n"
-        "4️⃣ BotFather bergan tokenni nusxalang.\n\n"
-        "📌 Tokenni shu yerga yuboring."
-    )
-
-
-# ============================================================
-# CHECK TOKEN
-# ============================================================
-
-async def check_token(token):
-
-    temp_app = None
-
-    try:
-
-        temp_app = (
-            Application.builder()
-            .token(token)
-            .build()
-        )
-
-        await temp_app.initialize()
-
-        me = await temp_app.bot.get_me()
-
-        return me
-
-    except Exception as e:
-
-        logger.error(
-            "Token error: %s",
-            e
-        )
-
-        return None
-
-    finally:
-
-        if temp_app:
-
-            try:
-                await temp_app.shutdown()
-            except Exception:
-                pass
-
-
-# ============================================================
-# MAIN BALANCE
-# ============================================================
-
-async def main_balance_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    balance = get_balance(
-        query.from_user.id
-    )
-
-    await query.message.reply_text(
-        f"💰 Sizning balansingiz:\n\n"
-        f"💵 {balance:,} so‘m",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "➕ Balans to‘ldirish",
-                    callback_data="main_topup"
-                )
-            ]
-        ])
-    )
-
-
-# ============================================================
-# TOPUP START
-# ============================================================
-
-async def topup_start(
-    update,
-    context,
-    bot_db_id=0,
-    source="main"
-):
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "topup_amount"
-
-    context.user_data["payment_bot_id"] = bot_db_id
-
-    context.user_data["payment_source"] = source
-
-    card = get_payment_card()
-
-    await update.message.reply_text(
-        "➕ Balans to‘ldirish\n\n"
-        "💳 Karta:\n"
-        f"`{card}`\n\n"
-        "💰 Qancha summa to‘ldirmoqchisiz?\n\n"
-        "Masalan: 25000",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# MAIN TOPUP
-# ============================================================
-
-async def main_topup_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "topup_amount"
-
-    context.user_data["payment_bot_id"] = 0
-
-    context.user_data["payment_source"] = "main"
-
-    card = get_payment_card()
-
-    await query.message.reply_text(
-        "➕ Balans to‘ldirish\n\n"
-        "💳 Karta:\n"
-        f"`{card}`\n\n"
-        "💰 Summani yuboring.\n\n"
-        "Masalan: 25000",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# MAIN SUBSCRIPTIONS
-# ============================================================
-
-async def main_subscriptions_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bots = get_user_bots(
-        query.from_user.id
-    )
-
-    if not bots:
-
-        await query.message.reply_text(
-            "❌ Avval bot yarating."
-        )
-
-        return
-
-    buttons = []
-
-    for bot in bots:
-
-        status = (
-            "🟢"
-            if subscription_active(bot["id"])
-            else "🔴"
-        )
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"{status} @{bot['username'] or bot['name']}",
-                callback_data=f"bot_subscription:{bot['id']}"
-            )
-        ])
-
-    await query.message.reply_text(
-        "💳 Qaysi bot uchun obuna olasiz?",
+    await context.bot.send_message(
+        chat_id,
+        "📦 Qaysi API orqali buyurtma qilasiz?",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
 # ============================================================
-# BOT SUBSCRIPTION
+# API ADD STATE
 # ============================================================
 
-async def bot_subscription_callback(
-    update,
-    context
-):
+def set_state(context, name, value):
+    context.user_data[name] = value
 
-    query = update.callback_query
 
-    await query.answer()
+def get_state(context, name):
+    return context.user_data.get(name)
 
-    bot_db_id = int(
-        query.data.split(":")[1]
-    )
 
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_db_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    bot = get_bot(bot_db_id)
-
-    await query.message.reply_text(
-        f"💳 {bot['name']} uchun obuna\n\n"
-        f"{subscription_text(bot_db_id)}\n\n"
-        "👇 Tarifni tanlang:",
-        reply_markup=subscription_menu(bot_db_id)
-    )
+def clear_api_state(context):
+    for key in [
+        "api_name",
+        "api_base_url",
+        "api_key",
+        "api_balance_url",
+        "api_catalog_url",
+        "api_order_url",
+        "selected_api_id",
+        "selected_product_id",
+        "delivery_type",
+        "player_data"
+    ]:
+        context.user_data.pop(key, None)
 
 
 # ============================================================
-# BUY SUBSCRIPTION
+# API ULASH
 # ============================================================
 
-async def buy_subscription_callback(
-    update,
-    context
-):
+async def api_add_start(query, context):
+    clear_api_state(context)
+    set_state(context, "api_step", "name")
 
-    query = update.callback_query
-
-    await query.answer()
-
-    parts = query.data.split(":")
-
-    plan = parts[1]
-    bot_db_id = int(parts[2])
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_db_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    if plan not in SUBSCRIPTIONS:
-        await query.message.reply_text(
-            "❌ Tarif topilmadi."
-        )
-        return
-
-    info = SUBSCRIPTIONS[plan]
-
-    balance = get_balance(
-        query.from_user.id
+    await query.message.edit_text(
+        "🔑 API ulash\n\n"
+        "1️⃣ API nomini yuboring.\n\n"
+        "Masalan:\n"
+        "Father"
     )
 
-    if balance < info["price"]:
 
-        await query.message.reply_text(
-            "❌ Balans yetarli emas.\n\n"
-            f"💰 Kerak: {info['price']:,} so‘m\n"
-            f"💵 Balansingiz: {balance:,} so‘m\n\n"
-            "Avval balansni to‘ldiring.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "➕ Balans to‘ldirish",
-                        callback_data="main_topup"
-                    )
-                ]
-            ])
-        )
+async def handle_api_add_text(update, context):
+    step = get_state(context, "api_step")
 
-        return
-
-    change_balance(
-        query.from_user.id,
-        -info["price"],
-        "subscription",
-        f"{info['name']} obuna"
-    )
-
-    ok, end = activate_subscription(
-        bot_db_id,
-        query.from_user.id,
-        plan
-    )
-
-    if not ok:
-
-        change_balance(
-            query.from_user.id,
-            info["price"],
-            "refund",
-            "Obuna aktivlashtirish qaytarildi"
-        )
-
-        await query.message.reply_text(
-            "❌ Obunani yoqishda xato."
-        )
-
-        return
-
-    await query.message.reply_text(
-        "✅ OBUNA FAOLLASHTIRILDI!\n\n"
-        f"📦 Tarif: {info['name']}\n"
-        f"💰 Narx: {info['price']:,} so‘m\n"
-        f"📅 Tugash: "
-        f"{end.astimezone().strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"💵 Qolgan balans: "
-        f"{get_balance(query.from_user.id):,} so‘m"
-    )
-
-    bot = get_bot(bot_db_id)
-
-    if bot:
-
-        token = bot["token"]
-
-        if token not in running_bots:
-
-            task = asyncio.create_task(
-                run_child_bot(token)
-            )
-
-            running_tasks[token] = task
-
-
-# ============================================================
-# RECEIVE MAIN TEXT
-# ============================================================
-
-async def receive_main_text(
-    update,
-    context
-):
-
-    if not update.message:
-        return
-
-    state = context.user_data.get("state")
-
-    if not state:
-        return
+    if not step:
+        return False
 
     text = update.message.text.strip()
 
-    # --------------------------------------------------------
-    # BOT TOKEN
-    # --------------------------------------------------------
-
-    if state == "waiting_bot_token":
-
-        if ":" not in text:
-
+    if step == "name":
+        if len(text) < 2:
             await update.message.reply_text(
-                "❌ Token noto‘g‘ri."
+                "❌ API nomi juda qisqa."
             )
+            return True
 
-            return
+        set_state(context, "api_name", text)
+        set_state(context, "api_step", "base_url")
 
         await update.message.reply_text(
-            "⏳ Token tekshirilmoqda..."
+            "🌐 API Base URL ni yuboring.\n\n"
+            "Masalan:\n"
+            "https://example.com/api"
         )
+        return True
 
-        me = await check_token(text)
-
-        if not me:
-
+    if step == "base_url":
+        if not text.startswith("http://") and not text.startswith("https://"):
             await update.message.reply_text(
-                "❌ Token ishlamadi.\n\n"
-                "BotFather tokenini tekshiring."
+                "❌ URL http:// yoki https:// bilan boshlanishi kerak."
             )
+            return True
 
-            return
+        set_state(context, "api_base_url", text.rstrip("/"))
+        set_state(context, "api_step", "key")
 
-        bot_db_id = save_bot(
+        await update.message.reply_text(
+            "🔐 API key/tokenni yuboring."
+        )
+        return True
+
+    if step == "key":
+        set_state(context, "api_key", text)
+        set_state(context, "api_step", "balance_url")
+
+        await update.message.reply_text(
+            "💰 Balans endpointini yuboring.\n\n"
+            "Masalan:\n"
+            "/balance\n\n"
+            "Agar Base URLning o‘zi balans uchun ishlatilsa:\n"
+            "skip"
+        )
+        return True
+
+    if step == "balance_url":
+        if text.lower() == "skip":
+            text = ""
+
+        set_state(context, "api_balance_url", text)
+        set_state(context, "api_step", "catalog_url")
+
+        await update.message.reply_text(
+            "📦 Narx/katalog endpointini yuboring.\n\n"
+            "Masalan:\n"
+            "/products\n\n"
+            "Agar hozircha kerak bo‘lmasa:\n"
+            "skip"
+        )
+        return True
+
+    if step == "catalog_url":
+        if text.lower() == "skip":
+            text = ""
+
+        set_state(context, "api_catalog_url", text)
+        set_state(context, "api_step", "order_url")
+
+        await update.message.reply_text(
+            "🚚 Buyurtma endpointini yuboring.\n\n"
+            "Masalan:\n"
+            "/order"
+        )
+        return True
+
+    if step == "order_url":
+        set_state(context, "api_order_url", text)
+
+        conn = db()
+
+        cur = conn.execute("""
+            INSERT INTO api_accounts(
+                user_id,
+                name,
+                base_url,
+                api_key,
+                balance_url,
+                catalog_url,
+                order_url,
+                markup_uzs,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (
             update.effective_user.id,
-            text,
-            me.id,
-            me.username,
-            me.first_name,
-        )
+            get_state(context, "api_name"),
+            get_state(context, "api_base_url"),
+            get_state(context, "api_key"),
+            get_state(context, "api_balance_url"),
+            get_state(context, "api_catalog_url"),
+            get_state(context, "api_order_url"),
+            datetime.now().isoformat()
+        ))
 
-        context.user_data.clear()
+        api_id = cur.lastrowid
+
+        conn.commit()
+        conn.close()
+
+        clear_api_state(context)
 
         await update.message.reply_text(
-            "✅ BOT QO‘SHILDI!\n\n"
-            f"🤖 Nomi: {me.first_name}\n"
-            f"👤 Username: "
-            f"@{me.username or 'yo‘q'}\n\n"
-            "⚠️ Bot ishlashi uchun obuna sotib oling.",
-            reply_markup=settings_menu(bot_db_id)
+            "🔄 API tekshirilmoqda..."
         )
 
-        return
+        result = await asyncio.to_thread(
+            test_api_connection,
+            api_id
+        )
 
-    # --------------------------------------------------------
-    # TOPUP AMOUNT
-    # --------------------------------------------------------
-
-    if state == "topup_amount":
-
-        try:
-
-            amount = int(
-                text.replace(" ", "")
-                .replace(",", "")
-            )
-
-            if amount <= 0:
-                raise ValueError
-
-        except Exception:
-
+        if result["ok"]:
             await update.message.reply_text(
-                "❌ Summani faqat raqam bilan yuboring.\n\n"
-                "Masalan: 25000"
+                f"✅ API muvaffaqiyatli ulandi!\n\n"
+                f"🔑 API: {result['name']}\n\n"
+                "Endi API uchun quyidagi sozlamalar mavjud:",
+                reply_markup=api_control_keyboard(api_id)
             )
-
-            return
-
-        context.user_data["topup_amount"] = amount
-
-        context.user_data["state"] = "topup_photo"
-
-        await update.message.reply_text(
-            f"💰 Summa: {amount:,} so‘m\n\n"
-            "📸 Endi to‘lov chekini RASM qilib yuboring."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SERVICE NAME
-    # --------------------------------------------------------
-
-    if state == "service_name":
-
-        context.user_data["service_name"] = text
-
-        context.user_data["state"] = (
-            "service_description"
-        )
-
-        await update.message.reply_text(
-            "📝 Xizmat tavsifini yuboring."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SERVICE DESCRIPTION
-    # --------------------------------------------------------
-
-    if state == "service_description":
-
-        context.user_data["service_description"] = text
-
-        context.user_data["state"] = "service_price"
-
-        await update.message.reply_text(
-            "💰 Narxni yuboring.\n\n"
-            "Masalan: 10000"
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # SERVICE PRICE
-    # --------------------------------------------------------
-
-    if state == "service_price":
-
-        try:
-
-            price = int(
-                text.replace(" ", "")
-                .replace(",", "")
-            )
-
-            if price < 0:
-                raise ValueError
-
-        except Exception:
-
+        else:
             await update.message.reply_text(
-                "❌ Narx noto‘g‘ri."
+                "⚠️ API saqlandi, lekin tekshirishda javob olinmadi.\n\n"
+                f"Xato: {result['error']}\n\n"
+                "API sozlamalarini tekshirib ko‘ring.",
+                reply_markup=api_control_keyboard(api_id)
             )
 
-            return
+        return True
 
-        bot_id = context.user_data["bot_id"]
-
-        add_service(
-            bot_id,
-            context.user_data["service_name"],
-            context.user_data["service_description"],
-            price
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Xizmat qo‘shildi!",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # START TEXT
-    # --------------------------------------------------------
-
-    if state == "start_text":
-
-        bot_id = context.user_data["bot_id"]
-
-        set_start_text(
-            bot_id,
-            text
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Start xabari o‘zgartirildi.",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # BUTTON TITLE
-    # --------------------------------------------------------
-
-    if state == "button_title":
-
-        context.user_data["button_title"] = text
-
-        context.user_data["state"] = "button_text"
-
-        await update.message.reply_text(
-            "📝 Tugma bosilganda chiqadigan matnni yuboring."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # BUTTON TEXT
-    # --------------------------------------------------------
-
-    if state == "button_text":
-
-        bot_id = context.user_data["bot_id"]
-
-        add_custom_button(
-            bot_id,
-            context.user_data["button_title"],
-            text
-        )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Tugma qo‘shildi!",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # CODE MODE
-    # --------------------------------------------------------
-
-    if state == "code_mode":
-
-        bot_id = context.user_data["bot_id"]
-
-        try:
-            data = json.loads(text)
-        except Exception:
-
-            await update.message.reply_text(
-                "❌ JSON formati noto‘g‘ri."
-            )
-
-            return
-
-        if not isinstance(data, dict):
-
-            await update.message.reply_text(
-                "❌ JSON obyekt bo‘lishi kerak."
-            )
-
-            return
-
-        services = data.get(
-            "services",
-            []
-        )
-
-        added = 0
-
-        if isinstance(services, list):
-
-            for item in services:
-
-                if not isinstance(item, dict):
-                    continue
-
-                name = str(
-                    item.get("name", "")
-                ).strip()
-
-                description = str(
-                    item.get("description", "")
-                ).strip()
-
-                try:
-                    price = int(
-                        item.get("price", 0)
-                    )
-                except Exception:
-                    continue
-
-                if not name or price < 0:
-                    continue
-
-                add_service(
-                    bot_id,
-                    name,
-                    description,
-                    price
-                )
-
-                added += 1
-
-        welcome = data.get("welcome")
-
-        if isinstance(welcome, str):
-
-            if welcome.strip():
-
-                set_start_text(
-                    bot_id,
-                    welcome.strip()
-                )
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Kod orqali sozlash tugadi!\n\n"
-            f"🛍 {added} ta xizmat qo‘shildi.",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
+    return False
 
 
 # ============================================================
-# RECEIVE PAYMENT PHOTO
+# API KEYBOARD
 # ============================================================
 
-async def receive_photo(
-    update,
-    context
-):
-
-    state = context.user_data.get("state")
-
-    if state != "topup_photo":
-        return
-
-    if not update.message.photo:
-        return
-
-    photo = update.message.photo[-1]
-
-    amount = int(
-        context.user_data.get(
-            "topup_amount",
-            0
-        )
-    )
-
-    bot_db_id = int(
-        context.user_data.get(
-            "payment_bot_id",
-            0
-        )
-    )
-
-    source = context.user_data.get(
-        "payment_source",
-        "main"
-    )
-
-    payment_id = create_payment(
-        update.effective_user.id,
-        bot_db_id,
-        amount,
-        photo.file_id,
-        source
-    )
-
-    context.user_data.clear()
-
-    await update.message.reply_text(
-        "✅ Chek qabul qilindi!\n\n"
-        f"💰 Summa: {amount:,} so‘m\n"
-        f"🧾 To‘lov ID: #{payment_id}\n\n"
-        "⏳ Admin tasdiqlashini kuting."
-    )
-
-    # Send to admin through main bot
-    if ADMIN_ID and MAIN_BOT_TOKEN:
-
-        try:
-
-            admin_app = (
-                Application.builder()
-                .token(MAIN_BOT_TOKEN)
-                .build()
-            )
-
-            await admin_app.initialize()
-
-            user = update.effective_user
-
-            caption = (
-                "💳 YANGI TO‘LOV\n\n"
-                f"🧾 ID: #{payment_id}\n"
-                f"👤 User ID: {user.id}\n"
-                f"👤 Username: @{user.username or 'yo‘q'}\n"
-                f"💰 Summa: {amount:,} so‘m\n"
-                f"📍 Manba: {source}\n"
-                f"🤖 Bot ID: {bot_db_id}"
-            )
-
-            keyboard = InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "✅ TASDIQLASH",
-                        callback_data=f"pay_approve:{payment_id}"
-                    ),
-                    InlineKeyboardButton(
-                        "❌ RAD ETISH",
-                        callback_data=f"pay_reject:{payment_id}"
-                    )
-                ]
-            ])
-
-            await admin_app.bot.send_photo(
-                chat_id=ADMIN_ID,
-                photo=photo.file_id,
-                caption=caption,
-                reply_markup=keyboard
-            )
-
-            await admin_app.shutdown()
-
-        except Exception as e:
-
-            logger.exception(
-                "Admin notification error: %s",
-                e
-            )
-
-
-# ============================================================
-# MY BOTS
-# ============================================================
-
-async def my_bots_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bots = get_user_bots(
-        query.from_user.id
-    )
-
-    if not bots:
-
-        await query.message.reply_text(
-            "📋 Sizda hali bot yo‘q.",
-            reply_markup=main_menu()
-        )
-
-        return
-
-    buttons = []
-
-    for bot in bots:
-
-        username = bot["username"]
-
-        status = (
-            "🟢"
-            if subscription_active(bot["id"])
-            else "🔴"
-        )
-
-        title = (
-            f"{status} @{username}"
-            if username
-            else f"{status} {bot['name']}"
-        )
-
-        buttons.append([
+def api_control_keyboard(api_id):
+    return InlineKeyboardMarkup([
+        [
             InlineKeyboardButton(
-                title,
-                callback_data=f"manage:{bot['id']}"
+                "💰 API Balans",
+                callback_data=f"api_balance:{api_id}"
             )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "🤖 Yangi bot",
-            callback_data="create_bot"
-        )
-    ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Orqaga",
-            callback_data="back_main"
-        )
-    ])
-
-    await query.message.reply_text(
-        "📋 Mening botlarim:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ============================================================
-# MANAGE BOT
-# ============================================================
-
-async def manage_bot_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    bot = get_bot(bot_id)
-
-    if not bot:
-
-        await query.message.reply_text(
-            "❌ Bot topilmadi."
-        )
-
-        return
-
-    if bot["owner_id"] != query.from_user.id:
-
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-
-        return
-
-    await query.message.reply_text(
-        f"⚙️ Bot sozlamalari\n\n"
-        f"🤖 {bot['name']}\n"
-        f"@{bot['username'] or 'yo‘q'}\n\n"
-        f"{subscription_text(bot_id)}",
-        reply_markup=settings_menu(bot_id)
-    )
-
-
-# ============================================================
-# SERVICES ADMIN
-# ============================================================
-
-async def services_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    services = get_services(bot_id)
-
-    if not services:
-
-        await query.message.reply_text(
-            "🛍 Hozircha xizmatlar yo‘q.",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
-
-    text = "🛍 Xizmatlar:\n\n"
-
-    for service in services:
-
-        text += (
-            f"🔹 {service['name']}\n"
-            f"💰 {service['price']:,} so‘m\n"
-        )
-
-        if service["description"]:
-            text += (
-                f"📝 {service['description']}\n"
-            )
-
-        text += "\n"
-
-    await query.message.reply_text(
-        text,
-        reply_markup=settings_menu(bot_id)
-    )
-
-
-# ============================================================
-# ADD SERVICE
-# ============================================================
-
-async def add_service_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    context.user_data.clear()
-
-    context.user_data["bot_id"] = bot_id
-    context.user_data["state"] = "service_name"
-
-    await query.message.reply_text(
-        "➕ Xizmat nomini yuboring."
-    )
-
-
-# ============================================================
-# EDIT SERVICES
-# ============================================================
-
-async def edit_services_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    services = get_all_services(bot_id)
-
-    if not services:
-
-        await query.message.reply_text(
-            "❌ Xizmatlar yo‘q.",
-            reply_markup=settings_menu(bot_id)
-        )
-
-        return
-
-    buttons = []
-
-    for service in services:
-
-        buttons.append([
+        ],
+        [
             InlineKeyboardButton(
-                f"✏️ {service['name']}",
-                callback_data=(
-                    f"editone:{service['id']}:"
-                    f"{bot_id}"
-                )
+                "🔄 API narxlarini yangilash",
+                callback_data=f"api_refresh:{api_id}"
             )
-        ])
-
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Orqaga",
-            callback_data=f"manage:{bot_id}"
-        )
+        ],
+        [
+            InlineKeyboardButton(
+                "💵 Ustama qo‘shish",
+                callback_data=f"api_markup:{api_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📦 Buyurtma",
+                callback_data=f"order_api:{api_id}"
+            )
+        ]
     ])
 
-    await query.message.reply_text(
-        "✏️ Xizmatni tanlang:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
 
 # ============================================================
-# EDIT ONE
+# API TEST
 # ============================================================
 
-async def edit_one_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    parts = query.data.split(":")
-
-    service_id = int(parts[1])
-    bot_id = int(parts[2])
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
+def get_api(api_id):
     conn = db()
-
-    service = conn.execute("""
-        SELECT *
-        FROM services
-        WHERE id = ?
-        AND bot_id = ?
-    """, (
-        service_id,
-        bot_id
-    )).fetchone()
-
+    row = conn.execute(
+        "SELECT * FROM api_accounts WHERE id=?",
+        (api_id,)
+    ).fetchone()
     conn.close()
-
-    if not service:
-
-        await query.message.reply_text(
-            "❌ Xizmat topilmadi."
-        )
-
-        return
-
-    context.user_data.clear()
-
-    context.user_data["state"] = (
-        "edit_service_name"
-    )
-
-    context.user_data["service_id"] = service_id
-    context.user_data["bot_id"] = bot_id
-
-    await query.message.reply_text(
-        "✏️ Yangi xizmat nomini yuboring.\n\n"
-        f"Eski: {service['name']}"
-    )
+    return row
 
 
-# ============================================================
-# DELETE SERVICES
-# ============================================================
+def build_url(base_url, endpoint):
+    if not endpoint:
+        return base_url
 
-async def delete_services_callback(
-    update,
-    context
-):
+    if endpoint.startswith("http://") or endpoint.startswith("https://"):
+        return endpoint
 
-    query = update.callback_query
+    return base_url.rstrip("/") + "/" + endpoint.lstrip("/")
 
-    await query.answer()
 
-    bot_id = int(
-        query.data.split(":")[1]
-    )
+def api_headers(api):
+    return {
+        "Authorization": f"Bearer {api['api_key']}",
+        "X-API-Key": api["api_key"],
+        "Accept": "application/json",
+        "Content-Type": "application/json"
+    }
 
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
 
-    services = get_all_services(bot_id)
+def test_api_connection(api_id):
+    api = get_api(api_id)
 
-    if not services:
+    if not api:
+        return {
+            "ok": False,
+            "error": "API topilmadi"
+        }
 
-        await query.message.reply_text(
-            "❌ Xizmatlar yo‘q."
-        )
-
-        return
-
-    buttons = []
-
-    for service in services:
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"🗑 {service['name']}",
-                callback_data=(
-                    f"deleteone:{service['id']}:"
-                    f"{bot_id}"
-                )
+    try:
+        if api["balance_url"]:
+            url = build_url(
+                api["base_url"],
+                api["balance_url"]
             )
-        ])
 
-    buttons.append([
-        InlineKeyboardButton(
-            "⬅️ Orqaga",
-            callback_data=f"manage:{bot_id}"
-        )
-    ])
+            response = requests.get(
+                url,
+                headers=api_headers(api),
+                timeout=20
+            )
 
-    await query.message.reply_text(
-        "🗑 O‘chirmoqchi bo‘lgan xizmatni tanlang:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
+            if response.status_code >= 400:
+                return {
+                    "ok": False,
+                    "error": f"HTTP {response.status_code}"
+                }
+
+        return {
+            "ok": True,
+            "name": api["name"]
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
 
 
 # ============================================================
-# DELETE ONE
+# API BALANCE
 # ============================================================
 
-async def delete_one_callback(
-    update,
-    context
-):
+def fetch_balance(api_id):
+    api = get_api(api_id)
 
-    query = update.callback_query
+    if not api:
+        return {
+            "ok": False,
+            "error": "API topilmadi"
+        }
 
-    await query.answer()
+    if not api["balance_url"]:
+        return {
+            "ok": False,
+            "error": "Balans endpointi kiritilmagan"
+        }
 
-    parts = query.data.split(":")
-
-    service_id = int(parts[1])
-    bot_id = int(parts[2])
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
+    try:
+        url = build_url(
+            api["base_url"],
+            api["balance_url"]
         )
-        return
+
+        response = requests.get(
+            url,
+            headers=api_headers(api),
+            timeout=20
+        )
+
+        data = response.json()
+
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "error": f"HTTP {response.status_code}: {data}"
+            }
+
+        balance = find_balance(data)
+
+        if balance is None:
+            return {
+                "ok": False,
+                "error": "Javob ichidan balans topilmadi"
+            }
+
+        return {
+            "ok": True,
+            "balance": balance
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+def find_balance(data):
+    if isinstance(data, dict):
+        possible = [
+            "balance",
+            "Balance",
+            "amount",
+            "credit",
+            "credits",
+            "money",
+            "wallet"
+        ]
+
+        for key in possible:
+            if key in data:
+                return data[key]
+
+        for value in data.values():
+            result = find_balance(value)
+            if result is not None:
+                return result
+
+    elif isinstance(data, list):
+        for item in data:
+            result = find_balance(item)
+            if result is not None:
+                return result
+
+    return None
+
+
+# ============================================================
+# API CATALOG
+# ============================================================
+
+def fetch_catalog(api_id):
+    api = get_api(api_id)
+
+    if not api:
+        return {
+            "ok": False,
+            "error": "API topilmadi"
+        }
+
+    if not api["catalog_url"]:
+        return {
+            "ok": False,
+            "error": "Katalog endpointi kiritilmagan"
+        }
+
+    try:
+        url = build_url(
+            api["base_url"],
+            api["catalog_url"]
+        )
+
+        response = requests.get(
+            url,
+            headers=api_headers(api),
+            timeout=30
+        )
+
+        data = response.json()
+
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "error": f"HTTP {response.status_code}: {data}"
+            }
+
+        products = normalize_products(data)
+
+        if not products:
+            return {
+                "ok": False,
+                "error": "API javobidan mahsulotlar topilmadi"
+            }
+
+        return {
+            "ok": True,
+            "products": products
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+def normalize_products(data):
+    if isinstance(data, dict):
+        for key in [
+            "products",
+            "packages",
+            "items",
+            "services",
+            "data"
+        ]:
+            if key in data:
+                result = normalize_products(data[key])
+                if result:
+                    return result
+
+        # Bitta mahsulot bo‘lishi mumkin
+        if any(
+            key in data
+            for key in ["id", "product_id", "package_id"]
+        ):
+            return [data]
+
+    if isinstance(data, list):
+        result = []
+
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+
+            external_id = (
+                item.get("id")
+                or item.get("product_id")
+                or item.get("package_id")
+                or item.get("code")
+            )
+
+            name = (
+                item.get("name")
+                or item.get("title")
+                or item.get("package")
+                or f"Product {external_id}"
+            )
+
+            price = (
+                item.get("price")
+                or item.get("amount")
+                or item.get("cost")
+                or item.get("sale_price")
+            )
+
+            if external_id is None or price is None:
+                continue
+
+            try:
+                price = float(price)
+            except Exception:
+                continue
+
+            result.append({
+                "external_id": str(external_id),
+                "name": str(name),
+                "price": price
+            })
+
+        return result
+
+    return []
+
+
+def refresh_catalog(api_id):
+    result = fetch_catalog(api_id)
+
+    if not result["ok"]:
+        return result
+
+    api = get_api(api_id)
+    markup = float(api["markup_uzs"])
 
     conn = db()
 
-    conn.execute("""
-        DELETE FROM services
-        WHERE id = ?
-        AND bot_id = ?
-    """, (
-        service_id,
-        bot_id
-    ))
+    count = 0
+
+    for item in result["products"]:
+        sale_price = item["price"] + markup
+
+        conn.execute("""
+            INSERT INTO products(
+                api_id,
+                external_id,
+                name,
+                api_price,
+                sale_price,
+                active
+            )
+            VALUES (?, ?, ?, ?, ?, 1)
+            ON CONFLICT(api_id, external_id)
+            DO UPDATE SET
+                name=excluded.name,
+                api_price=excluded.api_price,
+                sale_price=excluded.sale_price,
+                active=1
+        """, (
+            api_id,
+            item["external_id"],
+            item["name"],
+            item["price"],
+            sale_price
+        ))
+
+        count += 1
 
     conn.commit()
     conn.close()
 
-    await query.message.reply_text(
-        "✅ Xizmat o‘chirildi.",
-        reply_markup=settings_menu(bot_id)
-    )
-
-
-# ============================================================
-# START TEXT
-# ============================================================
-
-async def start_text_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "start_text"
-    context.user_data["bot_id"] = bot_id
-
-    await query.message.reply_text(
-        "👋 Yangi Start xabarini yuboring."
-    )
-
-
-# ============================================================
-# ADD BUTTON
-# ============================================================
-
-async def add_button_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "button_title"
-    context.user_data["bot_id"] = bot_id
-
-    await query.message.reply_text(
-        "🔘 Tugma nomini yuboring.\n\n"
-        "Masalan: 📞 Admin"
-    )
-
-
-# ============================================================
-# CODE MODE
-# ============================================================
-
-async def code_mode_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_id = int(
-        query.data.split(":")[1]
-    )
-
-    if not user_owns_bot(
-        query.from_user.id,
-        bot_id
-    ):
-        await query.message.reply_text(
-            "❌ Bu bot sizniki emas."
-        )
-        return
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "code_mode"
-    context.user_data["bot_id"] = bot_id
-
-    example = {
-        "welcome": "Assalomu Aleykum! 👋",
-        "services": [
-            {
-                "name": "Telegram Premium 1 oy",
-                "description": "1 oylik Premium",
-                "price": 10000
-            },
-            {
-                "name": "Telegram Stars",
-                "description": "100 Stars",
-                "price": 25000
-            }
-        ]
+    return {
+        "ok": True,
+        "count": count,
+        "markup": markup
     }
 
+
+# ============================================================
+# MARKUP
+# ============================================================
+
+async def api_markup_start(query, context, api_id):
+    set_state(context, "markup_api_id", api_id)
+    set_state(context, "markup_step", True)
+
     await query.message.reply_text(
-        "💻 Xavfsiz JSON konfiguratsiya:\n\n"
-        + json.dumps(
-            example,
-            ensure_ascii=False,
-            indent=2
+        "💵 Ustama qancha qo‘shmoqchisiz?\n\n"
+        "UZSda raqam yuboring.\n\n"
+        "Masalan:\n"
+        "5000"
+    )
+
+
+async def handle_markup_text(update, context):
+    if not get_state(context, "markup_step"):
+        return False
+
+    text = update.message.text.strip().replace(",", "").replace(" ", "")
+
+    try:
+        value = int(text)
+
+        if value < 0:
+            raise ValueError
+
+    except Exception:
+        await update.message.reply_text(
+            "❌ Faqat musbat UZS summa kiriting.\n\n"
+            "Masalan: 5000"
         )
+        return True
+
+    api_id = get_state(context, "markup_api_id")
+
+    conn = db()
+
+    conn.execute(
+        "UPDATE api_accounts SET markup_uzs=? WHERE id=? AND user_id=?",
+        (value, api_id, update.effective_user.id)
+    )
+
+    conn.commit()
+    conn.close()
+
+    context.user_data.pop("markup_step", None)
+    context.user_data.pop("markup_api_id", None)
+
+    await update.message.reply_text(
+        f"✅ Ustama saqlandi!\n\n"
+        f"💵 Ustama: +{value:,} UZS",
+        reply_markup=api_control_keyboard(api_id)
+    )
+
+    return True
+
+
+# ============================================================
+# API LIST
+# ============================================================
+
+async def show_api_list(update, context):
+    user_id = update.effective_user.id
+
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM api_accounts
+        WHERE user_id=? AND active=1
+        ORDER BY id DESC
+    """, (user_id,)).fetchall()
+
+    conn.close()
+
+    if not rows:
+        if update.callback_query:
+            await update.callback_query.message.edit_text(
+                "❌ Sizda API yo‘q.",
+                reply_markup=user_menu()
+            )
+        else:
+            await update.message.reply_text(
+                "❌ Sizda API yo‘q.",
+                reply_markup=user_menu()
+            )
+        return
+
+    buttons = []
+
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"🔑 {row['name']}",
+                callback_data=f"api_view:{row['id']}"
+            )
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(
+            "➕ Yangi API ulash",
+            callback_data="api_add"
+        )
+    ])
+
+    markup = InlineKeyboardMarkup(buttons)
+
+    if update.callback_query:
+        await update.callback_query.message.edit_text(
+            "🔑 APIlarim:",
+            reply_markup=markup
+        )
+    else:
+        await update.message.reply_text(
+            "🔑 APIlarim:",
+            reply_markup=markup
+        )
+
+
+# ============================================================
+# PRODUCTS
+# ============================================================
+
+async def show_products(query, context, api_id):
+    conn = db()
+
+    rows = conn.execute("""
+        SELECT *
+        FROM products
+        WHERE api_id=? AND active=1
+        ORDER BY id ASC
+        LIMIT 100
+    """, (api_id,)).fetchall()
+
+    conn.close()
+
+    if not rows:
+        await query.message.edit_text(
+            "❌ Hali mahsulot yo‘q.\n\n"
+            "🔄 Avval API narxlarini yangilang."
+        )
+        return
+
+    buttons = []
+
+    for row in rows:
+        buttons.append([
+            InlineKeyboardButton(
+                f"{row['name']} — {int(row['sale_price']):,} UZS",
+                callback_data=f"product:{row['id']}"
+            )
+        ])
+
+    await query.message.edit_text(
+        "📦 Mahsulotni tanlang:",
+        reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
 # ============================================================
-# EDIT SERVICE TEXT
+# ORDER
 # ============================================================
 
-async def edit_service_text_handler(
-    update,
-    context
-):
+async def order_product(query, context, product_id):
+    conn = db()
 
-    state = context.user_data.get(
-        "state"
+    row = conn.execute("""
+        SELECT p.*, a.name api_name
+        FROM products p
+        JOIN api_accounts a ON a.id=p.api_id
+        WHERE p.id=?
+    """, (product_id,)).fetchone()
+
+    conn.close()
+
+    if not row:
+        await query.answer("Mahsulot topilmadi", show_alert=True)
+        return
+
+    set_state(context, "selected_product_id", product_id)
+    set_state(context, "selected_api_id", row["api_id"])
+    set_state(context, "order_step", "delivery")
+
+    markup = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "🤖 AUTO yetkazish",
+                callback_data="delivery:auto"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "👤 MANUAL yetkazish",
+                callback_data="delivery:manual"
+            )
+        ]
+    ])
+
+    await query.message.edit_text(
+        f"📦 {row['name']}\n"
+        f"💰 Narx: {int(row['sale_price']):,} UZS\n\n"
+        "🚚 Yetkazish usulini tanlang:",
+        reply_markup=markup
     )
 
-    if state == "edit_service_name":
 
-        context.user_data["new_name"] = (
-            update.message.text.strip()
+async def delivery_selected(query, context, delivery_type):
+    context.user_data["delivery_type"] = delivery_type
+    context.user_data["order_step"] = "player_data"
+
+    if delivery_type == "auto":
+        text = (
+            "🤖 AUTO yetkazish tanlandi.\n\n"
+            "📌 Buyurtma yuboriladigan ma'lumotni kiriting.\n\n"
+            "Masalan PUBG uchun:\n"
+            "Player ID"
+        )
+    else:
+        text = (
+            "👤 MANUAL yetkazish tanlandi.\n\n"
+            "📌 Buyurtma uchun kerakli ma'lumotni yuboring."
         )
 
-        context.user_data["state"] = (
-            "edit_service_description"
-        )
+    await query.message.edit_text(text)
 
-        await update.message.reply_text(
-            "📝 Yangi tavsifni yuboring.\n\n"
-            "Kerak bo‘lmasa: -"
-        )
 
+async def handle_order_data(update, context):
+    if get_state(context, "order_step") != "player_data":
+        return False
+
+    player_data = update.message.text.strip()
+
+    product_id = get_state(context, "selected_product_id")
+    api_id = get_state(context, "selected_api_id")
+    delivery_type = get_state(context, "delivery_type")
+
+    conn = db()
+
+    product = conn.execute("""
+        SELECT *
+        FROM products
+        WHERE id=?
+    """, (product_id,)).fetchone()
+
+    if not product:
+        conn.close()
+        await update.message.reply_text("❌ Mahsulot topilmadi.")
         return True
 
-    if state == "edit_service_description":
+    now = datetime.now().isoformat()
 
-        desc = update.message.text.strip()
-
-        if desc == "-":
-            desc = ""
-
-        context.user_data["new_description"] = desc
-
-        context.user_data["state"] = (
-            "edit_service_price"
+    cur = conn.execute("""
+        INSERT INTO orders(
+            user_id,
+            api_id,
+            product_id,
+            product_name,
+            external_product_id,
+            player_data,
+            delivery_type,
+            api_price,
+            sale_price,
+            status,
+            created_at,
+            updated_at
         )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    """, (
+        update.effective_user.id,
+        api_id,
+        product_id,
+        product["name"],
+        product["external_id"],
+        player_data,
+        delivery_type,
+        product["api_price"],
+        product["sale_price"],
+        now,
+        now
+    ))
+
+    order_id = cur.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    context.user_data.pop("order_step", None)
+    context.user_data.pop("selected_product_id", None)
+    context.user_data.pop("selected_api_id", None)
+    context.user_data.pop("delivery_type", None)
+
+    if delivery_type == "auto":
+        result = await asyncio.to_thread(
+            send_real_order,
+            order_id
+        )
+
+        if result["ok"]:
+            await update.message.reply_text(
+                f"✅ Buyurtma yuborildi!\n\n"
+                f"🆔 Buyurtma: #{order_id}\n"
+                f"📦 {product['name']}\n"
+                f"💰 {int(product['sale_price']):,} UZS\n"
+                f"🚚 AUTO\n\n"
+                f"📌 Provider ID: {result.get('provider_order_id', '-')}"
+            )
+        else:
+            await update.message.reply_text(
+                f"⚠️ Buyurtma yaratildi, lekin APIga yuborilmadi.\n\n"
+                f"🆔 #{order_id}\n"
+                f"Xato: {result['error']}"
+            )
+    else:
+        await update.message.reply_text(
+            f"✅ Buyurtma qabul qilindi!\n\n"
+            f"🆔 Buyurtma: #{order_id}\n"
+            f"📦 {product['name']}\n"
+            f"💰 {int(product['sale_price']):,} UZS\n"
+            f"🚚 MANUAL\n\n"
+            "👤 Admin buyurtmani qo‘lda bajaradi."
+        )
+
+        if ADMIN_ID:
+            await context.bot.send_message(
+                ADMIN_ID,
+                f"📦 Yangi MANUAL buyurtma!\n\n"
+                f"🆔 #{order_id}\n"
+                f"👤 User: {update.effective_user.id}\n"
+                f"📦 {product['name']}\n"
+                f"💰 {int(product['sale_price']):,} UZS\n"
+                f"📌 Ma'lumot: {player_data}"
+            )
+
+    return True
+
+
+# ============================================================
+# REAL API ORDER
+# ============================================================
+
+def send_real_order(order_id):
+    conn = db()
+
+    order = conn.execute("""
+        SELECT o.*, a.*
+        FROM orders o
+        JOIN api_accounts a ON a.id=o.api_id
+        WHERE o.id=?
+    """, (order_id,)).fetchone()
+
+    conn.close()
+
+    if not order:
+        return {
+            "ok": False,
+            "error": "Order topilmadi"
+        }
+
+    if not order["order_url"]:
+        return {
+            "ok": False,
+            "error": "Order endpointi sozlanmagan"
+        }
+
+    try:
+        url = build_url(
+            order["base_url"],
+            order["order_url"]
+        )
+
+        payload = {
+            "product_id": order["external_product_id"],
+            "player_id": order["player_data"],
+            "quantity": 1,
+            "idempotency_key": str(uuid.uuid4())
+        }
+
+        response = requests.post(
+            url,
+            headers=api_headers(order),
+            json=payload,
+            timeout=30
+        )
+
+        data = response.json()
+
+        if response.status_code >= 400:
+            return {
+                "ok": False,
+                "error": f"HTTP {response.status_code}: {data}"
+            }
+
+        provider_id = (
+            data.get("order_id")
+            or data.get("id")
+            or data.get("transaction_id")
+            or ""
+        )
+
+        conn = db()
+
+        conn.execute("""
+            UPDATE orders
+            SET status='sent',
+                provider_order_id=?,
+                updated_at=?
+            WHERE id=?
+        """, (
+            str(provider_id),
+            datetime.now().isoformat(),
+            order_id
+        ))
+
+        conn.commit()
+        conn.close()
+
+        return {
+            "ok": True,
+            "provider_order_id": provider_id
+        }
+
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user = query.from_user
+    save_user(user)
+
+    data = query.data
+
+    if data == "api_add":
+        await api_add_start(query, context)
+        return
+
+    if data == "api_list":
+        await show_api_list(update, context)
+        return
+
+    if data == "my_balance":
+        await show_api_list_for_balance(
+            query.message.chat_id,
+            context
+        )
+        return
+
+    if data == "profile":
+        conn = db()
+
+        api_count = conn.execute(
+            "SELECT COUNT(*) c FROM api_accounts WHERE user_id=?",
+            (user.id,)
+        ).fetchone()["c"]
+
+        order_count = conn.execute(
+            "SELECT COUNT(*) c FROM orders WHERE user_id=?",
+            (user.id,)
+        ).fetchone()["c"]
+
+        conn.close()
+
+        await query.message.edit_text(
+            f"👤 Profil\n\n"
+            f"🆔 ID: {user.id}\n"
+            f"👤 @{user.username or 'yo‘q'}\n"
+            f"🔑 API: {api_count} ta\n"
+            f"📦 Buyurtma: {order_count} ta",
+            reply_markup=user_menu()
+        )
+        return
+
+    if data == "help":
+        await query.message.edit_text(
+            "❓ Yordam\n\n"
+            "🔑 API ulash — o‘z API'ingizni ulang.\n"
+            "💰 Balans — API balansini tekshiring.\n"
+            "🔄 API narxlarini yangilang.\n"
+            "💵 Ustama — sotuv narxiga UZS qo‘shing.\n"
+            "📦 Buyurtma — AUTO yoki MANUAL tanlang.",
+            reply_markup=user_menu()
+        )
+        return
+
+    if data == "order":
+        await show_order_apis(
+            query.message.chat_id,
+            context
+        )
+        return
+
+    if data.startswith("api_view:"):
+        api_id = int(data.split(":")[1])
+        api = get_api(api_id)
+
+        if not api or api["user_id"] != user.id:
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        await query.message.edit_text(
+            f"🔑 {api['name']}\n\n"
+            f"🌐 URL: {api['base_url']}\n"
+            f"💵 Ustama: +{int(api['markup_uzs']):,} UZS",
+            reply_markup=api_control_keyboard(api_id)
+        )
+        return
+
+    if data.startswith("api_balance:"):
+        api_id = int(data.split(":")[1])
+        api = get_api(api_id)
+
+        if not api or api["user_id"] != user.id:
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        await query.message.edit_text(
+            "🔄 API balansi tekshirilmoqda..."
+        )
+
+        result = await asyncio.to_thread(
+            fetch_balance,
+            api_id
+        )
+
+        if result["ok"]:
+            await query.message.edit_text(
+                f"💰 {api['name']} API Balansi\n\n"
+                f"💵 {result['balance']}",
+                reply_markup=api_control_keyboard(api_id)
+            )
+        else:
+            await query.message.edit_text(
+                f"❌ Balansni olishda xato:\n\n"
+                f"{result['error']}",
+                reply_markup=api_control_keyboard(api_id)
+            )
+        return
+
+    if data.startswith("api_refresh:"):
+        api_id = int(data.split(":")[1])
+        api = get_api(api_id)
+
+        if not api or api["user_id"] != user.id:
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        await query.message.edit_text(
+            "🔄 API yangilanmoqda...\n\n"
+            "💰 API narxlari olinmoqda..."
+        )
+
+        result = await asyncio.to_thread(
+            refresh_catalog,
+            api_id
+        )
+
+        if result["ok"]:
+            await query.message.edit_text(
+                f"✅ API narxlari olindi!\n\n"
+                f"📦 {result['count']} ta mahsulot\n"
+                f"💵 Ustama: +{int(result['markup']):,} UZS",
+                reply_markup=api_control_keyboard(api_id)
+            )
+        else:
+            await query.message.edit_text(
+                f"❌ API narxlari olinmadi.\n\n"
+                f"{result['error']}",
+                reply_markup=api_control_keyboard(api_id)
+            )
+        return
+
+    if data.startswith("api_markup:"):
+        api_id = int(data.split(":")[1])
+        api = get_api(api_id)
+
+        if not api or api["user_id"] != user.id:
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        await api_markup_start(
+            query,
+            context,
+            api_id
+        )
+        return
+
+    if data.startswith("order_api:"):
+        api_id = int(data.split(":")[1])
+        api = get_api(api_id)
+
+        if not api or api["user_id"] != user.id:
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        await show_products(
+            query,
+            context,
+            api_id
+        )
+        return
+
+    if data.startswith("product:"):
+        product_id = int(data.split(":")[1])
+        await order_product(
+            query,
+            context,
+            product_id
+        )
+        return
+
+    if data.startswith("delivery:"):
+        delivery_type = data.split(":")[1]
+
+        await delivery_selected(
+            query,
+            context,
+            delivery_type
+        )
+        return
+
+    # ================= ADMIN =================
+
+    if data == "admin_users":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        conn = db()
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM users"
+        ).fetchone()["c"]
+        conn.close()
+
+        await query.message.edit_text(
+            f"👥 Foydalanuvchilar: {count} ta",
+            reply_markup=admin_menu()
+        )
+        return
+
+    if data == "admin_orders":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        conn = db()
+
+        rows = conn.execute("""
+            SELECT id, user_id, product_name,
+                   sale_price, delivery_type, status
+            FROM orders
+            ORDER BY id DESC
+            LIMIT 20
+        """).fetchall()
+
+        conn.close()
+
+        if not rows:
+            text = "📦 Buyurtmalar yo‘q."
+        else:
+            text = "📦 So‘nggi buyurtmalar:\n\n"
+
+            for r in rows:
+                text += (
+                    f"#{r['id']} | "
+                    f"{r['product_name']} | "
+                    f"{int(r['sale_price']):,} UZS | "
+                    f"{r['delivery_type']} | "
+                    f"{r['status']}\n"
+                )
+
+        await query.message.edit_text(
+            text,
+            reply_markup=admin_menu()
+        )
+        return
+
+    if data == "admins":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        conn = db()
+
+        rows = conn.execute("""
+            SELECT user_id, username
+            FROM admins
+            ORDER BY user_id
+        """).fetchall()
+
+        conn.close()
+
+        text = "👑 Qo‘shimcha adminlar:\n\n"
+
+        if not rows:
+            text += "Hozircha yo‘q."
+        else:
+            for r in rows:
+                text += f"• @{r['username'] or 'username yo‘q'} — {r['user_id']}\n"
+
+        await query.message.edit_text(
+            text,
+            reply_markup=admin_menu()
+        )
+        return
+
+    if data == "admin_add":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        context.user_data["admin_action"] = "add"
+
+        await query.message.edit_text(
+            "➕ Admin qo‘shish\n\n"
+            "Foydalanuvchining username'ini yuboring.\n\n"
+            "Masalan:\n"
+            "@username"
+        )
+        return
+
+    if data == "admin_remove":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        context.user_data["admin_action"] = "remove"
+
+        await query.message.edit_text(
+            "➖ Adminni olib tashlash\n\n"
+            "@username yuboring."
+        )
+        return
+
+    if data == "admin_stats":
+        if not is_admin(user.id):
+            await query.message.edit_text("❌ Ruxsat yo‘q.")
+            return
+
+        conn = db()
+
+        total = conn.execute(
+            "SELECT COUNT(*) c FROM orders"
+        ).fetchone()["c"]
+
+        sent = conn.execute(
+            "SELECT COUNT(*) c FROM orders WHERE status='sent'"
+        ).fetchone()["c"]
+
+        revenue = conn.execute(
+            "SELECT COALESCE(SUM(sale_price),0) s FROM orders"
+        ).fetchone()["s"]
+
+        conn.close()
+
+        await query.message.edit_text(
+            f"📊 Statistika\n\n"
+            f"📦 Jami buyurtma: {total}\n"
+            f"✅ APIga yuborilgan: {sent}\n"
+            f"💰 Jami tushum: {int(revenue):,} UZS",
+            reply_markup=admin_menu()
+        )
+        return
+
+
+# ============================================================
+# ADMIN USERNAME
+# ============================================================
+
+async def handle_admin_action(update, context):
+    action = context.user_data.get("admin_action")
+
+    if not action:
+        return False
+
+    if not is_admin(update.effective_user.id):
+        return False
+
+    username = update.message.text.strip().lstrip("@").lower()
+
+    conn = db()
+
+    user = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE LOWER(username)=?
+    """, (username,)).fetchone()
+
+    if not user:
+        conn.close()
 
         await update.message.reply_text(
-            "💰 Yangi narxni yuboring."
+            "❌ Bu username bilan foydalanuvchi topilmadi.\n\n"
+            "U avval botga /start bosgan bo‘lishi kerak."
         )
-
         return True
 
-    if state == "edit_service_price":
+    if action == "add":
+        conn.execute("""
+            INSERT OR REPLACE INTO admins(
+                user_id,
+                username,
+                added_at
+            )
+            VALUES (?, ?, ?)
+        """, (
+            user["user_id"],
+            user["username"],
+            datetime.now().isoformat()
+        ))
+
+        conn.commit()
+        conn.close()
+
+        context.user_data.pop("admin_action", None)
+
+        await update.message.reply_text(
+            f"✅ @{user['username']} admin qilib qo‘shildi."
+        )
 
         try:
+            from telegram import BotCommandScopeChat
 
-            price = int(
-                update.message.text
-                .strip()
-                .replace(" ", "")
-                .replace(",", "")
+            await context.bot.set_my_commands(
+                [
+                    BotCommand("start", "Botni ishga tushirish"),
+                    BotCommand("help", "Yordam"),
+                    BotCommand("profile", "Profil"),
+                    BotCommand("balance", "Balans"),
+                    BotCommand("admin", "Admin panel"),
+                ],
+                scope=BotCommandScopeChat(user["user_id"])
             )
+        except Exception as e:
+            logger.warning("Admin command update error: %s", e)
 
-            if price < 0:
-                raise ValueError
+        return True
 
-        except Exception:
-
+    if action == "remove":
+        if user["user_id"] == ADMIN_ID:
             await update.message.reply_text(
-                "❌ Narx noto‘g‘ri."
+                "❌ Asosiy adminni olib tashlab bo‘lmaydi."
             )
-
             return True
 
-        service_id = context.user_data[
-            "service_id"
-        ]
-
-        bot_id = context.user_data[
-            "bot_id"
-        ]
-
-        update_service(
-            service_id,
-            context.user_data["new_name"],
-            context.user_data["new_description"],
-            price
+        conn.execute(
+            "DELETE FROM admins WHERE user_id=?",
+            (user["user_id"],)
         )
 
-        context.user_data.clear()
+        conn.commit()
+        conn.close()
+
+        context.user_data.pop("admin_action", None)
 
         await update.message.reply_text(
-            "✅ Xizmat o‘zgartirildi!",
-            reply_markup=settings_menu(bot_id)
+            f"✅ @{user['username']} adminlikdan olib tashlandi."
         )
 
         return True
@@ -2759,1427 +1920,119 @@ async def edit_service_text_handler(
 
 
 # ============================================================
-# CHILD START
+# /ADMIN
 # ============================================================
 
-async def child_start(
-    update,
-    context
-):
-
-    bot_db_id = context.application.bot_data[
-        "bot_db_id"
-    ]
-
-    save_user(
-        update.effective_user
-    )
-
-    if not subscription_active(bot_db_id):
-
-        bot = get_bot(bot_db_id)
-
+async def admin_command(update, context):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text(
-            "🔴 Bu botning obunasi tugagan.\n\n"
-            "Bot egasi asosiy bot orqali obunani yangilashi kerak."
-        )
-
-        return
-
-    text = get_start_text(
-        bot_db_id
-    )
-
-    await update.message.reply_text(
-        text,
-        reply_markup=child_menu(bot_db_id)
-    )
-
-
-# ============================================================
-# CHILD BALANCE
-# ============================================================
-
-async def child_balance_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    balance = get_balance(
-        query.from_user.id
-    )
-
-    await query.message.reply_text(
-        f"💰 Balansingiz:\n\n"
-        f"{balance:,} so‘m"
-    )
-
-
-# ============================================================
-# CHILD TOPUP
-# ============================================================
-
-async def child_topup_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_db_id = context.application.bot_data[
-        "bot_db_id"
-    ]
-
-    context.user_data.clear()
-
-    context.user_data["state"] = "topup_amount"
-    context.user_data["payment_bot_id"] = bot_db_id
-    context.user_data["payment_source"] = "child"
-
-    card = get_payment_card()
-
-    await query.message.reply_text(
-        "➕ Balans to‘ldirish\n\n"
-        "💳 Karta:\n"
-        f"`{card}`\n\n"
-        "💰 Summani yuboring.\n"
-        "Masalan: 25000",
-        parse_mode="Markdown"
-    )
-
-
-# ============================================================
-# CHILD SUBSCRIPTION
-# ============================================================
-
-async def child_subscription_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_db_id = context.application.bot_data[
-        "bot_db_id"
-    ]
-
-    await query.message.reply_text(
-        f"💳 Bot obunasi\n\n"
-        f"{subscription_text(bot_db_id)}\n\n"
-        "Obunani bot egasi asosiy bot orqali sotib oladi.",
-        reply_markup=subscription_menu(bot_db_id)
-    )
-
-
-# ============================================================
-# CHILD SERVICES
-# ============================================================
-
-async def child_services_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_db_id = context.application.bot_data[
-        "bot_db_id"
-    ]
-
-    if not subscription_active(bot_db_id):
-
-        await query.message.reply_text(
-            "🔴 Bot obunasi tugagan."
-        )
-
-        return
-
-    services = get_services(bot_db_id)
-
-    if not services:
-
-        await query.message.reply_text(
-            "🛍 Hozircha xizmatlar mavjud emas."
-        )
-
-        return
-
-    buttons = []
-
-    for service in services:
-
-        buttons.append([
-            InlineKeyboardButton(
-                f"{service['name']} — "
-                f"{service['price']:,} so‘m",
-                callback_data=(
-                    f"service:{service['id']}:"
-                    f"{bot_db_id}"
-                )
-            )
-        ])
-
-    await query.message.reply_text(
-        "🛍 Xizmatlar:",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ============================================================
-# CHILD SERVICE
-# ============================================================
-
-async def child_service_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    bot_db_id = context.application.bot_data[
-        "bot_db_id"
-    ]
-
-    if not subscription_active(bot_db_id):
-
-        await query.message.reply_text(
-            "🔴 Bot obunasi tugagan."
-        )
-
-        return
-
-    service_id = int(
-        query.data.split(":")[1]
-    )
-
-    service = get_service(
-        service_id
-    )
-
-    if not service:
-
-        await query.message.reply_text(
-            "❌ Xizmat topilmadi."
-        )
-
-        return
-
-    text = (
-        f"🛍 {service['name']}\n\n"
-    )
-
-    if service["description"]:
-
-        text += (
-            f"📝 {service['description']}\n\n"
-        )
-
-    text += (
-        f"💰 Narxi: "
-        f"{service['price']:,} so‘m"
-    )
-
-    await query.message.reply_text(
-        text
-    )
-
-
-# ============================================================
-# CUSTOM BUTTON
-# ============================================================
-
-async def custom_button_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    parts = query.data.split(":")
-
-    button_id = int(parts[1])
-    bot_db_id = int(parts[2])
-
-    if not subscription_active(bot_db_id):
-
-        await query.message.reply_text(
-            "🔴 Bot obunasi tugagan."
-        )
-
-        return
-
-    conn = db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM custom_buttons
-        WHERE id = ?
-        AND bot_id = ?
-        AND active = 1
-    """, (
-        button_id,
-        bot_db_id
-    )).fetchone()
-
-    conn.close()
-
-    if not row:
-
-        await query.message.reply_text(
-            "❌ Tugma topilmadi."
-        )
-
-        return
-
-    await query.message.reply_text(
-        row["text"]
-    )
-
-
-# ============================================================
-# CHILD HELP
-# ============================================================
-
-async def child_help(
-    update,
-    context
-):
-
-    await update.message.reply_text(
-        "ℹ️ Yordam\n\n"
-        "/start — Asosiy menyu\n"
-        "/help — Yordam"
-    )
-
-
-# ============================================================
-# ADMIN CHECK
-# ============================================================
-
-def is_admin(user_id):
-
-    return (
-        ADMIN_ID != 0
-        and user_id == ADMIN_ID
-    )
-
-
-# ============================================================
-# ADMIN PANEL
-# ============================================================
-
-def admin_menu():
-
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "💳 Karta",
-                callback_data="admin_card"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "💰 Balanslar",
-                callback_data="admin_balances"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "📊 Statistika",
-                callback_data="admin_stats"
-            )
-        ],
-    ])
-
-
-async def admin_command(
-    update,
-    context
-):
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        await update.message.reply_text(
-            "❌ Siz admin emassiz."
+            "❌ Sizda admin huquqi yo‘q."
         )
         return
 
     await update.message.reply_text(
-        "👨‍💼 ADMIN PANEL",
+        "👑 Admin panel",
         reply_markup=admin_menu()
     )
 
 
 # ============================================================
-# ADMIN CARD
+# TEXT ROUTER
 # ============================================================
 
-async def admin_card_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await handle_admin_action(update, context):
         return
 
-    context.user_data.clear()
+    if await handle_markup_text(update, context):
+        return
 
-    context.user_data["state"] = "admin_card"
+    if await handle_api_add_text(update, context):
+        return
 
-    await query.message.reply_text(
-        "💳 Yangi karta raqamini yuboring."
+    if await handle_order_data(update, context):
+        return
+
+    await update.message.reply_text(
+        "⬇️ Menyudan foydalaning.",
+        reply_markup=(
+            admin_menu()
+            if is_admin(update.effective_user.id)
+            else user_menu()
+        )
     )
-
-
-# ============================================================
-# ADMIN STATS
-# ============================================================
-
-async def admin_stats_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    conn = db()
-
-    users = conn.execute(
-        "SELECT COUNT(*) AS c FROM users"
-    ).fetchone()["c"]
-
-    bots = conn.execute(
-        "SELECT COUNT(*) AS c FROM bots"
-    ).fetchone()["c"]
-
-    payments = conn.execute(
-        "SELECT COUNT(*) AS c FROM payments"
-    ).fetchone()["c"]
-
-    approved = conn.execute("""
-        SELECT COALESCE(SUM(amount), 0) AS s
-        FROM payments
-        WHERE status = 'approved'
-    """).fetchone()["s"]
-
-    conn.close()
-
-    await query.message.reply_text(
-        "📊 STATISTIKA\n\n"
-        f"👤 Foydalanuvchilar: {users}\n"
-        f"🤖 Botlar: {bots}\n"
-        f"💳 To‘lovlar: {payments}\n"
-        f"💰 Tasdiqlangan tushum: {approved:,} so‘m"
-    )
-
-
-# ============================================================
-# ADMIN BALANCES
-# ============================================================
-
-async def admin_balances_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        return
-
-    conn = db()
-
-    rows = conn.execute("""
-        SELECT user_id, username, balance
-        FROM users
-        ORDER BY balance DESC
-        LIMIT 20
-    """).fetchall()
-
-    conn.close()
-
-    if not rows:
-
-        await query.message.reply_text(
-            "Foydalanuvchilar yo‘q."
-        )
-
-        return
-
-    text = "💰 BALANSLAR\n\n"
-
-    for row in rows:
-
-        text += (
-            f"👤 {row['user_id']}\n"
-            f"@{row['username'] or 'yo‘q'}\n"
-            f"💵 {int(row['balance'] or 0):,} so‘m\n\n"
-        )
-
-    await query.message.reply_text(
-        text
-    )
-
-
-# ============================================================
-# ADMIN PAYMENT PROCESS
-# ============================================================
-
-async def admin_payment_callback(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    await query.answer()
-
-    if not is_admin(
-        query.from_user.id
-    ):
-        await query.message.reply_text(
-            "❌ Admin emassiz."
-        )
-        return
-
-    parts = query.data.split(":")
-
-    action = parts[0]
-    payment_id = int(parts[1])
-
-    approve = (
-        action == "pay_approve"
-    )
-
-    row, result = process_payment(
-        payment_id,
-        approve,
-        query.from_user.id
-    )
-
-    if result == "not_found":
-
-        await query.message.reply_text(
-            "❌ To‘lov topilmadi."
-        )
-
-        return
-
-    if result == "already_processed":
-
-        await query.message.reply_text(
-            "⚠️ Bu to‘lov avval ko‘rib chiqilgan."
-        )
-
-        return
-
-    if approve:
-
-        await query.message.reply_text(
-            f"✅ To‘lov #{payment_id} tasdiqlandi.\n\n"
-            f"💰 {row['amount']:,} so‘m balansga qo‘shildi."
-        )
-
-        try:
-
-            main_app = (
-                Application.builder()
-                .token(MAIN_BOT_TOKEN)
-                .build()
-            )
-
-            await main_app.initialize()
-
-            await main_app.bot.send_message(
-                chat_id=row["user_id"],
-                text=(
-                    "✅ TO‘LOV TASDIQLANDI!\n\n"
-                    f"🧾 ID: #{payment_id}\n"
-                    f"💰 +{row['amount']:,} so‘m\n\n"
-                    f"💵 Yangi balans: "
-                    f"{get_balance(row['user_id']):,} so‘m"
-                )
-            )
-
-            await main_app.shutdown()
-
-        except Exception as e:
-
-            logger.error(
-                "User notification error: %s",
-                e
-            )
-
-    else:
-
-        await query.message.reply_text(
-            f"❌ To‘lov #{payment_id} rad etildi."
-        )
-
-        try:
-
-            main_app = (
-                Application.builder()
-                .token(MAIN_BOT_TOKEN)
-                .build()
-            )
-
-            await main_app.initialize()
-
-            await main_app.bot.send_message(
-                chat_id=row["user_id"],
-                text=(
-                    "❌ TO‘LOV RAD ETILDI.\n\n"
-                    f"🧾 ID: #{payment_id}\n"
-                    f"💰 Summa: {row['amount']:,} so‘m"
-                )
-            )
-
-            await main_app.shutdown()
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# ADMIN TEXT
-# ============================================================
-
-async def admin_text_handler(
-    update,
-    context
-):
-
-    if not is_admin(
-        update.effective_user.id
-    ):
-        return False
-
-    state = context.user_data.get(
-        "state"
-    )
-
-    if state == "admin_card":
-
-        card = update.message.text.strip()
-
-        set_payment_card(card)
-
-        context.user_data.clear()
-
-        await update.message.reply_text(
-            "✅ Karta raqami o‘zgartirildi.",
-            reply_markup=admin_menu()
-        )
-
-        return True
-
-    return False
-
-
-# ============================================================
-# CHILD RUNNER
-# ============================================================
-
-async def run_child_bot(token):
-
-    if token in running_bots:
-        return
-
-    app = None
-
-    try:
-
-        conn = db()
-
-        row = conn.execute("""
-            SELECT *
-            FROM bots
-            WHERE token = ?
-            AND active = 1
-        """, (token,)).fetchone()
-
-        conn.close()
-
-        if not row:
-            return
-
-        bot_db_id = row["id"]
-
-        # No subscription = don't run
-        if not subscription_active(bot_db_id):
-
-            logger.info(
-                "Child bot %s has no active subscription.",
-                bot_db_id
-            )
-
-            return
-
-        app = (
-            Application.builder()
-            .token(token)
-            .build()
-        )
-
-        app.bot_data["bot_db_id"] = bot_db_id
-
-        app.add_handler(
-            CommandHandler(
-                "start",
-                child_start
-            )
-        )
-
-        app.add_handler(
-            CommandHandler(
-                "help",
-                child_help
-            )
-        )
-
-        app.add_handler(
-            CommandHandler(
-                "admin",
-                admin_command
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                child_services_callback,
-                pattern=r"^child_services:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                child_balance_callback,
-                pattern=r"^child_balance:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                child_topup_callback,
-                pattern=r"^child_topup:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                child_subscription_callback,
-                pattern=r"^child_subscription:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                child_service_callback,
-                pattern=r"^service:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                custom_button_callback,
-                pattern=r"^custom:"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                admin_payment_callback,
-                pattern=r"^pay_(approve|reject):"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                admin_card_callback,
-                pattern=r"^admin_card$"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                admin_stats_callback,
-                pattern=r"^admin_stats$"
-            )
-        )
-
-        app.add_handler(
-            CallbackQueryHandler(
-                admin_balances_callback,
-                pattern=r"^admin_balances$"
-            )
-        )
-
-        app.add_handler(
-            MessageHandler(
-                filters.PHOTO,
-                receive_photo
-            )
-        )
-
-        app.add_handler(
-            MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                child_text_router
-            )
-        )
-
-        await app.initialize()
-
-        await app.start()
-
-        await app.updater.start_polling(
-            drop_pending_updates=True
-        )
-
-        running_bots[token] = app
-
-        logger.info(
-            "Child bot started: %s",
-            bot_db_id
-        )
-
-        while token in running_bots:
-
-            if not subscription_active(bot_db_id):
-
-                logger.info(
-                    "Subscription expired: %s",
-                    bot_db_id
-                )
-
-                break
-
-            await asyncio.sleep(10)
-
-    except Exception as e:
-
-        logger.exception(
-            "Child bot error: %s",
-            e
-        )
-
-    finally:
-
-        running_bots.pop(
-            token,
-            None
-        )
-
-        if app:
-
-            try:
-                await app.updater.stop()
-            except Exception:
-                pass
-
-            try:
-                await app.stop()
-            except Exception:
-                pass
-
-            try:
-                await app.shutdown()
-            except Exception:
-                pass
-
-
-# ============================================================
-# CHILD TEXT ROUTER
-# ============================================================
-
-async def child_text_router(
-    update,
-    context
-):
-
-    state = context.user_data.get(
-        "state"
-    )
-
-    if state == "topup_amount":
-
-        await receive_main_text(
-            update,
-            context
-        )
-
-        return
-
-    if state == "topup_photo":
-
-        return
-
-    if state == "admin_card":
-
-        handled = await admin_text_handler(
-            update,
-            context
-        )
-
-        if handled:
-            return
-
-    await receive_main_text(
-        update,
-        context
-    )
-
-
-# ============================================================
-# RESTORE BOTS
-# ============================================================
-
-async def restore_saved_bots():
-
-    rows = get_active_bots()
-
-    logger.info(
-        "Found %s saved bots.",
-        len(rows)
-    )
-
-    for row in rows:
-
-        if not subscription_active(
-            row["id"]
-        ):
-            continue
-
-        token = row["token"]
-
-        if token in running_bots:
-            continue
-
-        task = asyncio.create_task(
-            run_child_bot(token)
-        )
-
-        running_tasks[token] = task
-
-        await asyncio.sleep(1)
-
-
-# ============================================================
-# EXPIRATION MONITOR
-# ============================================================
-
-async def subscription_monitor():
-
-    while True:
-
-        try:
-
-            rows = get_active_bots()
-
-            for row in rows:
-
-                if not subscription_active(
-                    row["id"]
-                ):
-
-                    token = row["token"]
-
-                    if token in running_bots:
-
-                        logger.info(
-                            "Stopping expired bot %s",
-                            row["id"]
-                        )
-
-                        running_bots.pop(
-                            token,
-                            None
-                        )
-
-            await asyncio.sleep(30)
-
-        except Exception as e:
-
-            logger.error(
-                "Subscription monitor error: %s",
-                e
-            )
-
-            await asyncio.sleep(30)
-
-
-# ============================================================
-# CALLBACK ROUTER
-# ============================================================
-
-async def callback_router(
-    update,
-    context
-):
-
-    query = update.callback_query
-
-    if not query:
-        return
-
-    data = query.data
-
-    # --------------------------------------------------------
-    # ADMIN PAYMENTS
-    # --------------------------------------------------------
-
-    if data.startswith(
-        "pay_approve:"
-    ) or data.startswith(
-        "pay_reject:"
-    ):
-
-        await admin_payment_callback(
-            update,
-            context
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ADMIN
-    # --------------------------------------------------------
-
-    if data == "admin_card":
-
-        await admin_card_callback(
-            update,
-            context
-        )
-
-        return
-
-    if data == "admin_stats":
-
-        await admin_stats_callback(
-            update,
-            context
-        )
-
-        return
-
-    if data == "admin_balances":
-
-        await admin_balances_callback(
-            update,
-            context
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # MAIN
-    # --------------------------------------------------------
-
-    if data == "create_bot":
-
-        await create_bot_callback(
-            update,
-            context
-        )
-
-    elif data == "my_bots":
-
-        await my_bots_callback(
-            update,
-            context
-        )
-
-    elif data == "main_balance":
-
-        await main_balance_callback(
-            update,
-            context
-        )
-
-    elif data == "main_topup":
-
-        await main_topup_callback(
-            update,
-            context
-        )
-
-    elif data == "main_subscriptions":
-
-        await main_subscriptions_callback(
-            update,
-            context
-        )
-
-    elif data == "back_main":
-
-        await query.answer()
-
-        await query.message.reply_text(
-            "Asosiy menyu:",
-            reply_markup=main_menu()
-        )
-
-    elif data.startswith(
-        "manage:"
-    ):
-
-        await manage_bot_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "services:"
-    ):
-
-        await services_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "add_service:"
-    ):
-
-        await add_service_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "edit_services:"
-    ):
-
-        await edit_services_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "editone:"
-    ):
-
-        await edit_one_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "delete_services:"
-    ):
-
-        await delete_services_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "deleteone:"
-    ):
-
-        await delete_one_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "start_text:"
-    ):
-
-        await start_text_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "add_button:"
-    ):
-
-        await add_button_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "code_mode:"
-    ):
-
-        await code_mode_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "bot_subscription:"
-    ):
-
-        await bot_subscription_callback(
-            update,
-            context
-        )
-
-    elif data.startswith(
-        "buy_sub:"
-    ):
-
-        await buy_subscription_callback(
-            update,
-            context
-        )
-
-    else:
-
-        await query.answer()
-
-
-# ============================================================
-# MAIN TEXT ROUTER
-# ============================================================
-
-async def main_text_router(
-    update,
-    context
-):
-
-    handled = await admin_text_handler(
-        update,
-        context
-    )
-
-    if handled:
-        return
-
-    state = context.user_data.get(
-        "state"
-    )
-
-    if state in (
-        "edit_service_name",
-        "edit_service_description",
-        "edit_service_price"
-    ):
-
-        handled = await edit_service_text_handler(
-            update,
-            context
-        )
-
-        if handled:
-            return
-
-    await receive_main_text(
-        update,
-        context
-    )
-
-
-# ============================================================
-# HEALTH SERVER
-# ============================================================
-
-class HealthHandler(
-    BaseHTTPRequestHandler
-):
-
-    def do_GET(self):
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"BOT SERVER OK"
-        )
-
-    def log_message(
-        self,
-        format,
-        *args
-    ):
-
-        return
-
-
-def start_health_server():
-
-    server = HTTPServer(
-        (
-            "0.0.0.0",
-            PORT
-        ),
-        HealthHandler
-    )
-
-    logger.info(
-        "Health server on port %s",
-        PORT
-    )
-
-    server.serve_forever()
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-async def main():
-
-    if not MAIN_BOT_TOKEN:
-
+def main():
+    if not BOT_TOKEN:
         raise RuntimeError(
-            "BOT_TOKEN topilmadi. "
-            "Render Environment Variables ga "
-            "BOT_TOKEN qo‘ying."
+            "BOT_TOKEN Render Environment Variables ichida yo‘q."
         )
 
     if ADMIN_ID == 0:
-
-        logger.warning(
-            "ADMIN_ID qo‘yilmagan."
+        raise RuntimeError(
+            "ADMIN_ID Render Environment Variables ichida yo‘q."
         )
 
     init_db()
 
-    # Health server
-    threading.Thread(
+    Thread(
         target=start_health_server,
         daemon=True
     ).start()
 
-    app = (
+    application = (
         Application.builder()
-        .token(MAIN_BOT_TOKEN)
+        .token(BOT_TOKEN)
+        .post_init(setup_commands)
         .build()
     )
 
-    # Main commands
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start_command
-        )
+    application.add_handler(
+        CommandHandler("start", start)
     )
 
-    app.add_handler(
-        CommandHandler(
-            "admin",
-            admin_command
-        )
+    application.add_handler(
+        CommandHandler("help", help_command)
     )
 
-    # Main callbacks
-    app.add_handler(
-        CallbackQueryHandler(
-            callback_router
-        )
+    application.add_handler(
+        CommandHandler("profile", profile_command)
     )
 
-    # Photo
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            receive_photo
-        )
+    application.add_handler(
+        CommandHandler("balance", balance_command)
     )
 
-    # Text
-    app.add_handler(
+    application.add_handler(
+        CommandHandler("order", order_command)
+    )
+
+    application.add_handler(
+        CommandHandler("admin", admin_command)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(callback_handler)
+    )
+
+    application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            main_text_router
+            text_handler
         )
     )
 
-    await app.initialize()
+    logger.info("Bot started.")
 
-    await app.start()
-
-    await app.updater.start_polling(
-        drop_pending_updates=True
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
     )
 
-    logger.info(
-        "Main bot started."
-    )
-
-    # Restore child bots
-    await restore_saved_bots()
-
-    # Subscription monitor
-    asyncio.create_task(
-        subscription_monitor()
-    )
-
-    try:
-
-        while True:
-
-            await asyncio.sleep(60)
-
-    except asyncio.CancelledError:
-
-        pass
-
-    finally:
-
-        await app.updater.stop()
-
-        await app.stop()
-
-        await app.shutdown()
-
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        asyncio.run(main())
-
-    except KeyboardInterrupt:
-
-        logger.info(
-            "Application stopped."
-        )
+    main()
