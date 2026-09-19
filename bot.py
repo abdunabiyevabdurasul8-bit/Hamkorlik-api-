@@ -2,7 +2,6 @@ import os
 import json
 import sqlite3
 import logging
-import asyncio
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -11,12 +10,12 @@ import requests
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
     Bot,
     BotCommandScopeDefault,
     MenuButtonDefault,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
@@ -37,13 +36,8 @@ ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 DB_FILE = os.getenv("DB_FILE", "donuz.db")
 SOS_USERNAME = os.getenv("SOS_USERNAME", "@donuz1").strip()
 
+# Render Web Service PORT
 PORT = int(os.getenv("PORT", "10000"))
-
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN topilmadi")
-
-if not ADMIN_ID:
-    logging.warning("ADMIN_ID berilmagan")
 
 
 # =========================================================
@@ -58,6 +52,10 @@ logging.basicConfig(
 logger = logging.getLogger("DONUZ")
 
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN topilmadi")
+
+
 # =========================================================
 # WEB SERVICE HEALTH SERVER
 # =========================================================
@@ -66,13 +64,19 @@ class HealthHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
         self.end_headers()
         self.wfile.write(b"DONUZ BOT OK")
 
     def do_HEAD(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header(
+            "Content-Type",
+            "text/plain; charset=utf-8"
+        )
         self.end_headers()
 
     def log_message(self, format, *args):
@@ -80,18 +84,23 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_health_server():
+
     try:
         server = HTTPServer(
             ("0.0.0.0", PORT),
-            HealthHandler,
+            HealthHandler
         )
 
-        logger.info(f"Health server started on 0.0.0.0:{PORT}")
+        logger.info(
+            f"Health server started on port {PORT}"
+        )
 
         server.serve_forever()
 
     except Exception as e:
-        logger.exception(f"Health server error: {e}")
+        logger.exception(
+            f"Health server error: {e}"
+        )
 
 
 # =========================================================
@@ -99,6 +108,7 @@ def start_health_server():
 # =========================================================
 
 def get_db():
+
     conn = sqlite3.connect(
         DB_FILE,
         timeout=30,
@@ -107,8 +117,13 @@ def get_db():
 
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
+    )
 
     return conn
 
@@ -215,19 +230,38 @@ def init_db():
 
 
 # =========================================================
-# STATE
+# TIME
 # =========================================================
 
-def set_state(user_id, bot_owner_id, state, data=None):
+def now():
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+# =========================================================
+# STATES
+# =========================================================
+
+def set_state(
+    user_id,
+    owner_id,
+    state,
+    data=None
+):
 
     data = data or {}
 
     conn = get_db()
-    cur = conn.cursor()
 
-    cur.execute("""
+    conn.execute("""
         INSERT INTO states
-        (user_id, bot_owner_id, state, data)
+        (
+            user_id,
+            bot_owner_id,
+            state,
+            data
+        )
         VALUES (?, ?, ?, ?)
         ON CONFLICT(user_id, bot_owner_id)
         DO UPDATE SET
@@ -235,26 +269,33 @@ def set_state(user_id, bot_owner_id, state, data=None):
             data=excluded.data
     """, (
         user_id,
-        bot_owner_id,
+        owner_id,
         state,
-        json.dumps(data, ensure_ascii=False),
+        json.dumps(
+            data,
+            ensure_ascii=False
+        ),
     ))
 
     conn.commit()
     conn.close()
 
 
-def get_state(user_id, bot_owner_id):
+def get_state(
+    user_id,
+    owner_id
+):
 
     conn = get_db()
 
     row = conn.execute("""
         SELECT state, data
         FROM states
-        WHERE user_id=? AND bot_owner_id=?
+        WHERE user_id=?
+          AND bot_owner_id IS ?
     """, (
         user_id,
-        bot_owner_id,
+        owner_id,
     )).fetchone()
 
     conn.close()
@@ -263,23 +304,29 @@ def get_state(user_id, bot_owner_id):
         return None, {}
 
     try:
-        data = json.loads(row["data"])
+        data = json.loads(
+            row["data"]
+        )
     except Exception:
         data = {}
 
     return row["state"], data
 
 
-def clear_state(user_id, bot_owner_id):
+def clear_state(
+    user_id,
+    owner_id
+):
 
     conn = get_db()
 
     conn.execute("""
         DELETE FROM states
-        WHERE user_id=? AND bot_owner_id=?
+        WHERE user_id=?
+          AND bot_owner_id IS ?
     """, (
         user_id,
-        bot_owner_id,
+        owner_id,
     ))
 
     conn.commit()
@@ -333,12 +380,13 @@ def customer_keyboard():
 
 
 # =========================================================
-# TELEGRAM MENU HIDE
+# HIDE BOT COMMANDS
 # =========================================================
 
 async def hide_bot_commands(bot):
 
     try:
+
         await bot.delete_my_commands(
             scope=BotCommandScopeDefault()
         )
@@ -348,16 +396,19 @@ async def hide_bot_commands(bot):
         )
 
     except Exception as e:
+
         logger.warning(
-            f"Bot menu sozlamasida xato: {e}"
+            f"Telegram menu setup error: {e}"
         )
 
 
 # =========================================================
-# MASTER / OWNER HELPERS
+# OWNER HELPERS
 # =========================================================
 
-def get_owner_by_user(user_id):
+def get_owner_by_user(
+    user_id
+):
 
     conn = get_db()
 
@@ -365,29 +416,18 @@ def get_owner_by_user(user_id):
         SELECT *
         FROM bot_owners
         WHERE owner_user_id=?
-    """, (user_id,)).fetchone()
+    """, (
+        user_id,
+    )).fetchone()
 
     conn.close()
 
     return row
 
 
-def get_owner_by_token(token):
-
-    conn = get_db()
-
-    row = conn.execute("""
-        SELECT *
-        FROM bot_owners
-        WHERE bot_token=?
-    """, (token,)).fetchone()
-
-    conn.close()
-
-    return row
-
-
-def get_owner(owner_id):
+def get_owner_by_id(
+    owner_id
+):
 
     conn = get_db()
 
@@ -395,18 +435,32 @@ def get_owner(owner_id):
         SELECT *
         FROM bot_owners
         WHERE id=?
-    """, (owner_id,)).fetchone()
+    """, (
+        owner_id,
+    )).fetchone()
 
     conn.close()
 
     return row
 
 
-def now():
+def get_owner_by_token(
+    token
+):
 
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    conn = get_db()
+
+    row = conn.execute("""
+        SELECT *
+        FROM bot_owners
+        WHERE bot_token=?
+    """, (
+        token,
+    )).fetchone()
+
+    conn.close()
+
+    return row
 
 
 # =========================================================
@@ -415,26 +469,28 @@ def now():
 
 async def master_start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     user = update.effective_user
 
-    clear_state(user.id, None)
+    clear_state(
+        user.id,
+        None
+    )
 
     await update.message.reply_text(
         "Assalomu alaykum! 👋\n\n"
-        "🐷 DONUZ botimizga xush kelibsiz!\n\n"
-        "Bu bot orqali o‘zingizga shaxsiy Telegram bot "
-        "yaratishingiz va uni boshqarishingiz mumkin.\n\n"
-        "🤖 Botni ulang\n"
-        "🛒 Xizmatlaringizni boshqaring\n"
-        "🔌 API ulang\n"
-        "📦 Buyurtmalarni kuzating\n"
-        "👥 Foydalanuvchilarni boshqaring\n"
-        "💳 To‘lovlarni nazorat qiling\n"
-        "🔄 Katalogni yangilang\n\n"
-        "Boshlash uchun quyidagi menyudan foydalaning.",
+        "DONUZ botimizga xush kelibsiz!\n\n"
+        "Bu bot orqali o‘zingizga shaxsiy Telegram "
+        "bot yaratishingiz mumkin.\n\n"
+        "🤖 Shaxsiy bot ulash\n"
+        "🛒 Xizmatlar qo‘shish\n"
+        "🔌 API ulash\n"
+        "📦 Buyurtmalarni boshqarish\n"
+        "👥 Foydalanuvchilarni ko‘rish\n"
+        "💳 To‘lovlarni nazorat qilish\n"
+        "🔄 Katalogni yangilash",
         reply_markup=master_keyboard(),
     )
 
@@ -445,20 +501,20 @@ async def master_start(
 
 async def connect_bot_start(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     user = update.effective_user
 
-    existing = get_owner_by_user(user.id)
+    owner = get_owner_by_user(
+        user.id
+    )
 
-    if existing:
+    if owner:
 
         await update.message.reply_text(
-            "Sizda allaqachon ulangan bot mavjud. 🤖\n\n"
-            "Boshqarish uchun «⚙️ Mening panelim» "
-            "tugmasidan foydalaning.",
-            reply_markup=master_keyboard(),
+            "🤖 Sizning botingiz allaqachon ulangan.",
+            reply_markup=owner_keyboard(),
         )
 
         return
@@ -466,22 +522,23 @@ async def connect_bot_start(
     set_state(
         user.id,
         None,
-        "WAIT_BOT_TOKEN",
+        "WAIT_BOT_TOKEN"
     )
 
     await update.message.reply_text(
         "🤖 Bot ulash\n\n"
-        "BotFather orqali olgan bot tokeningizni yuboring.\n\n"
-        "Masalan:\n"
-        "`123456789:AA...`",
-        parse_mode="Markdown",
+        "BotFather bergan tokenni yuboring."
     )
 
+
+# =========================================================
+# PROCESS BOT TOKEN
+# =========================================================
 
 async def process_bot_token(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    token: str,
+    token
 ):
 
     user = update.effective_user
@@ -491,32 +548,37 @@ async def process_bot_token(
     if not token:
 
         await update.message.reply_text(
-            "❌ Token bo‘sh bo‘lishi mumkin emas."
+            "❌ Token bo‘sh."
         )
 
         return
 
     if get_owner_by_token(token):
 
-        await update.message.reply_text(
-            "❌ Bu bot allaqachon DONUZ platformasiga ulangan."
+        clear_state(
+            user.id,
+            None
         )
 
-        clear_state(user.id, None)
+        await update.message.reply_text(
+            "❌ Bu bot allaqachon ulangan."
+        )
 
         return
 
     try:
 
-        async with Bot(token=token) as bot:
+        async with Bot(
+            token=token
+        ) as bot:
 
             me = await bot.get_me()
 
     except Exception:
 
         await update.message.reply_text(
-            "❌ Bot token noto‘g‘ri yoki botga ulanib bo‘lmadi.\n\n"
-            "BotFather'dan tokenni qayta tekshirib yuboring."
+            "❌ Token noto‘g‘ri.\n\n"
+            "BotFather tokenini tekshirib qayta yuboring."
         )
 
         return
@@ -553,28 +615,32 @@ async def process_bot_token(
         conn.commit()
         conn.close()
 
-        clear_state(user.id, None)
+        clear_state(
+            user.id,
+            None
+        )
 
         await update.message.reply_text(
             "✅ Bot muvaffaqiyatli ulandi!\n\n"
             f"🤖 Bot: @{me.username or me.first_name}\n\n"
-            "Endi botingizni quyidagi panel orqali boshqarishingiz mumkin.",
+            "⚙️ Boshqaruv paneli:",
             reply_markup=owner_keyboard(),
         )
 
-        await start_customer_bot(owner_id)
+        await start_customer_bot(
+            owner_id
+        )
 
     except sqlite3.IntegrityError:
 
         await update.message.reply_text(
-            "❌ Bu bot yoki sizning akkauntingiz "
-            "allaqachon ulangan."
+            "❌ Bu bot yoki akkaunt allaqachon ulangan."
         )
 
     except Exception as e:
 
         logger.exception(
-            f"Bot ulashda xato: {e}"
+            f"Bot connection error: {e}"
         )
 
         await update.message.reply_text(
@@ -588,15 +654,18 @@ async def process_bot_token(
 
 async def receive_master_text(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     user = update.effective_user
-    text = (update.message.text or "").strip()
+
+    text = (
+        update.message.text or ""
+    ).strip()
 
     state, data = get_state(
         user.id,
-        None,
+        None
     )
 
     if state == "WAIT_BOT_TOKEN":
@@ -604,18 +673,20 @@ async def receive_master_text(
         await process_bot_token(
             update,
             context,
-            text,
+            text
         )
 
         return
 
-    owner = get_owner_by_user(user.id)
+    owner = get_owner_by_user(
+        user.id
+    )
 
     if text == "🤖 Botimni ulash":
 
         await connect_bot_start(
             update,
-            context,
+            context
         )
 
         return
@@ -625,15 +696,16 @@ async def receive_master_text(
         if not owner:
 
             await update.message.reply_text(
-                "Sizda hali ulangan bot yo‘q. 🤖\n\n"
-                "Avval «🤖 Botimni ulash» tugmasini bosing.",
+                "🤖 Avval botingizni ulang.",
                 reply_markup=master_keyboard(),
             )
 
             return
 
         await update.message.reply_text(
-            owner_panel_text(owner["id"]),
+            owner_panel_text(
+                owner["id"]
+            ),
             reply_markup=owner_keyboard(),
         )
 
@@ -643,12 +715,13 @@ async def receive_master_text(
 
         await update.message.reply_text(
             "📖 DONUZ qo‘llanmasi\n\n"
-            "1️⃣ «🤖 Botimni ulash» orqali BotFather tokenini yuboring.\n\n"
-            "2️⃣ Bot ulanganidan keyin «⚙️ Mening panelim»ga kiring.\n\n"
-            "3️⃣ Xizmat qo‘shing.\n\n"
-            "4️⃣ API sozlamalarini kiriting.\n\n"
-            "5️⃣ Foydalanuvchilar botingiz orqali xizmat sotib oladi.\n\n"
-            "6️⃣ Buyurtmalar va to‘lovlarni paneldan boshqarasiz.",
+            "1. 🤖 Botimni ulash\n"
+            "2. BotFather tokenini yuborish\n"
+            "3. ⚙️ Mening panelim\n"
+            "4. ➕ Xizmat qo‘shish\n"
+            "5. 🔌 API ulash\n"
+            "6. 🔄 Katalog yangilash\n"
+            "7. Buyurtmalarni boshqarish",
             reply_markup=master_keyboard(),
         )
 
@@ -657,15 +730,24 @@ async def receive_master_text(
     if text == "🆘 SOS":
 
         await update.message.reply_text(
-            f"🆘 Yordam kerakmi?\n\n"
-            f"Admin: {SOS_USERNAME}",
+            f"🆘 Yordam: {SOS_USERNAME}",
             reply_markup=master_keyboard(),
         )
 
         return
 
+    if owner:
+
+        await receive_owner_text(
+            update,
+            context,
+            owner["id"]
+        )
+
+        return
+
     await update.message.reply_text(
-        "Menyudan kerakli bo‘limni tanlang.",
+        "DONUZ menyusi:",
         reply_markup=master_keyboard(),
     )
 
@@ -674,7 +756,9 @@ async def receive_master_text(
 # OWNER PANEL
 # =========================================================
 
-def owner_panel_text(owner_id):
+def owner_panel_text(
+    owner_id
+):
 
     conn = get_db()
 
@@ -682,25 +766,33 @@ def owner_panel_text(owner_id):
         SELECT *
         FROM bot_owners
         WHERE id=?
-    """, (owner_id,)).fetchone()
+    """, (
+        owner_id,
+    )).fetchone()
 
     services = conn.execute("""
-        SELECT COUNT(*) AS c
+        SELECT COUNT(*) AS total
         FROM services
         WHERE bot_owner_id=?
-    """, (owner_id,)).fetchone()["c"]
+    """, (
+        owner_id,
+    )).fetchone()["total"]
 
     users = conn.execute("""
-        SELECT COUNT(*) AS c
+        SELECT COUNT(*) AS total
         FROM users
         WHERE bot_owner_id=?
-    """, (owner_id,)).fetchone()["c"]
+    """, (
+        owner_id,
+    )).fetchone()["total"]
 
     orders = conn.execute("""
-        SELECT COUNT(*) AS c
+        SELECT COUNT(*) AS total
         FROM orders
         WHERE bot_owner_id=?
-    """, (owner_id,)).fetchone()["c"]
+    """, (
+        owner_id,
+    )).fetchone()["total"]
 
     conn.close()
 
@@ -708,27 +800,33 @@ def owner_panel_text(owner_id):
         return "❌ Bot topilmadi."
 
     return (
-        "⚙️ DONUZ boshqaruv paneli\n\n"
+        "⚙️ Boshqaruv paneli\n\n"
         f"🤖 Bot: @{owner['bot_username'] or '-'}\n"
-        f"📦 Xizmatlar: {services}\n"
+        f"🛒 Xizmatlar: {services}\n"
         f"👥 Foydalanuvchilar: {users}\n"
-        f"🧾 Buyurtmalar: {orders}\n\n"
-        "Kerakli bo‘limni tanlang."
+        f"📦 Buyurtmalar: {orders}"
     )
 
+
+# =========================================================
+# OWNER STATE
+# =========================================================
 
 async def owner_state_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     user = update.effective_user
-    text = (update.message.text or "").strip()
+
+    text = (
+        update.message.text or ""
+    ).strip()
 
     state, data = get_state(
         user.id,
-        owner_id,
+        owner_id
     )
 
     # -----------------------------------------------------
@@ -743,42 +841,44 @@ async def owner_state_handler(
             user.id,
             owner_id,
             "SERVICE_DESCRIPTION",
-            data,
+            data
         )
 
         await update.message.reply_text(
             "📝 Xizmat tavsifini yuboring.\n\n"
-            "Agar kerak bo‘lmasa: -"
+            "Kerak bo‘lmasa: -"
         )
 
         return True
 
     # -----------------------------------------------------
-    # SERVICE DESCRIPTION
+    # DESCRIPTION
     # -----------------------------------------------------
 
     if state == "SERVICE_DESCRIPTION":
 
         data["description"] = (
-            "" if text == "-" else text
+            ""
+            if text == "-"
+            else text
         )
 
         set_state(
             user.id,
             owner_id,
             "SERVICE_PRICE",
-            data,
+            data
         )
 
         await update.message.reply_text(
-            "💰 Xizmat narxini UZSda yuboring.\n\n"
+            "💰 Narxni UZSda yuboring.\n\n"
             "Masalan: 15000"
         )
 
         return True
 
     # -----------------------------------------------------
-    # SERVICE PRICE
+    # PRICE
     # -----------------------------------------------------
 
     if state == "SERVICE_PRICE":
@@ -795,8 +895,7 @@ async def owner_state_handler(
         except Exception:
 
             await update.message.reply_text(
-                "❌ Narx noto‘g‘ri.\n"
-                "Masalan: 15000"
+                "❌ Narx noto‘g‘ri."
             )
 
             return True
@@ -807,31 +906,31 @@ async def owner_state_handler(
             user.id,
             owner_id,
             "SERVICE_MODE",
-            data,
+            data
         )
 
         keyboard = InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
-                    "🔌 API orqali",
-                    callback_data="smode:api",
+                    "🔌 API",
+                    callback_data="smode:api"
                 ),
                 InlineKeyboardButton(
                     "👨‍💼 Manual",
-                    callback_data="smode:manual",
+                    callback_data="smode:manual"
                 ),
             ],
             [
                 InlineKeyboardButton(
                     "🔄 API + Manual",
-                    callback_data="smode:both",
+                    callback_data="smode:both"
                 )
             ]
         ])
 
         await update.message.reply_text(
-            "⚙️ Xizmat yetkazib berish usulini tanlang:",
-            reply_markup=keyboard,
+            "⚙️ Yetkazib berish usulini tanlang:",
+            reply_markup=keyboard
         )
 
         return True
@@ -873,11 +972,11 @@ async def owner_state_handler(
 
         clear_state(
             user.id,
-            owner_id,
+            owner_id
         )
 
         await update.message.reply_text(
-            "✅ Xizmat muvaffaqiyatli qo‘shildi!",
+            "✅ Xizmat qo‘shildi.",
             reply_markup=owner_keyboard(),
         )
 
@@ -895,7 +994,7 @@ async def owner_state_handler(
             user.id,
             owner_id,
             "API_KEY",
-            data,
+            data
         )
 
         await update.message.reply_text(
@@ -916,15 +1015,12 @@ async def owner_state_handler(
             user.id,
             owner_id,
             "API_HEADER",
-            data,
+            data
         )
 
         await update.message.reply_text(
-            "📌 API header nomini yuboring.\n\n"
-            "Odatda:\n"
-            "Authorization\n\n"
-            "Agar X-API-Key bo‘lsa:\n"
-            "X-API-Key"
+            "📌 Header nomini yuboring.\n\n"
+            "Authorization yoki X-API-Key"
         )
 
         return True
@@ -941,15 +1037,12 @@ async def owner_state_handler(
             user.id,
             owner_id,
             "API_PREFIX",
-            data,
+            data
         )
 
         await update.message.reply_text(
-            "🔐 API prefixni yuboring.\n\n"
-            "Authorization uchun:\n"
-            "Bearer\n\n"
-            "X-API-Key uchun:\n"
-            "bo‘sh qoldirish mumkin emas — none deb yuboring."
+            "🔐 Prefixni yuboring.\n\n"
+            "Bearer yoki none"
         )
 
         return True
@@ -961,7 +1054,9 @@ async def owner_state_handler(
     if state == "API_PREFIX":
 
         data["api_prefix"] = (
-            "" if text.lower() == "none" else text
+            ""
+            if text.lower() == "none"
+            else text
         )
 
         conn = get_db()
@@ -988,8 +1083,14 @@ async def owner_state_handler(
             owner_id,
             data.get("api_url", ""),
             data.get("api_key", ""),
-            data.get("api_header", "Authorization"),
-            data.get("api_prefix", ""),
+            data.get(
+                "api_header",
+                "Authorization"
+            ),
+            data.get(
+                "api_prefix",
+                ""
+            ),
             now(),
         ))
 
@@ -998,11 +1099,11 @@ async def owner_state_handler(
 
         clear_state(
             user.id,
-            owner_id,
+            owner_id
         )
 
         await update.message.reply_text(
-            "✅ API sozlamalari saqlandi!",
+            "✅ API sozlamalari saqlandi.",
             reply_markup=owner_keyboard(),
         )
 
@@ -1012,10 +1113,12 @@ async def owner_state_handler(
 
 
 # =========================================================
-# API HELPERS
+# API SETTINGS
 # =========================================================
 
-def get_api_settings(owner_id):
+def get_api_settings(
+    owner_id
+):
 
     conn = get_db()
 
@@ -1023,29 +1126,42 @@ def get_api_settings(owner_id):
         SELECT *
         FROM api_settings
         WHERE bot_owner_id=?
-    """, (owner_id,)).fetchone()
+    """, (
+        owner_id,
+    )).fetchone()
 
     conn.close()
 
     return row
 
 
-def build_api_headers(settings):
+def build_api_headers(
+    settings
+):
 
     if not settings:
         return {}
 
-    header = settings["api_header"] or "Authorization"
-    key = settings["api_key"] or ""
-    prefix = settings["api_prefix"] or ""
+    header = (
+        settings["api_header"]
+        or "Authorization"
+    )
 
-    if prefix:
+    key = (
+        settings["api_key"]
+        or ""
+    )
 
-        value = f"{prefix} {key}"
+    prefix = (
+        settings["api_prefix"]
+        or ""
+    )
 
-    else:
-
-        value = key
+    value = (
+        f"{prefix} {key}"
+        if prefix
+        else key
+    )
 
     return {
         header: value,
@@ -1054,90 +1170,117 @@ def build_api_headers(settings):
     }
 
 
-def api_get(owner_id, endpoint=""):
+def api_get(
+    owner_id,
+    endpoint
+):
 
-    settings = get_api_settings(owner_id)
+    settings = get_api_settings(
+        owner_id
+    )
 
     if not settings:
+
         return {
             "ok": False,
-            "error": "API sozlanmagan",
+            "error": "API sozlanmagan"
         }
 
     base_url = (
-        settings["api_url"] or ""
+        settings["api_url"]
+        or ""
     ).rstrip("/")
 
-    url = base_url + "/" + endpoint.lstrip("/")
+    url = (
+        base_url
+        + "/"
+        + endpoint.lstrip("/")
+    )
 
     try:
 
         response = requests.get(
             url,
-            headers=build_api_headers(settings),
+            headers=build_api_headers(
+                settings
+            ),
             timeout=20,
         )
 
         try:
-            data = response.json()
+            result = response.json()
         except Exception:
-            data = response.text
+            result = response.text
 
         return {
             "ok": response.ok,
             "status": response.status_code,
-            "data": data,
+            "data": result
         }
 
     except Exception as e:
 
         return {
             "ok": False,
-            "error": str(e),
+            "error": str(e)
         }
 
 
-def api_post(owner_id, endpoint="", payload=None):
+def api_post(
+    owner_id,
+    endpoint,
+    payload=None
+):
 
-    settings = get_api_settings(owner_id)
+    settings = get_api_settings(
+        owner_id
+    )
 
     if not settings:
+
         return {
             "ok": False,
-            "error": "API sozlanmagan",
+            "error": "API sozlanmagan"
         }
 
     base_url = (
-        settings["api_url"] or ""
+        settings["api_url"]
+        or ""
     ).rstrip("/")
 
-    url = base_url + "/" + endpoint.lstrip("/")
+    url = (
+        base_url
+        + "/"
+        + endpoint.lstrip("/")
+    )
 
     try:
 
         response = requests.post(
             url,
-            headers=build_api_headers(settings),
+            headers=build_api_headers(
+                settings
+            ),
             json=payload or {},
             timeout=30,
         )
 
         try:
-            data = response.json()
+            result = response.json()
         except Exception:
-            data = response.text
+            result = response.text
 
         return {
             "ok": response.ok,
             "status": response.status_code,
-            "data": data,
+            "data": result
         }
 
     except Exception as e:
 
         return {
             "ok": False,
-            "error": str(e),
+            "error": str(e)
         }
 
 
@@ -1145,59 +1288,58 @@ def api_post(owner_id, endpoint="", payload=None):
 # API BALANCE
 # =========================================================
 
-async def api_balance(
+async def show_api_balance(
     update,
-    owner_id,
+    owner_id
 ):
 
     result = api_get(
         owner_id,
-        "/balance",
+        "balance"
     )
 
     if not result["ok"]:
 
         await update.message.reply_text(
-            "❌ API balansini olishda xatolik.\n\n"
-            f"{result.get('error', 'API xatosi')}"
+            "❌ API balansini olish imkoni bo‘lmadi."
         )
 
         return
 
-    data = result.get("data")
-
     await update.message.reply_text(
         "💰 API balans\n\n"
-        f"{json.dumps(data, ensure_ascii=False, indent=2)[:3500]}"
+        + json.dumps(
+            result["data"],
+            ensure_ascii=False,
+            indent=2
+        )[:3500]
     )
 
 
 # =========================================================
-# CATALOG REFRESH
+# CATALOG
 # =========================================================
 
 async def refresh_catalog(
     update,
-    owner_id,
+    owner_id
 ):
 
     result = api_get(
         owner_id,
-        "/catalog",
+        "catalog"
     )
 
     if not result["ok"]:
 
         await update.message.reply_text(
-            "❌ Katalogni yangilab bo‘lmadi.\n\n"
-            f"{result.get('error', 'API xatosi')}"
+            "❌ Katalogni yangilab bo‘lmadi."
         )
 
         return
 
     await update.message.reply_text(
-        "✅ API katalogiga so‘rov yuborildi.\n\n"
-        "API formatiga qarab katalog ma’lumotlari qaytarildi."
+        "✅ Katalog yangilandi."
     )
 
 
@@ -1208,20 +1350,27 @@ async def refresh_catalog(
 async def receive_owner_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     user = update.effective_user
-    text = (update.message.text or "").strip()
+
+    text = (
+        update.message.text or ""
+    ).strip()
 
     handled = await owner_state_handler(
         update,
         context,
-        owner_id,
+        owner_id
     )
 
     if handled:
         return
+
+    # -----------------------------------------------------
+    # SERVICES
+    # -----------------------------------------------------
 
     if text == "🛒 Xizmatlarim":
 
@@ -1232,52 +1381,59 @@ async def receive_owner_text(
             FROM services
             WHERE bot_owner_id=?
             ORDER BY id DESC
-        """, (owner_id,)).fetchall()
+        """, (
+            owner_id,
+        )).fetchall()
 
         conn.close()
 
         if not rows:
 
             await update.message.reply_text(
-                "🛒 Hozircha xizmatlar yo‘q.",
+                "🛒 Xizmatlar hali yo‘q.",
                 reply_markup=owner_keyboard(),
             )
 
             return
 
-        lines = [
-            "🛒 Xizmatlaringiz:\n"
-        ]
+        result = "🛒 Xizmatlar:\n\n"
 
         for row in rows:
 
-            lines.append(
-                f"#{row['id']} — {row['name']}\n"
+            result += (
+                f"#{row['id']} {row['name']}\n"
                 f"💰 {row['price']:,.0f} UZS\n"
-                f"⚙️ {row['api_mode']}\n"
+                f"⚙️ {row['api_mode']}\n\n"
             )
 
         await update.message.reply_text(
-            "\n".join(lines),
+            result[:4000],
             reply_markup=owner_keyboard(),
         )
 
         return
+
+    # -----------------------------------------------------
+    # ADD SERVICE
+    # -----------------------------------------------------
 
     if text == "➕ Xizmat qo‘shish":
 
         set_state(
             user.id,
             owner_id,
-            "SERVICE_NAME",
+            "SERVICE_NAME"
         )
 
         await update.message.reply_text(
-            "➕ Yangi xizmat\n\n"
-            "Xizmat nomini yuboring:"
+            "➕ Xizmat nomini yuboring:"
         )
 
         return
+
+    # -----------------------------------------------------
+    # ORDERS
+    # -----------------------------------------------------
 
     if text == "📦 Buyurtmalar":
 
@@ -1292,37 +1448,44 @@ async def receive_owner_text(
                 ON s.id=o.service_id
             WHERE o.bot_owner_id=?
             ORDER BY o.id DESC
-            LIMIT 20
-        """, (owner_id,)).fetchall()
+            LIMIT 30
+        """, (
+            owner_id,
+        )).fetchall()
 
         conn.close()
 
         if not rows:
 
             await update.message.reply_text(
-                "📦 Hozircha buyurtmalar yo‘q.",
+                "📦 Buyurtmalar hali yo‘q.",
                 reply_markup=owner_keyboard(),
             )
 
             return
 
-        lines = ["📦 Oxirgi buyurtmalar:\n"]
+        result = "📦 Buyurtmalar:\n\n"
 
         for row in rows:
 
-            lines.append(
-                f"#{row['id']} — {row['name'] or '-'}\n"
+            result += (
+                f"#{row['id']} — "
+                f"{row['name'] or '-'}\n"
                 f"👤 {row['user_telegram_id']}\n"
                 f"💰 {row['amount']:,.0f} UZS\n"
-                f"📌 {row['status']}\n"
+                f"📌 {row['status']}\n\n"
             )
 
         await update.message.reply_text(
-            "\n".join(lines),
+            result[:4000],
             reply_markup=owner_keyboard(),
         )
 
         return
+
+    # -----------------------------------------------------
+    # USERS
+    # -----------------------------------------------------
 
     if text == "👥 Foydalanuvchilar":
 
@@ -1334,77 +1497,93 @@ async def receive_owner_text(
             WHERE bot_owner_id=?
             ORDER BY id DESC
             LIMIT 50
-        """, (owner_id,)).fetchall()
+        """, (
+            owner_id,
+        )).fetchall()
 
         conn.close()
 
         if not rows:
 
             await update.message.reply_text(
-                "👥 Hozircha foydalanuvchilar yo‘q.",
+                "👥 Foydalanuvchilar hali yo‘q.",
                 reply_markup=owner_keyboard(),
             )
 
             return
 
-        lines = ["👥 Foydalanuvchilar:\n"]
+        result = "👥 Foydalanuvchilar:\n\n"
 
         for row in rows:
 
             username = (
-                f"@{row['username']}"
+                "@"
+                + row["username"]
                 if row["username"]
                 else "-"
             )
 
-            lines.append(
-                f"ID: {row['telegram_id']}\n"
-                f"Username: {username}\n"
-                f"Balans: {row['balance']:,.0f} UZS\n"
-                f"Qo‘shilgan: {row['joined_at']}\n"
+            result += (
+                f"🆔 {row['telegram_id']}\n"
+                f"👤 {username}\n"
+                f"💰 {row['balance']:,.0f} UZS\n"
+                f"📅 {row['joined_at']}\n\n"
             )
 
         await update.message.reply_text(
-            "\n".join(lines)[:4000],
+            result[:4000],
             reply_markup=owner_keyboard(),
         )
 
         return
+
+    # -----------------------------------------------------
+    # API CONNECT
+    # -----------------------------------------------------
 
     if text == "🔌 API ulash":
 
         set_state(
             user.id,
             owner_id,
-            "API_URL",
+            "API_URL"
         )
 
         await update.message.reply_text(
-            "🔌 API ulash\n\n"
-            "API Base URL manzilini yuboring.\n\n"
-            "Masalan:\n"
-            "https://example.com/api/v1"
+            "🔌 API Base URL yuboring:"
         )
 
         return
+
+    # -----------------------------------------------------
+    # API BALANCE
+    # -----------------------------------------------------
 
     if text == "💰 API Balans":
 
-        await api_balance(
+        await show_api_balance(
             update,
-            owner_id,
+            owner_id
         )
 
         return
+
+    # -----------------------------------------------------
+    # REFRESH
+    # -----------------------------------------------------
 
     if text == "🔄 Katalog yangilash":
 
         await refresh_catalog(
             update,
-            owner_id,
+            owner_id
         )
 
         return
+
+    # -----------------------------------------------------
+    # API SETTINGS
+    # -----------------------------------------------------
 
     if text == "⚙️ API sozlamalari":
 
@@ -1415,8 +1594,7 @@ async def receive_owner_text(
         if not settings:
 
             await update.message.reply_text(
-                "⚙️ API hali sozlanmagan.\n\n"
-                "«🔌 API ulash» bo‘limidan sozlang.",
+                "⚙️ API hali ulanmagan.",
                 reply_markup=owner_keyboard(),
             )
 
@@ -1432,6 +1610,10 @@ async def receive_owner_text(
 
         return
 
+    # -----------------------------------------------------
+    # PAYMENTS
+    # -----------------------------------------------------
+
     if text == "💳 To‘lovlar":
 
         conn = get_db()
@@ -1441,70 +1623,75 @@ async def receive_owner_text(
             FROM payments
             WHERE bot_owner_id=?
             ORDER BY id DESC
-            LIMIT 20
-        """, (owner_id,)).fetchall()
+            LIMIT 30
+        """, (
+            owner_id,
+        )).fetchall()
 
         conn.close()
 
         if not rows:
 
             await update.message.reply_text(
-                "💳 Hozircha to‘lovlar yo‘q.",
+                "💳 To‘lovlar hali yo‘q.",
                 reply_markup=owner_keyboard(),
             )
 
             return
 
-        lines = ["💳 To‘lovlar:\n"]
+        result = "💳 To‘lovlar:\n\n"
 
         for row in rows:
 
-            lines.append(
+            result += (
                 f"#{row['id']}\n"
                 f"👤 {row['user_telegram_id']}\n"
                 f"💰 {row['amount']:,.0f} UZS\n"
-                f"📌 {row['status']}\n"
+                f"📌 {row['status']}\n\n"
             )
 
         await update.message.reply_text(
-            "\n".join(lines),
+            result[:4000],
             reply_markup=owner_keyboard(),
         )
 
         return
+
+    # -----------------------------------------------------
+    # SOS
+    # -----------------------------------------------------
 
     if text == "🆘 SOS":
 
         await update.message.reply_text(
-            f"🆘 Yordam:\n\n{SOS_USERNAME}",
+            f"🆘 {SOS_USERNAME}",
             reply_markup=owner_keyboard(),
         )
 
         return
 
+    # -----------------------------------------------------
+    # BACK
+    # -----------------------------------------------------
+
     if text == "⬅️ Asosiy menyu":
 
         await update.message.reply_text(
-            "Asosiy menyu:",
+            "DONUZ",
             reply_markup=master_keyboard(),
         )
 
         return
 
-    await update.message.reply_text(
-        "Panel menyusidan foydalaning.",
-        reply_markup=owner_keyboard(),
-    )
-
 
 # =========================================================
-# SERVICE MODE CALLBACK
+# OWNER CALLBACK
 # =========================================================
 
 async def owner_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     query = update.callback_query
@@ -1512,90 +1699,98 @@ async def owner_callback(
     await query.answer()
 
     user = query.from_user
+
     data = query.data or ""
 
-    if data.startswith("smode:"):
+    if not data.startswith("smode:"):
+        return
 
-        mode = data.split(":", 1)[1]
+    mode = data.split(
+        ":",
+        1
+    )[1]
 
-        state, saved = get_state(
-            user.id,
-            owner_id,
+    state, saved = get_state(
+        user.id,
+        owner_id
+    )
+
+    if state != "SERVICE_MODE":
+
+        await query.edit_message_text(
+            "❌ Amal muddati tugagan."
         )
 
-        if state != "SERVICE_MODE":
+        return
 
-            await query.edit_message_text(
-                "❌ Bu amalning vaqti tugagan."
-            )
+    saved["api_mode"] = mode
 
-            return
+    if mode in (
+        "api",
+        "both"
+    ):
 
-        saved["api_mode"] = mode
-
-        if mode in ("api", "both"):
-
-            set_state(
-                user.id,
-                owner_id,
-                "SERVICE_ACTION",
-                saved,
-            )
-
-            await query.edit_message_text(
-                "🔌 API action/endpoint nomini yuboring.\n\n"
-                "Masalan:\n"
-                "top-up\n"
-                "order\n"
-                "buy"
-            )
-
-            return
-
-        conn = get_db()
-
-        conn.execute("""
-            INSERT INTO services
-            (
-                bot_owner_id,
-                name,
-                description,
-                price,
-                api_mode,
-                api_action,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (
-            owner_id,
-            saved.get("name", ""),
-            saved.get("description", ""),
-            saved.get("price", 0),
-            mode,
-            "",
-            now(),
-        ))
-
-        conn.commit()
-        conn.close()
-
-        clear_state(
+        set_state(
             user.id,
             owner_id,
+            "SERVICE_ACTION",
+            saved
         )
 
         await query.edit_message_text(
-            "✅ Xizmat muvaffaqiyatli qo‘shildi!"
+            "🔌 API endpoint/action yuboring.\n\n"
+            "Masalan:\n"
+            "buy\n"
+            "order\n"
+            "top-up"
         )
+
+        return
+
+    conn = get_db()
+
+    conn.execute("""
+        INSERT INTO services
+        (
+            bot_owner_id,
+            name,
+            description,
+            price,
+            api_mode,
+            api_action,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        owner_id,
+        saved.get("name", ""),
+        saved.get("description", ""),
+        saved.get("price", 0),
+        mode,
+        "",
+        now(),
+    ))
+
+    conn.commit()
+    conn.close()
+
+    clear_state(
+        user.id,
+        owner_id
+    )
+
+    await query.edit_message_text(
+        "✅ Xizmat qo‘shildi."
+    )
 
 
 # =========================================================
-# CUSTOMER HELPERS
+# CUSTOMER
 # =========================================================
 
 def get_or_create_customer(
     owner_id,
-    telegram_user,
+    user
 ):
 
     conn = get_db()
@@ -1603,10 +1798,11 @@ def get_or_create_customer(
     row = conn.execute("""
         SELECT *
         FROM users
-        WHERE bot_owner_id=? AND telegram_id=?
+        WHERE bot_owner_id=?
+          AND telegram_id=?
     """, (
         owner_id,
-        telegram_user.id,
+        user.id,
     )).fetchone()
 
     if not row:
@@ -1624,46 +1820,40 @@ def get_or_create_customer(
             VALUES (?, ?, ?, ?, 0, ?)
         """, (
             owner_id,
-            telegram_user.id,
-            telegram_user.username or "",
-            telegram_user.first_name or "",
+            user.id,
+            user.username or "",
+            user.first_name or "",
             now(),
         ))
 
         conn.commit()
 
-        row = conn.execute("""
-            SELECT *
-            FROM users
-            WHERE bot_owner_id=? AND telegram_id=?
-        """, (
-            owner_id,
-            telegram_user.id,
-        )).fetchone()
-
     else:
 
         conn.execute("""
             UPDATE users
-            SET username=?, first_name=?
-            WHERE bot_owner_id=? AND telegram_id=?
+            SET username=?,
+                first_name=?
+            WHERE bot_owner_id=?
+              AND telegram_id=?
         """, (
-            telegram_user.username or "",
-            telegram_user.first_name or "",
+            user.username or "",
+            user.first_name or "",
             owner_id,
-            telegram_user.id,
+            user.id,
         ))
 
         conn.commit()
 
-        row = conn.execute("""
-            SELECT *
-            FROM users
-            WHERE bot_owner_id=? AND telegram_id=?
-        """, (
-            owner_id,
-            telegram_user.id,
-        )).fetchone()
+    row = conn.execute("""
+        SELECT *
+        FROM users
+        WHERE bot_owner_id=?
+          AND telegram_id=?
+    """, (
+        owner_id,
+        user.id,
+    )).fetchone()
 
     conn.close()
 
@@ -1677,20 +1867,19 @@ def get_or_create_customer(
 async def customer_start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     user = update.effective_user
 
     get_or_create_customer(
         owner_id,
-        user,
+        user
     )
 
     await update.message.reply_text(
         "Assalomu alaykum! 👋\n\n"
-        "Xush kelibsiz!\n\n"
-        "Kerakli xizmatni menyudan tanlang.",
+        "Xush kelibsiz!",
         reply_markup=customer_keyboard(),
     )
 
@@ -1702,16 +1891,23 @@ async def customer_start(
 async def customer_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     user = update.effective_user
-    text = (update.message.text or "").strip()
+
+    text = (
+        update.message.text or ""
+    ).strip()
 
     customer = get_or_create_customer(
         owner_id,
-        user,
+        user
     )
+
+    # -----------------------------------------------------
+    # SERVICES
+    # -----------------------------------------------------
 
     if text == "🛒 Xizmatlar":
 
@@ -1720,16 +1916,19 @@ async def customer_text(
         rows = conn.execute("""
             SELECT *
             FROM services
-            WHERE bot_owner_id=? AND active=1
+            WHERE bot_owner_id=?
+              AND active=1
             ORDER BY id
-        """, (owner_id,)).fetchall()
+        """, (
+            owner_id,
+        )).fetchall()
 
         conn.close()
 
         if not rows:
 
             await update.message.reply_text(
-                "🛒 Hozircha xizmatlar mavjud emas.",
+                "🛒 Xizmatlar mavjud emas.",
                 reply_markup=customer_keyboard(),
             )
 
@@ -1741,45 +1940,56 @@ async def customer_text(
 
             keyboard.append([
                 InlineKeyboardButton(
-                    f"{row['name']} — {row['price']:,.0f} UZS",
-                    callback_data=f"service:{row['id']}",
+                    f"{row['name']} — "
+                    f"{row['price']:,.0f} UZS",
+                    callback_data=f"service:{row['id']}"
                 )
             ])
 
         await update.message.reply_text(
-            "🛒 Xizmatni tanlang:",
+            "🛒 Xizmatlar:",
             reply_markup=InlineKeyboardMarkup(
                 keyboard
-            ),
+            )
         )
 
         return
 
+    # -----------------------------------------------------
+    # BALANCE
+    # -----------------------------------------------------
+
     if text == "💰 Balans":
 
         await update.message.reply_text(
-            f"💰 Sizning balansingiz:\n\n"
+            f"💰 Balans: "
             f"{customer['balance']:,.0f} UZS",
             reply_markup=customer_keyboard(),
         )
 
         return
 
+    # -----------------------------------------------------
+    # TOP UP
+    # -----------------------------------------------------
+
     if text == "➕ Balans to‘ldirish":
 
         set_state(
             user.id,
             owner_id,
-            "PAYMENT_AMOUNT",
+            "PAYMENT_AMOUNT"
         )
 
         await update.message.reply_text(
-            "➕ Balans to‘ldirish\n\n"
-            "To‘ldirmoqchi bo‘lgan summani yuboring.\n\n"
-            "Masalan: 50000"
+            "💰 To‘ldirmoqchi bo‘lgan summani yuboring."
         )
 
         return
+
+    # -----------------------------------------------------
+    # ORDERS
+    # -----------------------------------------------------
 
     if text == "📦 Buyurtmalarim":
 
@@ -1806,41 +2016,50 @@ async def customer_text(
         if not rows:
 
             await update.message.reply_text(
-                "📦 Hozircha buyurtmalar yo‘q.",
+                "📦 Buyurtmalar yo‘q.",
                 reply_markup=customer_keyboard(),
             )
 
             return
 
-        lines = ["📦 Buyurtmalaringiz:\n"]
+        result = "📦 Buyurtmalar:\n\n"
 
         for row in rows:
 
-            lines.append(
-                f"#{row['id']} — {row['name'] or '-'}\n"
+            result += (
+                f"#{row['id']} — "
+                f"{row['name'] or '-'}\n"
                 f"💰 {row['amount']:,.0f} UZS\n"
-                f"📌 {row['status']}\n"
+                f"📌 {row['status']}\n\n"
             )
 
         await update.message.reply_text(
-            "\n".join(lines),
+            result[:4000],
             reply_markup=customer_keyboard(),
         )
 
         return
+
+    # -----------------------------------------------------
+    # SOS
+    # -----------------------------------------------------
 
     if text == "🆘 SOS":
 
         await update.message.reply_text(
-            f"🆘 Yordam:\n\n{SOS_USERNAME}",
+            f"🆘 {SOS_USERNAME}",
             reply_markup=customer_keyboard(),
         )
 
         return
 
+    # -----------------------------------------------------
+    # PAYMENT STATE
+    # -----------------------------------------------------
+
     state, data = get_state(
         user.id,
-        owner_id,
+        owner_id
     )
 
     if state == "PAYMENT_AMOUNT":
@@ -1857,7 +2076,7 @@ async def customer_text(
         except Exception:
 
             await update.message.reply_text(
-                "❌ Summani noto‘g‘ri yubordingiz."
+                "❌ Summa noto‘g‘ri."
             )
 
             return
@@ -1868,22 +2087,24 @@ async def customer_text(
             user.id,
             owner_id,
             "PAYMENT_RECEIPT",
-            data,
+            data
         )
 
         await update.message.reply_text(
-            f"💰 To‘lov summasi: {amount:,.0f} UZS\n\n"
-            "To‘lovni amalga oshiring va chek/rasmni yuboring."
+            f"💰 Summa: {amount:,.0f} UZS\n\n"
+            "To‘lovni amalga oshirib, "
+            "chek yoki to‘lov ma’lumotini yuboring."
         )
 
         return
 
     if state == "PAYMENT_RECEIPT":
 
-        receipt = text
-
         amount = float(
-            data.get("amount", 0)
+            data.get(
+                "amount",
+                0
+            )
         )
 
         conn = get_db()
@@ -1903,7 +2124,7 @@ async def customer_text(
             owner_id,
             user.id,
             amount,
-            receipt,
+            text,
             now(),
         ))
 
@@ -1912,21 +2133,15 @@ async def customer_text(
 
         clear_state(
             user.id,
-            owner_id,
+            owner_id
         )
 
         await update.message.reply_text(
-            "✅ To‘lov ma’lumoti qabul qilindi.\n\n"
-            "Admin tasdiqlaganidan keyin balansingizga qo‘shiladi.",
+            "✅ To‘lov ma’lumoti qabul qilindi.",
             reply_markup=customer_keyboard(),
         )
 
         return
-
-    await update.message.reply_text(
-        "Menyudan kerakli bo‘limni tanlang.",
-        reply_markup=customer_keyboard(),
-    )
 
 
 # =========================================================
@@ -1936,7 +2151,7 @@ async def customer_text(
 async def customer_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
-    owner_id: int,
+    owner_id
 ):
 
     query = update.callback_query
@@ -1944,12 +2159,20 @@ async def customer_callback(
     await query.answer()
 
     user = query.from_user
+
     data = query.data or ""
+
+    # -----------------------------------------------------
+    # SERVICE
+    # -----------------------------------------------------
 
     if data.startswith("service:"):
 
         service_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1
+            )[1]
         )
 
         conn = get_db()
@@ -1979,24 +2202,31 @@ async def customer_callback(
             [
                 InlineKeyboardButton(
                     "🛒 Sotib olish",
-                    callback_data=f"buy:{service_id}",
+                    callback_data=f"buy:{service_id}"
                 )
             ]
         ])
 
         await query.edit_message_text(
             f"🛒 {service['name']}\n\n"
-            f"{service['description'] or 'Tavsif mavjud emas'}\n\n"
-            f"💰 Narx: {service['price']:,.0f} UZS",
-            reply_markup=keyboard,
+            f"{service['description'] or ''}\n\n"
+            f"💰 {service['price']:,.0f} UZS",
+            reply_markup=keyboard
         )
 
         return
 
+    # -----------------------------------------------------
+    # BUY
+    # -----------------------------------------------------
+
     if data.startswith("buy:"):
 
         service_id = int(
-            data.split(":", 1)[1]
+            data.split(
+                ":",
+                1
+            )[1]
         )
 
         conn = get_db()
@@ -2012,7 +2242,7 @@ async def customer_callback(
             owner_id,
         )).fetchone()
 
-        user_row = conn.execute("""
+        customer = conn.execute("""
             SELECT *
             FROM users
             WHERE bot_owner_id=?
@@ -2024,7 +2254,7 @@ async def customer_callback(
 
         conn.close()
 
-        if not service or not user_row:
+        if not service or not customer:
 
             await query.edit_message_text(
                 "❌ Ma’lumot topilmadi."
@@ -2037,19 +2267,20 @@ async def customer_callback(
         )
 
         balance = float(
-            user_row["balance"]
+            customer["balance"]
         )
 
         if balance < price:
 
             await query.edit_message_text(
-                "❌ Balansingiz yetarli emas.\n\n"
+                "❌ Balans yetarli emas.\n\n"
                 f"💰 Narx: {price:,.0f} UZS\n"
                 f"💳 Balans: {balance:,.0f} UZS"
             )
 
             return
 
+        # Deduct balance
         conn = get_db()
 
         conn.execute("""
@@ -2088,11 +2319,15 @@ async def customer_callback(
         conn.commit()
         conn.close()
 
-        status = "pending"
+        status = "manual"
+
+        # -------------------------------------------------
+        # API ORDER
+        # -------------------------------------------------
 
         if service["api_mode"] in (
             "api",
-            "both",
+            "both"
         ):
 
             result = api_post(
@@ -2102,7 +2337,7 @@ async def customer_callback(
                     "user_id": user.id,
                     "quantity": 1,
                     "order_id": order_id,
-                },
+                }
             )
 
             conn = get_db()
@@ -2119,7 +2354,7 @@ async def customer_callback(
                 """, (
                     json.dumps(
                         result.get("data"),
-                        ensure_ascii=False,
+                        ensure_ascii=False
                     )[:10000],
                     order_id,
                 ))
@@ -2147,7 +2382,7 @@ async def customer_callback(
                 """, (
                     json.dumps(
                         result,
-                        ensure_ascii=False,
+                        ensure_ascii=False
                     )[:10000],
                     order_id,
                 ))
@@ -2164,7 +2399,7 @@ async def customer_callback(
                 """, (
                     json.dumps(
                         result,
-                        ensure_ascii=False,
+                        ensure_ascii=False
                     )[:10000],
                     order_id,
                 ))
@@ -2180,31 +2415,37 @@ async def customer_callback(
                 UPDATE orders
                 SET status='manual'
                 WHERE id=?
-            """, (order_id,))
+            """, (
+                order_id,
+            ))
 
             conn.commit()
             conn.close()
 
+        # -------------------------------------------------
+        # RESULT
+        # -------------------------------------------------
+
         if status == "completed":
 
             message = (
-                "✅ Buyurtma muvaffaqiyatli bajarildi!\n\n"
-                f"🧾 Buyurtma: #{order_id}"
+                "✅ Buyurtma bajarildi!\n\n"
+                f"🧾 #{order_id}"
             )
 
         elif status == "failed":
 
             message = (
                 "❌ Buyurtma bajarilmadi.\n\n"
-                "Balansingiz qaytarildi."
+                "💰 Mablag‘ balansga qaytarildi."
             )
 
         else:
 
             message = (
                 "✅ Buyurtma qabul qilindi!\n\n"
-                f"🧾 Buyurtma: #{order_id}\n"
-                "📌 Holat: Kutilmoqda"
+                f"🧾 #{order_id}\n"
+                "📌 Kutilmoqda"
             )
 
         await query.edit_message_text(
@@ -2213,127 +2454,129 @@ async def customer_callback(
 
 
 # =========================================================
-# START CUSTOMER BOT
+# CUSTOMER BOT STORAGE
 # =========================================================
 
 customer_apps = {}
-customer_locks = {}
-
-
-async def start_customer_bot(owner_id):
-
-    if owner_id in customer_apps:
-
-        return
-
-    lock = customer_locks.setdefault(
-        owner_id,
-        asyncio.Lock(),
-    )
-
-    async with lock:
-
-        if owner_id in customer_apps:
-            return
-
-        owner = get_owner(owner_id)
-
-        if not owner:
-            return
-
-        if not owner["active"]:
-            return
-
-        token = owner["bot_token"]
-
-        try:
-
-            app = (
-                Application.builder()
-                .token(token)
-                .build()
-            )
-
-            async def start_handler(
-                update,
-                context,
-            ):
-                await customer_start(
-                    update,
-                    context,
-                    owner_id,
-                )
-
-            async def text_handler(
-                update,
-                context,
-            ):
-                await customer_text(
-                    update,
-                    context,
-                    owner_id,
-                )
-
-            async def callback_handler(
-                update,
-                context,
-            ):
-                await customer_callback(
-                    update,
-                    context,
-                    owner_id,
-                )
-
-            app.add_handler(
-                CommandHandler(
-                    "start",
-                    start_handler,
-                )
-            )
-
-            app.add_handler(
-                CallbackQueryHandler(
-                    callback_handler
-                )
-            )
-
-            app.add_handler(
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND,
-                    text_handler,
-                )
-            )
-
-            await app.initialize()
-
-            await hide_bot_commands(
-                app.bot
-            )
-
-            await app.start()
-
-            if app.updater:
-
-                await app.updater.start_polling(
-                    drop_pending_updates=True
-                )
-
-            customer_apps[owner_id] = app
-
-            logger.info(
-                f"Customer bot started: {owner['bot_username']}"
-            )
-
-        except Exception as e:
-
-            logger.exception(
-                f"Customer bot start error "
-                f"{owner_id}: {e}"
-            )
 
 
 # =========================================================
-# START ALL CUSTOMER BOTS
+# START CUSTOMER BOT
+# =========================================================
+
+async def start_customer_bot(
+    owner_id
+):
+
+    if owner_id in customer_apps:
+        return
+
+    owner = get_owner_by_id(
+        owner_id
+    )
+
+    if not owner:
+        return
+
+    if not owner["active"]:
+        return
+
+    token = owner["bot_token"]
+
+    try:
+
+        app = (
+            Application.builder()
+            .token(token)
+            .build()
+        )
+
+        async def start_handler(
+            update,
+            context
+        ):
+
+            await customer_start(
+                update,
+                context,
+                owner_id
+            )
+
+        async def text_handler(
+            update,
+            context
+        ):
+
+            await customer_text(
+                update,
+                context,
+                owner_id
+            )
+
+        async def callback_handler(
+            update,
+            context
+        ):
+
+            await customer_callback(
+                update,
+                context,
+                owner_id
+            )
+
+        app.add_handler(
+            CommandHandler(
+                "start",
+                start_handler
+            )
+        )
+
+        app.add_handler(
+            CallbackQueryHandler(
+                callback_handler
+            )
+        )
+
+        app.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                text_handler
+            )
+        )
+
+        await app.initialize()
+
+        await hide_bot_commands(
+            app.bot
+        )
+
+        await app.start()
+
+        if app.updater:
+
+            await app.updater.start_polling(
+                drop_pending_updates=True
+            )
+
+        customer_apps[
+            owner_id
+        ] = app
+
+        logger.info(
+            f"Customer bot started: "
+            f"@{owner['bot_username']}"
+        )
+
+    except Exception as e:
+
+        logger.exception(
+            f"Customer bot start error "
+            f"{owner_id}: {e}"
+        )
+
+
+# =========================================================
+# START SAVED BOTS
 # =========================================================
 
 async def start_all_customer_bots():
@@ -2359,7 +2602,7 @@ async def start_all_customer_bots():
         except Exception as e:
 
             logger.exception(
-                f"Saved bot start error: {e}"
+                f"Saved bot error: {e}"
             )
 
 
@@ -2368,7 +2611,7 @@ async def start_all_customer_bots():
 # =========================================================
 
 async def post_init(
-    application: Application,
+    application: Application
 ):
 
     await hide_bot_commands(
@@ -2383,11 +2626,11 @@ async def post_init(
 # =========================================================
 
 async def post_shutdown(
-    application: Application,
+    application: Application
 ):
 
     logger.info(
-        "DONUZ shutting down..."
+        "DONUZ shutting down"
     )
 
     for owner_id, app in list(
@@ -2405,7 +2648,7 @@ async def post_shutdown(
         except Exception as e:
 
             logger.warning(
-                f"Customer bot shutdown error: {e}"
+                f"Shutdown error: {e}"
             )
 
     customer_apps.clear()
@@ -2417,27 +2660,16 @@ async def post_shutdown(
 
 def main():
 
-    # -----------------------------------------------------
-    # START RENDER HEALTH SERVER
-    # -----------------------------------------------------
-
-    health_thread = threading.Thread(
+    # Render PORT server
+    threading.Thread(
         target=start_health_server,
-        daemon=True,
-    )
+        daemon=True
+    ).start()
 
-    health_thread.start()
-
-    # -----------------------------------------------------
-    # DATABASE
-    # -----------------------------------------------------
-
+    # Database
     init_db()
 
-    # -----------------------------------------------------
-    # MASTER BOT
-    # -----------------------------------------------------
-
+    # Master application
     application = (
         Application.builder()
         .token(BOT_TOKEN)
@@ -2446,45 +2678,34 @@ def main():
         .build()
     )
 
-    # -----------------------------------------------------
-    # MASTER HANDLERS
-    # -----------------------------------------------------
-
+    # /start
     application.add_handler(
         CommandHandler(
             "start",
-            master_start,
+            master_start
         )
     )
 
+    # Text
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
-            receive_master_text,
+            receive_master_text
         )
     )
 
-    # -----------------------------------------------------
-    # OWNER CALLBACKS
-    # -----------------------------------------------------
-
+    # Callback
     application.add_handler(
         CallbackQueryHandler(
-            lambda update, context: owner_callback_router(
-                update,
-                context,
-            )
+            owner_callback_router
         )
     )
-
-    # -----------------------------------------------------
-    # RUN POLLING
-    # -----------------------------------------------------
 
     logger.info(
         "DONUZ master bot starting..."
     )
 
+    # Telegram polling
     application.run_polling(
         drop_pending_updates=True
     )
@@ -2496,7 +2717,7 @@ def main():
 
 async def owner_callback_router(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
@@ -2504,10 +2725,8 @@ async def owner_callback_router(
     if not query:
         return
 
-    user_id = query.from_user.id
-
     owner = get_owner_by_user(
-        user_id
+        query.from_user.id
     )
 
     if not owner:
@@ -2516,7 +2735,7 @@ async def owner_callback_router(
     await owner_callback(
         update,
         context,
-        owner["id"],
+        owner["id"]
     )
 
 
