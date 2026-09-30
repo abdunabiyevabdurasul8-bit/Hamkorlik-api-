@@ -165,107 +165,95 @@ def conn():
 
 
 def init_db():
-
     c = conn()
 
-        c.execute("""CREATE TABLE IF NOT EXISTS users(
-        user_id INTEGER PRIMARY KEY,
-        username TEXT DEFAULT '',
-        first_name TEXT DEFAULT '',
-        balance REAL DEFAULT 0,
-        created_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS payments(
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        requested_amount REAL,
-        approved_amount REAL DEFAULT 0,
-        photo_id TEXT,
-        status TEXT DEFAULT 'pending',
-        created_at TEXT,
-        approved_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS games(
-        game_id INTEGER PRIMARY KEY,
-        name TEXT,
-        id_label TEXT DEFAULT 'Player ID',
-        requires_server INTEGER DEFAULT 0,
-        amount_based INTEGER DEFAULT 0,
-        active INTEGER DEFAULT 1,
-        updated_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS products(
-        game_id INTEGER,
-        paket_id INTEGER,
-        game_name TEXT,
-        package_name TEXT,
-        price_usd REAL DEFAULT 0,
-        api_price_uzs REAL DEFAULT 0,
-        sale_price REAL DEFAULT 0,
-        active INTEGER DEFAULT 1,
-        updated_at TEXT,
-        PRIMARY KEY(game_id, paket_id)
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS orders(
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        playpay_order_id TEXT,
-        game_id INTEGER,
-        paket_id INTEGER,
-        product_name TEXT,
-        player_id TEXT,
-        fields_json TEXT,
-        cost_usd REAL DEFAULT 0,
-        charged_usd REAL DEFAULT 0,
-        sale_price REAL DEFAULT 0,
-        status TEXT,
-        created_at TEXT,
-        updated_at TEXT,
-        notified TEXT DEFAULT '0'
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS promo_codes(
-        code TEXT PRIMARY KEY,
-        percent REAL,
-        max_uses INTEGER DEFAULT 0,
-        used INTEGER DEFAULT 0,
-        active INTEGER DEFAULT 1
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS promo_users(
-        user_id INTEGER,
-        code TEXT,
-        PRIMARY KEY(user_id, code)
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS bot_instances(
-        id SERIAL PRIMARY KEY,
-        owner_id INTEGER UNIQUE,
-        bot_token TEXT UNIQUE,
-        bot_id INTEGER UNIQUE,
-        bot_username TEXT DEFAULT '',
-        active INTEGER DEFAULT 0,
-        created_at TEXT,
-        expires_at TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS settings(
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )""")
-    c.execute("""CREATE TABLE IF NOT EXISTS balance_history(
-        id SERIAL PRIMARY KEY,
-        user_id INTEGER,
-        amount REAL,
-        type TEXT,
-        note TEXT,
-        created_at TEXT
-    )""")
+    statements = [
+        """CREATE TABLE IF NOT EXISTS users(
+            user_id BIGINT PRIMARY KEY,
+            username TEXT DEFAULT '',
+            first_name TEXT DEFAULT '',
+            balance DOUBLE PRECISION DEFAULT 0,
+            created_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS payments(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            requested_amount DOUBLE PRECISION,
+            approved_amount DOUBLE PRECISION DEFAULT 0,
+            photo_id TEXT,
+            status TEXT DEFAULT 'pending',
+            created_at TEXT,
+            approved_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS games(
+            game_id INTEGER PRIMARY KEY,
+            name TEXT,
+            id_label TEXT DEFAULT 'Player ID',
+            requires_server INTEGER DEFAULT 0,
+            amount_based INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1,
+            updated_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS products(
+            game_id INTEGER,
+            paket_id INTEGER,
+            game_name TEXT,
+            package_name TEXT,
+            price_usd DOUBLE PRECISION DEFAULT 0,
+            api_price_uzs DOUBLE PRECISION DEFAULT 0,
+            sale_price DOUBLE PRECISION DEFAULT 0,
+            active INTEGER DEFAULT 1,
+            updated_at TEXT,
+            PRIMARY KEY(game_id, paket_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS orders(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            playpay_order_id TEXT,
+            game_id INTEGER,
+            paket_id INTEGER,
+            product_name TEXT,
+            player_id TEXT,
+            fields_json TEXT,
+            cost_usd DOUBLE PRECISION DEFAULT 0,
+            charged_usd DOUBLE PRECISION DEFAULT 0,
+            sale_price DOUBLE PRECISION DEFAULT 0,
+            status TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            notified TEXT DEFAULT '0'
+        )""",
+        """CREATE TABLE IF NOT EXISTS promo_codes(
+            code TEXT PRIMARY KEY,
+            percent DOUBLE PRECISION,
+            max_uses INTEGER DEFAULT 0,
+            used INTEGER DEFAULT 0,
+            active INTEGER DEFAULT 1
+        )""",
+        """CREATE TABLE IF NOT EXISTS promo_users(
+            user_id BIGINT,
+            code TEXT,
+            PRIMARY KEY(user_id, code)
+        )""",
+        """CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS balance_history(
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT,
+            amount DOUBLE PRECISION,
+            type TEXT,
+            note TEXT,
+            created_at TEXT
+        )"""
+    ]
+
+    for sql in statements:
+        c.execute(sql)
 
     c.commit()
     c.close()
-
-    set_default(
-        "payment_card",
-        PAYMENT_CARD
-    )
-
 
 def set_default(key, value):
 
