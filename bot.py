@@ -2625,61 +2625,13 @@ async def game(update, context):
         await q.message.reply_text("❌ Paketlar topilmadi.")
         return
 
-    # Telegram callback_data uzunligi sababli bitta tugmada faqat ID saqlanadi.
-    # Foydalanuvchiga esa paket ID + nomi + narxi to'liq ko'rsatiladi.
-    header = (
-        f"🎮 {game_name}\n"
-        f"🆔 Game ID: {game_id}\n\n"
-        f"📦 Paketlar ({len(kb)} ta):\n\n"
+    # Paketlarni uzun ID+nom+narx ro'yxati qilib alohida yubormaymiz.
+    # Foydalanuvchi paketni tugmadan tanlaydi; keyin ID/username kiritadi.
+    await q.message.reply_text(
+        f"🎮 {game_name}\n\n"
+        "📦 Paketni tanlang:",
+        reply_markup=InlineKeyboardMarkup(kb)
     )
-
-    lines = []
-    for r in rows:
-        try:
-            paket_id = int(r["paket_id"])
-            price = child_price(Decimal(str(r["sale_price"])), markup)
-            package_name = str(r["package_name"] or "Paket")
-            lines.append(
-                f"🆔 Paket ID: {paket_id}\n"
-                f"📦 {package_name}\n"
-                f"💰 {price:,.0f} so'm"
-            )
-        except Exception:
-            continue
-
-    # Juda ko'p paketlarda Telegram xabar limiti oshib ketmasligi uchun
-    # ma'lumotni bo'lib yuboramiz, lekin barcha paket tugmalari saqlanadi.
-    text = header + "\n\n".join(lines)
-    if len(text) <= 3800:
-        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
-    else:
-        await q.message.reply_text(
-            header + "\n\n".join(lines[:80]),
-            reply_markup=InlineKeyboardMarkup(kb[:80])
-        )
-        # Qolgan paketlar uchun alohida xabarlar; tugmalar ham mos ravishda yuboriladi.
-        for i in range(80, len(rows), 80):
-            chunk_rows = rows[i:i+80]
-            chunk_kb = kb[i:i+80]
-            chunk_lines = []
-            for r in chunk_rows:
-                try:
-                    paket_id = int(r["paket_id"])
-                    price = child_price(Decimal(str(r["sale_price"])), markup)
-                    package_name = str(r["package_name"] or "Paket")
-                    chunk_lines.append(
-                        f"🆔 Paket ID: {paket_id}\n"
-                        f"📦 {package_name}\n"
-                        f"💰 {price:,.0f} so'm"
-                    )
-                except Exception:
-                    pass
-            if chunk_lines:
-                await q.message.reply_text(
-                    f"🎮 {game_name} — paketlar {i+1}-{i+len(chunk_rows)}\n\n" +
-                    "\n\n".join(chunk_lines),
-                    reply_markup=InlineKeyboardMarkup(chunk_kb)
-                )
 
 
 # ============================================================
@@ -3045,18 +2997,16 @@ async def confirm(update, context):
 
         return
 
-    # ID tekshiruvi allaqachon o'tgan bo'lishi kerak.
-    # Grand Mobile bundan mustasno.
-    if int(game_id) != GRAND_MOBILE_GAME_ID:
-        player_name = str(
-            context.user_data.get("player_name", "")
-        ).strip()
+    # Buyurtma yuborilishidan oldin PlayPay ID tekshiruvi shart.
+    player_name = str(
+        context.user_data.get("player_name", "")
+    ).strip()
 
-        if not player_name:
-            await q.message.reply_text(
-                "❌ ID hali tekshirilmagan. Iltimos, buyurtmani qaytadan boshlang."
-            )
-            return
+    if not player_name:
+        await q.message.reply_text(
+            "❌ ID hali tekshirilmagan. Iltimos, ID ni qaytadan yuboring."
+        )
+        return
 
     if game_id is None or paket_id is None:
 
@@ -3732,13 +3682,6 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
-        # Grand Mobile uchun API tekshiruv yo'q — manual oqim saqlanadi.
-        if int(game_id or 0) == GRAND_MOBILE_GAME_ID:
-            context.user_data["player_name"] = "Manual"
-            context.user_data["state"] = None
-            await confirm_order(update.message, context)
-            return
-
         if not PLAYPAY_API_KEY:
             await update.message.reply_text(
                 "❌ PLAYPAY_API_KEY sozlanmagan. ID/nickname tekshiruvi ishlashi uchun Render ENV ga API key qo'shing."
@@ -3757,15 +3700,28 @@ async def text_handler(update, context):
             server_id if server_id else None
         )
 
-        if not data.get("ok"):
-            error = str(data.get("error", "Tekshiruv xatosi"))
+        if not isinstance(data, dict):
+            await update.message.reply_text(
+                "❌ PlayPay javobi noto'g'ri formatda qaytdi."
+            )
+            context.user_data["state"] = None
+            return
+
+        if data.get("ok") is False:
+            error = str(data.get("error") or data.get("message") or "Tekshiruv xatosi")
             await update.message.reply_text(
                 f"❌ ID tekshirilmadi.\n\n{error}"
             )
             context.user_data["state"] = None
             return
 
-        if not data.get("valid"):
+        valid = data.get("valid")
+        if valid is None:
+            valid = data.get("success")
+        if valid is None:
+            valid = data.get("is_valid")
+
+        if not bool(valid):
             await update.message.reply_text(
                 "❌ ID noto'g'ri yoki o'yinchi topilmadi.\n\n"
                 "🆔 ID ni tekshirib, qaytadan buyurtma bering."
@@ -3775,7 +3731,11 @@ async def text_handler(update, context):
             return
 
         player_name = str(
-            data.get("player_name", "")
+            data.get("player_name")
+            or data.get("nickname")
+            or data.get("name")
+            or data.get("username")
+            or ""
         ).strip()
 
         if not player_name:
