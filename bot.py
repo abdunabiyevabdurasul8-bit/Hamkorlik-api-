@@ -2299,7 +2299,7 @@ def sync_catalog():
 def main_menu():
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛍️ O'yinlar / Donat", callback_data="games")],
+        [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
         [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
@@ -2455,14 +2455,39 @@ async def games(update, context):
 
     c.close()
 
+    # Agar katalog hali yuklanmagan bo'lsa, foydalanuvchi
+    # "🎮 O'yinlar" tugmasini bosganda avtomatik yangilaymiz.
     if not rows:
+        try:
+            ok, msg = await asyncio.to_thread(sync_catalog)
+        except Exception as e:
+            ok, msg = False, str(e)
 
+        if ok:
+            c = conn()
+            rows = c.execute(
+                """
+                SELECT *
+                FROM games
+                WHERE active=1
+                ORDER BY
+                    CASE
+                        WHEN game_id=? THEN 0
+                        WHEN game_id=? THEN 1
+                        ELSE 2
+                    END,
+                    name
+                """,
+                (PUBG_GAME_ID, MOBILE_LEGENDS_GAME_ID)
+            ).fetchall()
+            c.close()
+
+    if not rows:
         await q.message.reply_text(
             "❌ O'yinlar topilmadi.\n\n"
-            "👑 Admin paneldan 🔄 Katalog "
-            "tugmasini bosib katalogni yangilang."
+            "🔄 PlayPay katalogini yangilashda xatolik bo'ldi.\n"
+            "👑 Admin paneldagi 🔄 Katalog tugmasini ham bosib ko'ring."
         )
-
         return
 
     kb = []
