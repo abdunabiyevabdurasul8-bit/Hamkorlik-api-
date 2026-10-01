@@ -817,19 +817,41 @@ def ps_get(path):
 
 
 def ps_post(path, payload, key=None):
+    if not PAYSTARS_API_KEY:
+        raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+
     r = requests.post(
         PAYSTARS_API + path,
         headers=ps_headers(key),
         json=payload,
         timeout=30
     )
+
     try:
         data = r.json()
     except Exception:
         data = {"detail": r.text[:500]}
+
     if not r.ok:
-        raise RuntimeError(f"PayStars HTTP {r.status_code}")
+        # API javobidagi foydali xabarni yo'qotmaslik uchun
+        # status + xavfsiz detail qaytaramiz. API key hech qachon chiqmaydi.
+        detail = data.get("detail", data) if isinstance(data, dict) else data
+        if isinstance(detail, dict):
+            msg = detail.get("message") or detail.get("error") or detail.get("code") or str(detail)
+        else:
+            msg = str(detail)
+        raise RuntimeError(f"PayStars HTTP {r.status_code}: {msg[:300]}")
+
+    if not isinstance(data, dict):
+        raise RuntimeError("PayStars noto'g'ri JSON javob qaytardi")
     return data
+
+
+def ps_normalize_username(value):
+    name = str(value or "").strip().lstrip("@").strip()
+    if not name or " " in name or len(name) > 64:
+        raise ValueError("Username noto'g'ri")
+    return name
 
 
 def ps_account():
@@ -837,9 +859,12 @@ def ps_account():
 
 
 def ps_check_user(username, kind):
+    name = ps_normalize_username(username)
+    if kind not in ("stars", "premium"):
+        raise ValueError("Username tekshirish turi noto'g'ri")
     return ps_post(
         "/check-username",
-        {"username": username, "kind": kind}
+        {"username": name, "kind": kind}
     )
 
 
@@ -1172,6 +1197,38 @@ async def paystars_balance_admin(update, context):
 # ============================================================
 # AKTIVSIM UI / FLOW
 # ============================================================
+
+async def aktivsim_intro_handler(update, context):
+    """Virtual raqam bosilganda avval qoidalar/ogohlantirish oynasini ko'rsatadi."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    text = (
+        "🏠 <b>Asosiy menyudasiz.</b>\n\n"
+        "🚀 Bizning bot orqali taqdim etilayotgan akkauntlar — "
+        "tayyor ochilgan Telegram akkauntlar bazasidan olinadi va sotib "
+        "olishdan oldin ma'lumotlarni tekshirish sizning vazifangizdir:\n\n"
+        "⚠️ <b>Kod faqat Telegram ilovasi orqali yuborilishi lozim!</b> "
+        "Agar Telegramning rasmiy ilovasidan kod yuborilsa, kod yetib "
+        "bormasligi yoki xatoliklar bo'lishi mumkin — buning uchun adminlar "
+        "javobgar emas!\n\n"
+        "✔️ Raqamni to'g'ri ishlatish, spamdan saqlash va xavfsizlik "
+        "choralariga rioya qilish — butunlay foydalanuvchi mas'uliyatidadir.\n\n"
+        "☝️ Qoidalar bilan tanishib chiqing va "
+        "<b>«Davom etish»</b> tugmasini bosing!"
+    )
+
+    kb = [[InlineKeyboardButton("Davom etish", callback_data="as_continue")]]
+    await q.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
 async def aktivsim_countries_handler(update, context):
     q = update.callback_query
     await q.answer()
@@ -3324,15 +3381,33 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Username noto'g'ri. Masalan: @username")
             return
         try:
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
             r = await asyncio.to_thread(ps_check_user, name, "stars")
             if not r.get("valid"):
-                raise RuntimeError("Username Stars uchun yaroqsiz.")
-            context.user_data["ps_username"] = name
-            context.user_data["ps_token"] = r.get("verification_token")
+                reason = r.get("detail") or r.get("message") or "Bu username Stars uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
+            context.user_data["ps_username"] = r.get("username") or name
+            context.user_data["ps_token"] = token
             context.user_data["state"] = "ps_stars_quantity"
-            await update.message.reply_text("🔢 Nechta Stars?\n\nMinimal: 50")
-        except Exception:
-            await update.message.reply_text("❌ Username tekshirishda xatolik.")
+            nickname = r.get("nickname")
+            extra = f"\n👤 {nickname}" if nickname else ""
+            await update.message.reply_text(f"✅ Username tasdiqlandi: @{context.user_data['ps_username']}{extra}\n\n🔢 Nechta Stars?\n\nMinimal: 50")
+        except Exception as e:
+            log.warning("PayStars Stars username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ PayStars API kaliti noto'g'ri yoki sozlanmagan."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Stars uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda xatolik.\n\n" + msg[:250]
+            await update.message.reply_text(user_msg)
         return
 
     if state == "ps_stars_quantity":
@@ -3378,9 +3453,15 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Username noto'g'ri.")
             return
         try:
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
             r = await asyncio.to_thread(ps_check_user, name, "premium")
             if not r.get("valid"):
-                raise RuntimeError
+                reason = r.get("detail") or r.get("message") or "Bu username Premium uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
             pricing = await asyncio.to_thread(ps_pricing)
             price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)))
             if price <= 0:
@@ -3401,8 +3482,18 @@ async def text_handler(update, context):
                     InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
                 ]])
             )
-        except Exception:
-            await update.message.reply_text("❌ Premium ma'lumotlarini olishda xatolik.")
+        except Exception as e:
+            log.warning("PayStars Premium username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ PayStars API kaliti noto'g'ri yoki sozlanmagan."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Premium uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda xatolik.\n\n" + msg[:250]
+            await update.message.reply_text(user_msg)
         return
 
     # ========================================================
@@ -5731,6 +5822,8 @@ async def callback_router(update, context):
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
     if d == "aktivsim_buy":
+        return await aktivsim_intro_handler(update, context)
+    if d == "as_continue":
         return await aktivsim_countries_handler(update, context)
     if d.startswith("as_country_"):
         return await aktivsim_country_handler(update, context)
