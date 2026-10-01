@@ -2761,6 +2761,10 @@ async def offer(update, context):
             "package_name"
         ],
 
+        "game_name": r[
+            "game_name"
+        ],
+
         "price": child_price(r["sale_price"], get_child_markup(context)),
 
         "id_label": id_label,
@@ -2874,25 +2878,22 @@ async def confirm_order(
             f"🌐 Server ID: {server_id}\n"
         )
 
+    game_name = context.user_data.get('game_name') or context.user_data.get('offer_game_name') or ''
+    if not game_name:
+        game_name = context.user_data.get('offer_name', 'O\'yin')
+
+    player_name = str(context.user_data.get('player_name', '')).strip()
+
     await message.reply_text(
-        f"📦 {context.user_data.get('offer_name','Paket')}\n\n"
+        f"🎮 {game_name}\n\n"
+        f"📦 {context.user_data.get('offer_name','Paket')}\n"
+        f"💰 Narx: {final_price:,.0f} so'm\n\n"
         f"🆔 {id_label}: {player_id}\n"
-        + (
-            f"👤 Nickname: {context.user_data.get('player_name', '')}\n"
-            if context.user_data.get('player_name')
-            else ""
-        )
-        + f"{extra}"
-        f"💰 Narx: {final_price:,.0f} so'm\n"
-        +
-        (
-            f"🎁 Chegirma: "
-            f"{discount:,.0f} so'm\n"
-            if discount
-            else ""
-        )
-        +
-        "\nBuyurtmani tasdiqlaysizmi?",
+        + (f"👤 Nickname: {player_name}\n" if player_name else "")
+        + extra
+        + (f"🎁 Chegirma: {discount:,.0f} so'm\n" if discount else "")
+        + "\n"
+        "Tasdiqlaysizmi?",
         reply_markup=InlineKeyboardMarkup([
             [
                 InlineKeyboardButton(
