@@ -2520,20 +2520,9 @@ async def game(update, context):
     q = update.callback_query
 
     try:
-
-        game_id = int(
-            q.data.split(
-                ":",
-                1
-            )[1]
-        )
-
+        game_id = int(q.data.split(":", 1)[1])
     except Exception:
-
-        await q.message.reply_text(
-            "❌ O'yin ID xato."
-        )
-
+        await q.message.reply_text("❌ O'yin ID xato.")
         return
 
     try:
@@ -2542,72 +2531,67 @@ async def game(update, context):
         pass
 
     c = conn()
-
     g = c.execute(
-        """
-        SELECT *
-        FROM games
-        WHERE game_id=?
-          AND active=1
-        """,
+        "SELECT * FROM games WHERE game_id=? AND active=1",
         (game_id,)
     ).fetchone()
-
     rows = c.execute(
         """
-        SELECT *
-        FROM products
-        WHERE game_id=?
-          AND active=1
+        SELECT * FROM products
+        WHERE game_id=? AND active=1
         ORDER BY paket_id
         """,
         (game_id,)
     ).fetchall()
-
     c.close()
 
-    if not g:
+    # Paketlar lokal DB'da bo'lmasa, aynan tanlangan o'yin paketlarini
+    # PlayPay API'dan darhol yangilaymiz.
+    if g and not rows:
+        try:
+            data = await asyncio.to_thread(get_packages_api, game_id)
+            if data:
+                for package in data.get("packages", []):
+                    if package.get("paket_id"):
+                        save_package(game_id, g["name"], package)
+        except Exception:
+            log.exception("Tanlangan o'yin paketlarini yangilash xatosi: %s", game_id)
 
+        c = conn()
+        rows = c.execute(
+            """
+            SELECT * FROM products
+            WHERE game_id=? AND active=1
+            ORDER BY paket_id
+            """,
+            (game_id,)
+        ).fetchall()
+        c.close()
+
+    if not g:
         await q.message.reply_text(
             "❌ O'yin topilmadi.\n\n"
-            "👑 Admin paneldan 🔄 Katalog "
-            "tugmasini bosib katalogni yangilang."
+            "👑 Admin paneldan 🔄 Katalog tugmasini bosib yangilang."
         )
-
         return
 
     if not rows:
-
         await q.message.reply_text(
             f"❌ {g['name']} uchun paketlar topilmadi.\n\n"
-            "👑 Admin paneldan 🔄 Katalog "
-            "tugmasini bosib katalogni yangilang."
+            "PlayPay API bu o'yin uchun hozir paket qaytarmadi."
         )
-
         return
 
     game_name = g["name"]
+    id_label = g["id_label"] or "Player ID"
+    requires_server = bool(g["requires_server"])
 
     if game_id == PUBG_GAME_ID:
-
         id_label = "Player ID"
         requires_server = False
-
     elif game_id == MOBILE_LEGENDS_GAME_ID:
-
         id_label = "User ID"
         requires_server = True
-
-    else:
-
-        id_label = (
-            g["id_label"]
-            or "Player ID"
-        )
-
-        requires_server = bool(
-            g["requires_server"]
-        )
 
     context.user_data.update({
         "game_id": game_id,
@@ -2616,45 +2600,86 @@ async def game(update, context):
         "requires_server": requires_server
     })
 
+    markup = get_child_markup(context)
     kb = []
+    skipped = 0
 
     for r in rows:
-
         try:
-
-            sale = Decimal(
-                str(r["sale_price"])
-            )
-
+            sale = Decimal(str(r["sale_price"]))
+            price = child_price(sale, markup)
+            paket_id = int(r["paket_id"])
+            package_name = str(r["package_name"] or "Paket")
         except Exception:
-
+            skipped += 1
             continue
 
         kb.append([
             InlineKeyboardButton(
-                f"{r['package_name']} — "
-                f"{child_price(sale, get_child_markup(context)):,.0f} so'm",
-                callback_data=(
-                    f"o:{game_id}:{r['paket_id']}"
-                )
+                f"📦 {package_name} — {price:,.0f} so'm",
+                callback_data=f"o:{game_id}:{paket_id}"
             )
         ])
 
     if not kb:
-
-        await q.message.reply_text(
-            "❌ Paketlar topilmadi."
-        )
-
+        await q.message.reply_text("❌ Paketlar topilmadi.")
         return
 
-    await q.message.reply_text(
-        f"📦 {game_name}\n\n"
-        "Paketni tanlang:",
-        reply_markup=InlineKeyboardMarkup(
-            kb[:100]
-        )
+    # Telegram callback_data uzunligi sababli bitta tugmada faqat ID saqlanadi.
+    # Foydalanuvchiga esa paket ID + nomi + narxi to'liq ko'rsatiladi.
+    header = (
+        f"🎮 {game_name}\n"
+        f"🆔 Game ID: {game_id}\n\n"
+        f"📦 Paketlar ({len(kb)} ta):\n\n"
     )
+
+    lines = []
+    for r in rows:
+        try:
+            paket_id = int(r["paket_id"])
+            price = child_price(Decimal(str(r["sale_price"])), markup)
+            package_name = str(r["package_name"] or "Paket")
+            lines.append(
+                f"🆔 Paket ID: {paket_id}\n"
+                f"📦 {package_name}\n"
+                f"💰 {price:,.0f} so'm"
+            )
+        except Exception:
+            continue
+
+    # Juda ko'p paketlarda Telegram xabar limiti oshib ketmasligi uchun
+    # ma'lumotni bo'lib yuboramiz, lekin barcha paket tugmalari saqlanadi.
+    text = header + "\n\n".join(lines)
+    if len(text) <= 3800:
+        await q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb))
+    else:
+        await q.message.reply_text(
+            header + "\n\n".join(lines[:80]),
+            reply_markup=InlineKeyboardMarkup(kb[:80])
+        )
+        # Qolgan paketlar uchun alohida xabarlar; tugmalar ham mos ravishda yuboriladi.
+        for i in range(80, len(rows), 80):
+            chunk_rows = rows[i:i+80]
+            chunk_kb = kb[i:i+80]
+            chunk_lines = []
+            for r in chunk_rows:
+                try:
+                    paket_id = int(r["paket_id"])
+                    price = child_price(Decimal(str(r["sale_price"])), markup)
+                    package_name = str(r["package_name"] or "Paket")
+                    chunk_lines.append(
+                        f"🆔 Paket ID: {paket_id}\n"
+                        f"📦 {package_name}\n"
+                        f"💰 {price:,.0f} so'm"
+                    )
+                except Exception:
+                    pass
+            if chunk_lines:
+                await q.message.reply_text(
+                    f"🎮 {game_name} — paketlar {i+1}-{i+len(chunk_rows)}\n\n" +
+                    "\n\n".join(chunk_lines),
+                    reply_markup=InlineKeyboardMarkup(chunk_kb)
+                )
 
 
 # ============================================================
