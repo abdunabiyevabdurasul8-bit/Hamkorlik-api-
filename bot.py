@@ -354,6 +354,11 @@ def init_db():
         "payment_card",
         PAYMENT_CARD
     )
+    set_default("donat_markup_percent", DEFAULT_MARKUP)
+    set_default("stars_markup_percent", PAYSTARS_MARKUP_PERCENT)
+    set_default("premium_markup_percent", PAYSTARS_MARKUP_PERCENT)
+    set_default("sim_markup_percent", AKTIVSIM_MARKUP_PERCENT)
+    set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -509,6 +514,25 @@ def is_child_bot(context):
 
 def bot_admin_id(context):
     return child_owner_id(context.bot.id) if is_child_bot(context) else ADMIN_ID
+
+
+async def notify_bot_owner_technical(context, user_id=None):
+    """Child bot egasiga provider/API nomini ko'rsatmasdan texnik xabar yuboradi."""
+    try:
+        owner_id = int(bot_admin_id(context) or 0)
+        if not owner_id or (user_id is not None and int(owner_id) == int(user_id)):
+            return
+        await context.bot.send_message(
+            chat_id=owner_id,
+            text=(
+                "⚠️ Texnik nosozlik\n\n"
+                "Ulangan botda buyurtmani bajarish vaqtida muammo yuz berdi.\n"
+                "Xizmat vaqtincha ishlamayapti yoki balans yetarli emas.\n"
+                "Iltimos, tekshirib ko'ring."
+            )
+        )
+    except Exception:
+        log.exception("Bot egasiga texnik xabar yuborishda xato")
 
 
 def set_request_db(context):
@@ -910,11 +934,13 @@ def ps_buy_premium(username, months, token):
     )
 
 
-def ps_sell(value):
-    return round(
-        float(value) * (1 + float(PAYSTARS_MARKUP_PERCENT) / 100),
-        2
-    )
+def ps_sell(value, kind="stars"):
+    key = "stars_markup_percent" if kind == "stars" else "premium_markup_percent"
+    try:
+        markup = Decimal(str(get_setting(key, PAYSTARS_MARKUP_PERCENT)))
+    except Exception:
+        markup = PAYSTARS_MARKUP_PERCENT
+    return round(float(value) * (1 + float(markup) / 100), 2)
 
 
 def ps_pricing():
@@ -996,9 +1022,13 @@ def aktivsim_code(order_id):
     return aktivsim_get("getCode", order_id=order_id)
 
 def aktivsim_sale_price(api_price):
+    try:
+        markup = Decimal(str(get_setting("sim_markup_percent", AKTIVSIM_MARKUP_PERCENT)))
+    except Exception:
+        markup = AKTIVSIM_MARKUP_PERCENT
     return float(
         Decimal(str(api_price or 0)) *
-        (Decimal("1") + AKTIVSIM_MARKUP_PERCENT / Decimal("100"))
+        (Decimal("1") + markup / Decimal("100"))
     )
 
 
@@ -1081,10 +1111,10 @@ async def paystars_menu(update, context):
     q = update.callback_query
     try:
         p = await asyncio.to_thread(ps_pricing)
-        star = ps_sell(p.get("star_price", 0))
-        p3 = ps_sell(p.get("premium_3_price", 0))
-        p6 = ps_sell(p.get("premium_6_price", 0))
-        p12 = ps_sell(p.get("premium_12_price", 0))
+        star = ps_sell(p.get("star_price", 0), "stars")
+        p3 = ps_sell(p.get("premium_3_price", 0), "premium")
+        p6 = ps_sell(p.get("premium_6_price", 0), "premium")
+        p12 = ps_sell(p.get("premium_12_price", 0), "premium")
         text = (
             "⭐ <b>Telegram xizmatlari</b>\n\n"
             f"⭐ 1 Stars: {star:,.0f} so'm\n"
@@ -1191,8 +1221,11 @@ async def ps_confirm(update, context, kind):
         context.user_data.clear()
     except Exception:
         add_balance(uid, price, "refund", f"PayStars {label} refund")
+        await notify_bot_owner_technical(context, uid)
         await q.message.reply_text(
-            "❌ Buyurtma yaratilmadi.\n\n💰 Balansingiz qaytarildi."
+            "❌ Buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring.\n"
+            "💰 Balansingiz qaytarildi."
         )
         context.user_data.clear()
 
@@ -1333,7 +1366,11 @@ async def aktivsim_country_handler(update, context):
     code = q.data[len("as_country_"):]
     res = await asyncio.to_thread(aktivsim_countries)
     if not res.get("ok"):
-        return await q.message.reply_text(f"❌ AktivSim API xatosi.\n{str(res.get('error', ''))[:400]}")
+        await notify_bot_owner_technical(context, uid)
+        return await q.message.reply_text(
+            "❌ Hozircha xizmatni ishga tushirib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring."
+        )
 
     raw = res.get("result", [])
     if isinstance(raw, dict):
@@ -1366,8 +1403,10 @@ async def aktivsim_country_handler(update, context):
     bought = await asyncio.to_thread(aktivsim_buy, code)
 
     if not bought.get("ok") or not bought.get("result"):
+        await notify_bot_owner_technical(context, uid)
         return await q.message.edit_text(
-            "❌ Raqamni olishda xatolik.\nQaytadan urinib ko'ring."
+            "❌ Buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring."
         )
 
     result = bought["result"]
@@ -1433,45 +1472,52 @@ def ensure_user(u):
     if not u:
         return
 
-    c = conn()
+    # Foydalanuvchi balansi barcha ulangan botlar uchun
+    # asosiy botning DBsida saqlanadi. Shu sabab child botdan
+    # kirgan user ham asosiy botdagi o'z balansidan foydalanadi.
+    c = None
+    try:
+        # main_conn() dan foydalanish har doim asosiy DBni beradi.
+        c = main_conn()
+        now = datetime.now().isoformat()
 
-    now = datetime.now().isoformat()
-
-    c.execute(
-        """
-        INSERT OR IGNORE INTO users
-        (user_id,username,first_name,created_at)
-        VALUES (?,?,?,?)
-        """,
-        (
-            u.id,
-            u.username or "",
-            u.first_name or "",
-            now
+        c.execute(
+            """
+            INSERT OR IGNORE INTO users
+            (user_id,username,first_name,created_at)
+            VALUES (?,?,?,?)
+            """,
+            (
+                u.id,
+                u.username or "",
+                u.first_name or "",
+                now
+            )
         )
-    )
 
-    c.execute(
-        """
-        UPDATE users
-        SET username=?,
-            first_name=?
-        WHERE user_id=?
-        """,
-        (
-            u.username or "",
-            u.first_name or "",
-            u.id
+        c.execute(
+            """
+            UPDATE users
+            SET username=?,
+                first_name=?
+            WHERE user_id=?
+            """,
+            (
+                u.username or "",
+                u.first_name or "",
+                u.id
+            )
         )
-    )
 
-    c.commit()
-    c.close()
+        c.commit()
+    finally:
+        if c is not None:
+            c.close()
 
 
 def user_exists(uid):
 
-    c = conn()
+    c = main_conn()
 
     r = c.execute(
         """
@@ -1489,7 +1535,7 @@ def user_exists(uid):
 
 def get_balance(uid):
 
-    c = conn()
+    c = main_conn()
 
     r = c.execute(
         """
@@ -1518,7 +1564,7 @@ def add_balance(
 
     amount = Decimal(str(amount))
 
-    c = conn()
+    c = main_conn()
 
     c.execute(
         """
@@ -1786,10 +1832,15 @@ def calc_sale_price(api_uzs):
 
         price = Decimal("0")
 
+    try:
+        markup = Decimal(str(get_setting("donat_markup_percent", DEFAULT_MARKUP)))
+    except Exception:
+        markup = DEFAULT_MARKUP
+
     sale = price * (
         Decimal("1")
         +
-        DEFAULT_MARKUP / Decimal("100")
+        markup / Decimal("100")
     )
 
     return sale.quantize(
@@ -2363,14 +2414,15 @@ def admin_kb():
             )
         ],
         [
-            InlineKeyboardButton(
-                "📦 Buyurtmalar",
-                callback_data="adm_orders"
-            ),
-            InlineKeyboardButton(
-                "💵 Narxlar",
-                callback_data="adm_prices"
-            )
+            InlineKeyboardButton("🎮 Donat ustama", callback_data="adm_markup_donat"),
+            InlineKeyboardButton("📱 SIM ustama", callback_data="adm_markup_sim")
+        ],
+        [
+            InlineKeyboardButton("⭐ Stars ustama", callback_data="adm_markup_stars"),
+            InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
+        ],
+        [
+            InlineKeyboardButton("💵 Donat narxlari", callback_data="adm_prices")
         ],
         [
             InlineKeyboardButton(
@@ -2722,8 +2774,8 @@ async def game(update, context):
 
     if not rows:
         await q.message.reply_text(
-            f"❌ {g['name']} uchun paketlar topilmadi.\n\n"
-            "PlayPay API bu o'yin uchun hozir paket qaytarmadi."
+            f"❌ {g['name']} uchun paketlar hozircha mavjud emas.\n\n"
+            "🛠 Texnik nosozlik yuz berdi. Keyinroq qayta urinib ko'ring."
         )
         return
 
@@ -3207,18 +3259,15 @@ async def confirm(update, context):
             f"{data.get('error','unknown')}"
         )
 
-        err = data.get(
-            "error",
-            "API xatosi"
-        )
-
+        # Foydalanuvchiga provider/API yoki sayt nomi ko'rsatilmaydi.
         await q.message.reply_text(
-            "❌ Buyurtma yuborilmadi.\n\n"
-            f"Xato: {err}\n\n"
-            f"💰 Pul balansga qaytarildi: "
-            f"{price:,.0f} so'm",
+            "❌ Hozircha buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik yuz berdi. Iltimos, birozdan keyin qayta urinib ko'ring.\n\n"
+            f"💰 Pul balansingizga qaytarildi: {price:,.0f} so'm",
             reply_markup=main_menu()
         )
+
+        await notify_bot_owner_technical(context, uid)
 
         return
 
@@ -3546,13 +3595,13 @@ async def text_handler(update, context):
             log.warning("PayStars Stars username check failed: %s", e)
             msg = str(e)
             if "401" in msg or "403" in msg or "API_KEY" in msg:
-                user_msg = "❌ PayStars API kaliti noto'g'ri yoki sozlanmagan."
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
             elif "422" in msg:
                 user_msg = "❌ Username topilmadi yoki Stars uchun mavjud emas."
             elif "429" in msg:
                 user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
             else:
-                user_msg = "❌ Username tekshirishda xatolik.\n\n" + msg[:250]
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
             await update.message.reply_text(user_msg)
         return
 
@@ -3567,7 +3616,7 @@ async def text_handler(update, context):
             return
         try:
             pricing = await asyncio.to_thread(ps_pricing)
-            price = ps_sell(float(pricing.get("star_price", 0)) * quantity)
+            price = ps_sell(float(pricing.get("star_price", 0)) * quantity, "stars")
             if price <= 0:
                 raise RuntimeError
             context.user_data["ps_quantity"] = quantity
@@ -3609,7 +3658,7 @@ async def text_handler(update, context):
             if not token:
                 raise RuntimeError("Verification token qaytmadi")
             pricing = await asyncio.to_thread(ps_pricing)
-            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)))
+            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)), "premium")
             if price <= 0:
                 raise RuntimeError
             context.user_data["ps_username"] = name
@@ -3632,13 +3681,13 @@ async def text_handler(update, context):
             log.warning("PayStars Premium username check failed: %s", e)
             msg = str(e)
             if "401" in msg or "403" in msg or "API_KEY" in msg:
-                user_msg = "❌ PayStars API kaliti noto'g'ri yoki sozlanmagan."
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
             elif "422" in msg:
                 user_msg = "❌ Username topilmadi yoki Premium uchun mavjud emas."
             elif "429" in msg:
                 user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
             else:
-                user_msg = "❌ Username tekshirishda xatolik.\n\n" + msg[:250]
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
             await update.message.reply_text(user_msg)
         return
 
@@ -4965,6 +5014,37 @@ async def price_callback(update, context):
     )
 
 
+async def admin_markup_start(update, context, kind):
+    q = update.callback_query
+    if q.from_user.id != bot_admin_id(context):
+        await q.answer("Siz admin emassiz.", show_alert=True)
+        return
+    labels = {
+        "donat": ("🎮 Donat", "donat_markup_percent", DEFAULT_MARKUP),
+        "sim": ("📱 SIM / Virtual raqam", "sim_markup_percent", AKTIVSIM_MARKUP_PERCENT),
+        "stars": ("⭐ Stars", "stars_markup_percent", PAYSTARS_MARKUP_PERCENT),
+        "premium": ("💎 Premium", "premium_markup_percent", PAYSTARS_MARKUP_PERCENT),
+    }
+    label, key, default = labels[kind]
+    try:
+        current = Decimal(str(get_setting(key, default)))
+    except Exception:
+        current = Decimal(str(default))
+    context.user_data.clear()
+    context.user_data["admin_state"] = f"markup_{kind}"
+    await q.message.reply_text(
+        f"{label} ustama sozlamasi\n\n"
+        f"📈 Hozirgi ustama: {current:g}%\n"
+        "💱 Narx UZS da hisoblanadi.\n\n"
+        "Yangi ustama foizini yuboring.\n"
+        "Masalan: 10\n"
+        "0 = ustamasiz"
+    )
+
+
+async def admin_paystars_price_start(update, context):
+    await admin_markup_start(update, context, "stars")
+
 # ============================================================
 # ADMIN PROMO / CARD / POST
 # ============================================================
@@ -5041,6 +5121,30 @@ async def admin_text_handler(update, context):
     if not state:
 
         return False
+
+    # ========================================================
+    # ALOHIDA USTAMALAR
+    # ========================================================
+    if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium"):
+        try:
+            percent = Decimal(text.replace(",", ".").replace("%", "").strip())
+        except Exception:
+            await update.message.reply_text("❌ Foizni raqamda yuboring. Masalan: 10")
+            return True
+        if percent < 0 or percent > 1000:
+            await update.message.reply_text("❌ Foiz 0 dan 1000 gacha bo'lishi kerak.")
+            return True
+        kind = state.replace("markup_", "")
+        keys = {"donat":"donat_markup_percent", "sim":"sim_markup_percent", "stars":"stars_markup_percent", "premium":"premium_markup_percent"}
+        labels = {"donat":"🎮 Donat", "sim":"📱 SIM / Virtual raqam", "stars":"⭐ Stars", "premium":"💎 Premium"}
+        set_setting(keys[kind], str(percent))
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
+            "Bu xizmatning ustamasi boshqalardan alohida.",
+            reply_markup=admin_kb()
+        )
+        return True
 
     # ========================================================
     # BALANCE USER
@@ -5903,6 +6007,21 @@ async def admin_callback(update, context):
             update,
             context
         )
+
+    elif d == "adm_paystars_price":
+        await admin_paystars_price_start(update, context)
+
+    elif d == "adm_markup_donat":
+        await admin_markup_start(update, context, "donat")
+
+    elif d == "adm_markup_sim":
+        await admin_markup_start(update, context, "sim")
+
+    elif d == "adm_markup_stars":
+        await admin_markup_start(update, context, "stars")
+
+    elif d == "adm_markup_premium":
+        await admin_markup_start(update, context, "premium")
 
     elif d == "adm_promo":
 
