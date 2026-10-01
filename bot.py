@@ -45,56 +45,6 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# ============================================================
-# SMSGANG CATALOG (catalog-only)
-# ============================================================
-SMSGANG_API_KEY = os.getenv("SMSGANG_API_KEY", "").strip()
-SMSGANG_BASE = os.getenv("SMSGANG_BASE", "").strip().rstrip("/")
-# Set these to the exact paths shown by your SMSGang API account/docs.
-SMSGANG_SERVICES_PATH = os.getenv("SMSGANG_SERVICES_PATH", "").strip()
-SMSGANG_COUNTRIES_PATH = os.getenv("SMSGANG_COUNTRIES_PATH", "").strip()
-SMSGANG_PRICES_PATH = os.getenv("SMSGANG_PRICES_PATH", "").strip()
-SMSGANG_MARKUP_PERCENT = Decimal(os.getenv("SMSGANG_MARKUP_PERCENT", "0"))
-SMSGANG_USD_UZS = Decimal(os.getenv("SMSGANG_USD_UZS", "12500"))
-
-
-def smsgang_get(path, **params):
-    if not SMSGANG_API_KEY or not SMSGANG_BASE or not path:
-        return {"ok": False, "error": "SMSGANG_API_KEY/SMSGANG_BASE/path sozlanmagan"}
-    try:
-        r = requests.get(
-            SMSGANG_BASE + "/" + path.lstrip("/"),
-            headers={"X-API-Key": SMSGANG_API_KEY},
-            params=params,
-            timeout=20,
-        )
-        try:
-            data = r.json()
-        except Exception:
-            data = {"detail": r.text[:500]}
-        if not r.ok:
-            return {"ok": False, "error": f"HTTP {r.status_code}", "data": data}
-        return {"ok": True, "data": data}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-def smsgang_price_uzs(value, currency="USD"):
-    amount = Decimal(str(value or 0))
-    if str(currency).upper() == "USD":
-        amount *= SMSGANG_USD_UZS
-    amount *= Decimal("1") + SMSGANG_MARKUP_PERCENT / Decimal("100")
-    return amount.quantize(Decimal("1"))
-
-
-def smsgang_catalog():
-    return {
-        "services": smsgang_get(SMSGANG_SERVICES_PATH),
-        "countries": smsgang_get(SMSGANG_COUNTRIES_PATH),
-        "prices": smsgang_get(SMSGANG_PRICES_PATH),
-    }
-
-
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 
 try:
@@ -121,6 +71,14 @@ PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
 PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
+
+# AktivSim / Donuz: virtual raqamlar
+AKTIVSIM_API_KEY = os.getenv("AKTIVSIM_API_KEY", "").strip() or os.getenv("DONUZ_API_KEY", "").strip()
+AKTIVSIM_BASE = os.getenv(
+    "AKTIVSIM_BASE",
+    "https://ws2524.wineclo.com/AktivSimBot/api/v2/"
+)
+AKTIVSIM_MARKUP_PERCENT = Decimal(os.getenv("AKTIVSIM_MARKUP_PERCENT", "35"))
 
 # SQLite
 DB = "bot.db"
@@ -369,12 +327,6 @@ def init_db():
         status TEXT DEFAULT 'trial',
         markup_uzs REAL DEFAULT 0
     );
-
-    CREATE TABLE IF NOT EXISTS subscription_plans(
-        days INTEGER PRIMARY KEY,
-        price_uzs REAL NOT NULL,
-        active INTEGER DEFAULT 1
-    );
     """)
 
     c.commit()
@@ -387,14 +339,6 @@ def init_db():
 
     if active_db() == MAIN_DB:
         c = conn()
-        plans = [
-            (7, float(os.getenv("SUB_PRICE_7", "15000"))),
-            (30, float(os.getenv("SUB_PRICE_30", "30000"))),
-            (90, float(os.getenv("SUB_PRICE_90", "75000"))),
-            (365, float(os.getenv("SUB_PRICE_365", "250000"))),
-        ]
-        for days, price in plans:
-            c.execute("INSERT OR IGNORE INTO subscription_plans(days,price_uzs,active) VALUES (?,?,1)", (days, price))
         c.execute("""
             CREATE TABLE IF NOT EXISTS custom_prices(
                 country_code TEXT PRIMARY KEY,
@@ -506,7 +450,7 @@ def ensure_external_schema():
 
 
 # ============================================================
-# BOT PLATFORM / SUBSCRIPTION
+# BOT PLATFORM
 # ============================================================
 
 def token_cipher():
@@ -554,31 +498,19 @@ def set_request_db(context):
 
 
 def child_active(row):
-    if not row:
-        return False
-    now = datetime.now()
-    trial = datetime.fromisoformat(row["trial_until"]) if row["trial_until"] else now
-    sub = datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else None
-    return now < trial or (sub and now < sub)
+    # Child botlar doim faol.
+    return bool(row)
 
 
 def child_grace_expired(row):
-    if not row:
-        return True
-    return datetime.now() >= datetime.fromisoformat(row["grace_until"])
+    # Muddat bo'yicha o'chirish yo'q.
+    return False
 
 
 def child_status(row):
     if not row:
         return "deleted"
-    now = datetime.now()
-    trial = datetime.fromisoformat(row["trial_until"]) if row["trial_until"] else now
-    sub = datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else None
-    if now < trial:
-        return "trial"
-    if sub and now < sub:
-        return "active"
-    return "expired"
+    return "active"
 
 
 def refresh_child_status(bot_id):
@@ -614,11 +546,6 @@ def child_turnover(bot_id):
     return int(row[0] or 0), float(row[1] or 0)
 
 
-def subscription_plans():
-    c = main_conn()
-    rows = c.execute("SELECT * FROM subscription_plans WHERE active=1 ORDER BY days").fetchall()
-    c.close()
-    return rows
 
 
 def format_dt(value):
@@ -662,8 +589,9 @@ async def create_child_bot(owner_id, owner_username, token):
         return me, False
 
     now = datetime.now()
-    trial = now + timedelta(days=1)
-    grace = trial + timedelta(days=7)
+    # Eski DB ustunlari saqlanadi, lekin ular endi hech qanday cheklov bermaydi.
+    trial = now
+    grace = now
     db_path = str(CHILD_DIR / f"{bot_id}.db")
     CURRENT_DB.set(db_path)
     init_db(); ensure_external_schema()
@@ -671,7 +599,7 @@ async def create_child_bot(owner_id, owner_username, token):
     # copy current catalog/settings into child DB
     copy_catalog_to_child(db_path)
     c = main_conn()
-    c.execute("""INSERT INTO child_bots(bot_id,bot_username,bot_name,owner_user_id,owner_username,token_enc,db_path,created_at,trial_until,subscription_until,grace_until,status,markup_uzs) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""", (bot_id, me.get("username", ""), me.get("first_name", ""), int(owner_id), owner_username or "", encrypt_token(token), db_path, now.isoformat(), trial.isoformat(), "", grace.isoformat(), "trial"))
+    c.execute("""INSERT INTO child_bots(bot_id,bot_username,bot_name,owner_user_id,owner_username,token_enc,db_path,created_at,trial_until,subscription_until,grace_until,status,markup_uzs) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0)""", (bot_id, me.get("username", ""), me.get("first_name", ""), int(owner_id), owner_username or "", encrypt_token(token), db_path, now.isoformat(), trial.isoformat(), "", grace.isoformat(), "active"))
     c.commit(); c.close()
     await start_child_bot(bot_id)
     return me, True
@@ -745,24 +673,27 @@ async def stop_child_bot(bot_id):
 
 
 async def manage_child_bots(context):
+    # Child botlar muddat sababli o'chirilmaydi.
     set_request_db(context)
-    c = main_conn(); rows = c.execute("SELECT * FROM child_bots").fetchall(); c.close()
+    c = main_conn()
+    rows = c.execute("SELECT * FROM child_bots").fetchall()
+    c.close()
+
     for row in rows:
-        status = child_status(row)
-        if status == "expired" and child_grace_expired(row):
-            await stop_child_bot(int(row["bot_id"]))
-            try:
-                Path(row["db_path"]).unlink(missing_ok=True)
-            except Exception:
-                pass
-            c = main_conn(); c.execute("DELETE FROM child_bots WHERE bot_id=?", (row["bot_id"],)); c.commit(); c.close()
-            continue
-        c = main_conn(); c.execute("UPDATE child_bots SET status=? WHERE bot_id=?", (status, row["bot_id"])); c.commit(); c.close()
-        if status in ("trial", "active") and int(row["bot_id"]) not in CHILD_APPS:
-            try: await start_child_bot(int(row["bot_id"]))
-            except Exception: log.exception("Child bot start xatosi")
-        elif status == "expired" and int(row["bot_id"]) in CHILD_APPS:
-            await stop_child_bot(int(row["bot_id"]))
+        bot_id = int(row["bot_id"])
+        try:
+            c = main_conn()
+            c.execute(
+                "UPDATE child_bots SET status='active' WHERE bot_id=?",
+                (bot_id,)
+            )
+            c.commit()
+            c.close()
+
+            if bot_id not in CHILD_APPS:
+                await start_child_bot(bot_id)
+        except Exception:
+            log.exception("Child bot start xatosi")
 
 
 def build_application(token, child=False):
@@ -782,79 +713,8 @@ def build_application(token, child=False):
 
 
 async def child_platform_access(update, context):
-    if not is_child_bot(context):
-        return True
-    row = child_bot_row(context.bot.id)
-    if not row:
-        return False
-    status = child_status(row)
-    if status in ("trial", "active"):
-        return True
-    await update.effective_message.reply_text(
-        "⛔ Obuna faol emas.\n\n"
-        "Bot egasi asosiy botga kirib obuna sotib olishi kerak.\n"
-        f"📅 Saqlash muddati: {format_dt(row['grace_until'])} gacha."
-    )
-    return False
-
-
-async def subscription_menu(update, context):
-    q = update.callback_query
-    rows = subscription_plans()
-    text = "💳 <b>Bot obunasi</b>\n\n1 kunlik sinov muddati bepul.\n\n"
-    kb=[]
-    for r in rows:
-        text += f"📅 {r['days']} kun — {r['price_uzs']:,.0f} so'm\n"
-        kb.append([InlineKeyboardButton(f"{r['days']} kun — {r['price_uzs']:,.0f} so'm", callback_data=f"sub_buy_{r['days']}")])
-    kb.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
-    await q.message.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
-
-
-async def buy_subscription(update, context, days):
-    q=update.callback_query
-    if is_child_bot(context):
-        await q.message.reply_text("Obunani asosiy platforma botidan sotib oling.")
-        return
-    c=main_conn(); plan=c.execute("SELECT * FROM subscription_plans WHERE days=? AND active=1",(days,)).fetchone(); c.close()
-    if not plan:
-        return await q.message.reply_text("❌ Obuna paketi topilmadi.")
-    price=Decimal(str(plan["price_uzs"]))
-    uid=q.from_user.id
-    if get_balance(uid)<price:
-        return await q.message.reply_text(f"❌ Balans yetarli emas.\nKerak: {price:,.0f} so'm\nBalans: {get_balance(uid):,.0f} so'm")
-    c=main_conn(); bots=c.execute("SELECT * FROM child_bots WHERE owner_user_id=? ORDER BY created_at DESC",(uid,)).fetchall(); c.close()
-    if not bots:
-        return await q.message.reply_text("Avval 🤖 Bot qo'shing.")
-    if len(bots)>1:
-        context.user_data["subscription_days"]=days
-        kb=[[InlineKeyboardButton(f"@{b['bot_username'] or b['bot_id']}",callback_data=f"sub_choose_{b['bot_id']}")] for b in bots]
-        kb.append([InlineKeyboardButton("❌ Bekor qilish",callback_data="cancel")])
-        return await q.message.reply_text("Obuna qaysi bot uchun?",reply_markup=InlineKeyboardMarkup(kb))
-    await activate_subscription(bots[0]["bot_id"], uid, days, price, context)
-
-
-async def activate_subscription(bot_id, uid, days, price, context):
-    c=main_conn(); row=c.execute("SELECT * FROM child_bots WHERE bot_id=? AND owner_user_id=?",(bot_id,uid)).fetchone(); c.close()
-    if not row:
-        return await context.bot.send_message(uid,"❌ Bot topilmadi.")
-    now=datetime.now()
-    current=datetime.fromisoformat(row["subscription_until"]) if row["subscription_until"] else now
-    start=max(now,current)
-    until=start+timedelta(days=days)
-    grace=until+timedelta(days=7)
-    add_balance(uid,-price,"subscription",f"Bot obunasi {days} kun")
-    c=main_conn(); c.execute("UPDATE child_bots SET subscription_until=?,grace_until=?,status=? WHERE bot_id=?",(until.isoformat(),grace.isoformat(),"active",bot_id)); c.commit(); c.close()
-    await start_child_bot(int(bot_id))
-    await context.bot.send_message(uid,f"✅ Obuna faollashtirildi!\n\n🤖 @{row['bot_username'] or bot_id}\n📅 {days} kun\n⏰ Tugaydi: {format_dt(until.isoformat())}")
-
-
-async def choose_subscription_bot(update, context, bot_id):
-    days=int(context.user_data.get("subscription_days",0))
-    c=main_conn(); plan=c.execute("SELECT price_uzs FROM subscription_plans WHERE days=?",(days,)).fetchone(); c.close()
-    if not plan:
-        return
-    await activate_subscription(bot_id, update.effective_user.id, days, Decimal(str(plan["price_uzs"])), context)
-    context.user_data.clear()
+    # Platforma cheklovi yo'q.
+    return True
 
 
 async def add_bot_start(update, context):
@@ -876,8 +736,7 @@ async def bot_manage(update, context, bot_id):
     q=update.callback_query; r=child_bot_row(bot_id)
     if not r or int(r["owner_user_id"])!=q.from_user.id: return await q.message.reply_text("❌ Bu bot sizniki emas.")
     orders,turn=child_turnover(bot_id); st=child_status(r)
-    until=r["subscription_until"] or r["trial_until"]
-    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: {st}\n⏰ Muddati: {format_dt(until)}\n💵 Ustama: {r['markup_uzs']:,.0f} so'm")
+    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: ♾️ Doimiy faol\n💵 Ustama: {r['markup_uzs']:,.0f} so'm")
     kb=[[InlineKeyboardButton("⚙️ Botlar sozlamalari",callback_data=f"bot_settings_{bot_id}")],[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="bot_list")]]
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
@@ -900,7 +759,6 @@ async def bot_markup_start(update, context, bot_id):
 async def bot_start_manual(update, context, bot_id):
     q=update.callback_query; r=child_bot_row(bot_id)
     if not r or int(r["owner_user_id"])!=q.from_user.id: return
-    if not child_active(r): return await q.message.reply_text("⛔ Obuna faol emas.")
     await start_child_bot(int(bot_id)); await q.message.reply_text("▶️ Bot ishga tushirildi.")
 
 
@@ -925,7 +783,7 @@ async def admin_bot_detail(update, context, bot_id):
     r=child_bot_row(bot_id)
     if not r: return await q.message.reply_text("❌ Bot topilmadi.")
     orders,turn=child_turnover(bot_id)
-    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi: @{r['owner_username'] or 'username'}\n👤 Owner ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: {child_status(r)}\n⏰ Trial: {format_dt(r['trial_until'])}\n💳 Obuna: {format_dt(r['subscription_until'])}\n🗑 Saqlash: {format_dt(r['grace_until'])}")
+    text=(f"🤖 <b>@{r['bot_username'] or bot_id}</b>\n\n🆔 Bot ID: <code>{bot_id}</code>\n👤 Egasi: @{r['owner_username'] or 'username'}\n👤 Owner ID: <code>{r['owner_user_id']}</code>\n📅 Qo'shilgan: {format_dt(r['created_at'])}\n💰 Aylanma: {turn:,.0f} so'm\n📦 Buyurtmalar: {orders}\n🟢 Holati: ♾️ Doimiy faol")
     kb=[[InlineKeyboardButton("▶️ Ishga tushirish",callback_data=f"adm_bot_start_{bot_id}"),InlineKeyboardButton("⛔ To'xtatish",callback_data=f"adm_bot_stop_{bot_id}")],[InlineKeyboardButton("🔙 Orqaga",callback_data="adm_bots")]]
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
@@ -1018,6 +876,145 @@ def ps_sell(value):
 
 def ps_pricing():
     return ps_account().get("pricing", {})
+
+
+# ============================================================
+# AKTIVSIM / DONUZ API
+# ============================================================
+def aktivsim_get(action, **params):
+    """AktivSim API chaqiruvini barqaror formatga keltiradi."""
+    if not AKTIVSIM_API_KEY:
+        return {"ok": False, "error": "AKTIVSIM_API_KEY/DONUZ_API_KEY sozlanmagan"}
+
+    params = dict(params)
+    params["action"] = action
+    # AktivSim/VirtualSim turidagi API'larda ikkala nom ham uchraydi.
+    params["apikey"] = AKTIVSIM_API_KEY
+    params.setdefault("api_key", AKTIVSIM_API_KEY)
+
+    try:
+        r = requests.get(
+            AKTIVSIM_BASE.rstrip("/") + "/",
+            params=params,
+            timeout=30,
+            headers={"Accept": "application/json", "User-Agent": "DonuzBot/1.0"},
+        )
+        raw = r.text[:4000]
+        try:
+            data = r.json()
+        except Exception:
+            return {
+                "ok": False,
+                "error": f"HTTP {r.status_code}: API JSON qaytarmadi: {raw[:500]}"
+            }
+
+        log.info("AktivSim %s | HTTP %s | %s", action, r.status_code, data)
+
+        if not r.ok:
+            return {"ok": False, "error": f"HTTP {r.status_code}", "raw": data}
+
+        # Turli AktivSim gateway formatlarini bitta formatga o'tkazamiz.
+        if isinstance(data, dict):
+            if data.get("ok") is True:
+                return data
+            if str(data.get("status", "")).lower() in ("success", "ok", "true"):
+                result = data.get("result", data.get("data", data))
+                return {"ok": True, "result": result, **data}
+            if "error" in data and not data.get("result") and not data.get("data"):
+                return {"ok": False, "error": str(data.get("error")), "raw": data}
+            if "data" in data and data.get("data") is not None:
+                return {"ok": True, "result": data["data"], **data}
+            if "result" in data:
+                return {"ok": True, "result": data["result"], **data}
+
+        # Ba'zi providerlar getCountries'ni to'g'ridan-to'g'ri dict/list qaytaradi.
+        if action == "getCountries" and isinstance(data, (list, dict)):
+            return {"ok": True, "result": data}
+
+        return {"ok": False, "error": "AktivSim API kutilmagan javob qaytardi", "raw": data}
+    except Exception as e:
+        log.exception("AktivSim API xatosi: %s", action)
+        return {"ok": False, "error": f"AktivSim API bilan aloqa xatosi: {e}"}
+
+
+def aktivsim_countries():
+    return aktivsim_get("getCountries")
+
+
+def aktivsim_balance():
+    return aktivsim_get("getBalance")
+
+
+def aktivsim_buy(country_code):
+    return aktivsim_get("buyNumber", country_code=country_code)
+
+
+def aktivsim_code(order_id):
+    return aktivsim_get("getCode", order_id=order_id)
+
+def aktivsim_sale_price(api_price):
+    return float(
+        Decimal(str(api_price or 0)) *
+        (Decimal("1") + AKTIVSIM_MARKUP_PERCENT / Decimal("100"))
+    )
+
+
+def save_external_order(
+    user_id,
+    provider,
+    service_type,
+    provider_order_id,
+    target,
+    quantity=0,
+    months=0,
+    price=0,
+    status="pending",
+):
+    c = conn()
+    now_s = datetime.now().isoformat()
+    try:
+        c.execute(
+            """
+            INSERT INTO external_orders
+            (user_id,provider,service_type,provider_order_id,target,
+             quantity,months,price,status,created_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                user_id, provider, service_type, str(provider_order_id or ""),
+                target or "", float(quantity or 0), int(months or 0),
+                float(price or 0), status, now_s
+            )
+        )
+        # Also mirror it into the main orders table so existing
+        # admin/user order history can see all providers.
+        c.execute(
+            """
+            INSERT INTO orders
+            (user_id,product_name,player_id,sale_price,status,created_at,
+             updated_at,provider,service_type,target,quantity,months,
+             provider_order_id)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                user_id,
+                service_type,
+                target or "",
+                float(price or 0),
+                status,
+                now_s,
+                now_s,
+                provider,
+                service_type,
+                target or "",
+                float(quantity or 0),
+                int(months or 0),
+                str(provider_order_id or ""),
+            )
+        )
+        c.commit()
+    finally:
+        c.close()
 
 
 # ============================================================
@@ -1170,6 +1167,186 @@ async def paystars_balance_admin(update, context):
         await q.message.reply_text(str(data))
     except Exception:
         await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
+
+
+# ============================================================
+# AKTIVSIM UI / FLOW
+# ============================================================
+async def aktivsim_countries_handler(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not AKTIVSIM_API_KEY:
+        return await q.message.reply_text(
+            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
+        )
+
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok"):
+        log.error("AktivSim countries failed: %s", res)
+        err = str(res.get("error", "Noma'lum xato"))[:500]
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxatini olishda xatolik.\n"
+            f"Sabab: {err}"
+        )
+
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        # {"1": "Russia"} yoki {"1": {"name": "Russia", ...}}
+        countries = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("country_code", item.get("id", key))
+                item.setdefault("name", item.get("eng") or item.get("name") or key)
+                countries.append(item)
+            else:
+                countries.append({"country_code": key, "name": str(value)})
+    elif isinstance(raw, list):
+        countries = raw
+    else:
+        countries = []
+
+    if not countries:
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxati bo'sh yoki API formati o'zgargan."
+        )
+
+    c = conn()
+    try:
+        custom = {
+            str(row["country_code"]): row["custom_price"]
+            for row in c.execute(
+                "SELECT country_code,custom_price FROM custom_prices"
+            ).fetchall()
+        }
+    except Exception:
+        custom = {}
+    finally:
+        c.close()
+
+    rows = []
+    for country in countries[:50]:
+        if not isinstance(country, dict):
+            continue
+        code = str(country.get("country_code", country.get("id", "")))
+        if not code:
+            continue
+        name = country.get("name") or country.get("eng") or country.get("rus") or code
+        flag = country.get("flag", "")
+        api_price = float(country.get("price", country.get("cost", 0)) or 0)
+        final = float(custom.get(code, aktivsim_sale_price(api_price)))
+        price_text = f" — {final:,.0f} so'm" if api_price or code in custom else ""
+        rows.append([InlineKeyboardButton(
+            f"{flag} {name}{price_text}",
+            callback_data=f"as_country_{code}"
+        )])
+
+    if not rows:
+        return await q.message.reply_text("❌ AktivSim davlatlar ro'yxatida yaroqli davlat topilmadi.")
+
+    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
+    await q.message.reply_text(
+        "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def aktivsim_country_handler(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    code = q.data[len("as_country_"):]
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok"):
+        return await q.message.reply_text(f"❌ AktivSim API xatosi.\n{str(res.get('error', ''))[:400]}")
+
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        raw = [dict(v, country_code=k) if isinstance(v, dict) else {"country_code": k, "name": str(v)} for k, v in raw.items()]
+    country = next(
+        (x for x in raw if str(x.get("country_code", x.get("id", ""))) == str(code)),
+        None
+    )
+    if not country:
+        return await q.message.reply_text("❌ Davlat topilmadi.")
+
+    c = conn()
+    r = c.execute(
+        "SELECT custom_price FROM custom_prices WHERE country_code=?",
+        (code,)
+    ).fetchone()
+    c.close()
+
+    api_price = float(country.get("price", 0) or 0)
+    price = float(r["custom_price"]) if r else aktivsim_sale_price(api_price)
+
+    if get_balance(uid) < Decimal(str(price)):
+        return await q.message.reply_text(
+            f"❌ Balansingiz yetarli emas.\n"
+            f"Kerak: {price:,.0f} so'm\n"
+            f"Balans: {float(get_balance(uid)):,.0f} so'm"
+        )
+
+    await q.message.edit_text("⏳ Raqam olinmoqda, kuting...")
+    bought = await asyncio.to_thread(aktivsim_buy, code)
+
+    if not bought.get("ok") or not bought.get("result"):
+        return await q.message.edit_text(
+            "❌ Raqamni olishda xatolik.\nQaytadan urinib ko'ring."
+        )
+
+    result = bought["result"]
+    provider_oid = result.get("order_id", "")
+    phone = result.get("phone", "")
+    api_real_price = result.get("price", api_price)
+
+    # Agar provider qaytargan narx boshqacha bo'lsa, sotuv narxini
+    # oldindan tanlangan katalog narxida saqlaymiz.
+    add_balance(uid, -price, "purchase", f"AktivSim {code}")
+    save_external_order(
+        uid, "aktivsim", "virtual_number", provider_oid,
+        phone, 1, 0, price, "sold"
+    )
+
+    code_result = await asyncio.to_thread(aktivsim_code, provider_oid)
+    sms_code = ""
+    if code_result.get("ok") and code_result.get("result"):
+        sms_code = (
+            code_result["result"].get("code")
+            or code_result["result"].get("sms_code")
+            or ""
+        )
+
+    text = (
+        "✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
+        f"🌍 {country.get('name', code)}\n"
+        f"📞 <code>+{phone}</code>\n"
+        f"💰 {price:,.0f} so'm\n"
+        f"🆔 {provider_oid}\n"
+    )
+    if sms_code:
+        text += f"🔑 Kod: <code>{sms_code}</code>\n"
+    else:
+        text += "⏳ SMS kodi hali kelmagan bo'lishi mumkin.\n"
+
+    await q.message.edit_text(text, parse_mode="HTML")
+
+
+async def aktivsim_balance_admin(update, context):
+    q = update.callback_query
+    if q.from_user.id != bot_admin_id(context):
+        return
+    if not AKTIVSIM_API_KEY:
+        return await q.message.reply_text(
+            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
+        )
+    data = await asyncio.to_thread(aktivsim_balance)
+    if data.get("ok"):
+        await q.message.reply_text(
+            f"🔒 AktivSim balansi: {data.get('balance', 'Nomaʼlum')}"
+        )
+    else:
+        await q.message.reply_text("❌ AktivSim balansini olishda xatolik.")
 
 
 # ============================================================
@@ -1348,6 +1525,60 @@ def api_get(path, params=None):
         log.exception(
             "PlayPay GET xatosi"
         )
+
+        return 0, {
+            "ok": False,
+            "error": str(e)
+        }
+
+
+def playpay_check_id(game_id, player_id, server_id=None, charname=None):
+
+    body = {
+        "game_id": int(game_id),
+        "player_id": str(player_id).strip(),
+    }
+
+    if server_id:
+        body["server_id"] = str(server_id).strip()
+
+    if charname:
+        body["charname"] = str(charname).strip()
+
+    return api_post_no_idempotency("/check_id", body)
+
+
+def api_post_no_idempotency(path, body):
+
+    try:
+
+        r = requests.post(
+            PLAYPAY_BASE + path,
+            headers=api_headers(),
+            json=body,
+            timeout=30
+        )
+
+        try:
+            data = r.json()
+        except Exception:
+            data = {
+                "ok": False,
+                "error": r.text
+            }
+
+        log.info(
+            "PlayPay POST %s | status=%s | data=%s",
+            path,
+            r.status_code,
+            data
+        )
+
+        return r.status_code, data
+
+    except Exception as e:
+
+        log.exception("PlayPay check_id xatosi")
 
         return 0, {
             "ok": False,
@@ -2013,10 +2244,10 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍️ O'yinlar / Donat", callback_data="games")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
+        [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
         [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
-        [InlineKeyboardButton("💳 Obuna sotib olish", callback_data="subscription")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
         [InlineKeyboardButton("📦 Buyurtmalarim", callback_data="orders")],
         [
@@ -2098,6 +2329,10 @@ def admin_kb():
             InlineKeyboardButton(
                 "⭐ PayStars balansi",
                 callback_data="adm_paystars_balance"
+            ),
+            InlineKeyboardButton(
+                "🔒 AktivSim balansi",
+                callback_data="adm_aktivsim_balance"
             ),
         ]
     ])
@@ -2560,7 +2795,12 @@ async def confirm_order(
     await message.reply_text(
         f"📦 {context.user_data.get('offer_name','Paket')}\n\n"
         f"🆔 {id_label}: {player_id}\n"
-        f"{extra}"
+        + (
+            f"👤 Nickname: {context.user_data.get('player_name', '')}\n"
+            if context.user_data.get('player_name')
+            else ""
+        )
+        + f"{extra}"
         f"💰 Narx: {final_price:,.0f} so'm\n"
         +
         (
@@ -2696,6 +2936,19 @@ async def confirm(update, context):
         )
 
         return
+
+    # ID tekshiruvi allaqachon o'tgan bo'lishi kerak.
+    # Grand Mobile bundan mustasno.
+    if int(game_id) != GRAND_MOBILE_GAME_ID:
+        player_name = str(
+            context.user_data.get("player_name", "")
+        ).strip()
+
+        if not player_name:
+            await q.message.reply_text(
+                "❌ ID hali tekshirilmagan. Iltimos, buyurtmani qaytadan boshlang."
+            )
+            return
 
     if game_id is None or paket_id is None:
 
@@ -3165,9 +3418,7 @@ async def text_handler(update, context):
                 f"{bot_action}\n\n"
                 f"🤖 @{me.get('username','')}\n"
                 f"🆔 Bot ID: {me['id']}\n"
-                f"🧪 Sinov: 1 kun\n"
-                f"⏰ Sinov tugashi: {format_dt(status['trial_until'])}\n\n"
-                "Obuna faol bo'lmasa bot ishlamaydi.",
+                "♾️ Obunasiz — doimiy ishlaydi.",
                 reply_markup=main_menu()
             )
         except Exception as e:
@@ -3329,6 +3580,83 @@ async def text_handler(update, context):
     # PLAYER / USER ID
     # ========================================================
 
+    async def validate_game_id():
+
+        game_id = context.user_data.get("game_id")
+        player_id = str(
+            context.user_data.get("player_id", "")
+        ).strip()
+        server_id = str(
+            context.user_data.get("server_id", "")
+        ).strip()
+
+        # Grand Mobile uchun API tekshiruv yo'q — manual oqim saqlanadi.
+        if int(game_id or 0) == GRAND_MOBILE_GAME_ID:
+            context.user_data["player_name"] = "Manual"
+            context.user_data["state"] = None
+            await confirm_order(update.message, context)
+            return
+
+        if not PLAYPAY_API_KEY:
+            await update.message.reply_text(
+                "❌ PLAYPAY_API_KEY sozlanmagan. ID/nickname tekshiruvi ishlashi uchun Render ENV ga API key qo'shing."
+            )
+            context.user_data["state"] = None
+            return
+
+        await update.message.reply_text(
+            "🔎 ID tekshirilmoqda..."
+        )
+
+        status, data = await asyncio.to_thread(
+            playpay_check_id,
+            game_id,
+            player_id,
+            server_id if server_id else None
+        )
+
+        if not data.get("ok"):
+            error = str(data.get("error", "Tekshiruv xatosi"))
+            await update.message.reply_text(
+                f"❌ ID tekshirilmadi.\n\n{error}"
+            )
+            context.user_data["state"] = None
+            return
+
+        if not data.get("valid"):
+            await update.message.reply_text(
+                "❌ ID noto'g'ri yoki o'yinchi topilmadi.\n\n"
+                "🆔 ID ni tekshirib, qaytadan buyurtma bering."
+            )
+            context.user_data["state"] = None
+            context.user_data.pop("player_name", None)
+            return
+
+        player_name = str(
+            data.get("player_name", "")
+        ).strip()
+
+        if not player_name:
+            await update.message.reply_text(
+                "❌ ID to'g'ri, lekin nickname ma'lumoti qaytmadi. Buyurtma to'xtatildi."
+            )
+            context.user_data["state"] = None
+            return
+
+        context.user_data["player_name"] = player_name
+        context.user_data["state"] = None
+
+        await update.message.reply_text(
+            f"✅ ID tasdiqlandi!\n\n"
+            f"👤 Nickname: <b>{player_name}</b>",
+            parse_mode="HTML"
+        )
+
+        await confirm_order(
+            update.message,
+            context
+        )
+
     if state == "player_id":
 
         if len(text) > 100:
@@ -3359,14 +3687,10 @@ async def text_handler(update, context):
 
             return
 
-        context.user_data[
-            "state"
-        ] = None
-
-        await confirm_order(
-            update.message,
-            context
-        )
+        # Server kerak bo'lmasa, ID'ni hozir tekshiramiz.
+        if not context.user_data.get("requires_server", False):
+            await validate_game_id()
+            return
 
         return
 
@@ -3388,14 +3712,7 @@ async def text_handler(update, context):
             "server_id"
         ] = text
 
-        context.user_data[
-            "state"
-        ] = None
-
-        await confirm_order(
-            update.message,
-            context
-        )
+        await validate_game_id()
 
         return
 
@@ -5413,14 +5730,14 @@ async def callback_router(update, context):
         return await ps_confirm(update, context, "stars")
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
+    if d == "aktivsim_buy":
+        return await aktivsim_countries_handler(update, context)
+    if d.startswith("as_country_"):
+        return await aktivsim_country_handler(update, context)
     if d == "adm_paystars_balance":
         return await paystars_balance_admin(update, context)
-    if d == "subscription":
-        return await subscription_menu(update, context)
-    if d.startswith("sub_buy_"):
-        return await buy_subscription(update, context, int(d.split("_")[-1]))
-    if d.startswith("sub_choose_"):
-        return await choose_subscription_bot(update, context, int(d.split("_")[-1]))
+    if d == "adm_aktivsim_balance":
+        return await aktivsim_balance_admin(update, context)
     if d == "bot_add":
         return await add_bot_start(update, context)
     if d == "bot_list":
@@ -5441,7 +5758,7 @@ async def callback_router(update, context):
         return await admin_bot_detail(update, context, int(d.split("_")[-1]))
     if d.startswith("adm_bot_start_"):
         bot_id=int(d.split("_")[-1]); r=child_bot_row(bot_id)
-        if q.from_user.id==ADMIN_ID and r and child_active(r): await start_child_bot(bot_id)
+        if q.from_user.id==ADMIN_ID and r: await start_child_bot(bot_id)
         return await q.message.reply_text("▶️ Bot ishga tushirildi.")
     if d.startswith("adm_bot_stop_"):
         bot_id=int(d.split("_")[-1])
