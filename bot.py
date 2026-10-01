@@ -45,6 +45,56 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
+# ============================================================
+# SMSGANG CATALOG (catalog-only)
+# ============================================================
+SMSGANG_API_KEY = os.getenv("SMSGANG_API_KEY", "").strip()
+SMSGANG_BASE = os.getenv("SMSGANG_BASE", "").strip().rstrip("/")
+# Set these to the exact paths shown by your SMSGang API account/docs.
+SMSGANG_SERVICES_PATH = os.getenv("SMSGANG_SERVICES_PATH", "").strip()
+SMSGANG_COUNTRIES_PATH = os.getenv("SMSGANG_COUNTRIES_PATH", "").strip()
+SMSGANG_PRICES_PATH = os.getenv("SMSGANG_PRICES_PATH", "").strip()
+SMSGANG_MARKUP_PERCENT = Decimal(os.getenv("SMSGANG_MARKUP_PERCENT", "0"))
+SMSGANG_USD_UZS = Decimal(os.getenv("SMSGANG_USD_UZS", "12500"))
+
+
+def smsgang_get(path, **params):
+    if not SMSGANG_API_KEY or not SMSGANG_BASE or not path:
+        return {"ok": False, "error": "SMSGANG_API_KEY/SMSGANG_BASE/path sozlanmagan"}
+    try:
+        r = requests.get(
+            SMSGANG_BASE + "/" + path.lstrip("/"),
+            headers={"X-API-Key": SMSGANG_API_KEY},
+            params=params,
+            timeout=20,
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = {"detail": r.text[:500]}
+        if not r.ok:
+            return {"ok": False, "error": f"HTTP {r.status_code}", "data": data}
+        return {"ok": True, "data": data}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def smsgang_price_uzs(value, currency="USD"):
+    amount = Decimal(str(value or 0))
+    if str(currency).upper() == "USD":
+        amount *= SMSGANG_USD_UZS
+    amount *= Decimal("1") + SMSGANG_MARKUP_PERCENT / Decimal("100")
+    return amount.quantize(Decimal("1"))
+
+
+def smsgang_catalog():
+    return {
+        "services": smsgang_get(SMSGANG_SERVICES_PATH),
+        "countries": smsgang_get(SMSGANG_COUNTRIES_PATH),
+        "prices": smsgang_get(SMSGANG_PRICES_PATH),
+    }
+
+
 ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
 
 try:
@@ -71,14 +121,6 @@ PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
 PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
-
-# AktivSim / Donuz: virtual raqamlar
-AKTIVSIM_API_KEY = os.getenv("AKTIVSIM_API_KEY", "").strip() or os.getenv("DONUZ_API_KEY", "").strip()
-AKTIVSIM_BASE = os.getenv(
-    "AKTIVSIM_BASE",
-    "https://ws2524.wineclo.com/AktivSimBot/api/v2/"
-)
-AKTIVSIM_MARKUP_PERCENT = Decimal(os.getenv("AKTIVSIM_MARKUP_PERCENT", "35"))
 
 # SQLite
 DB = "bot.db"
@@ -979,110 +1021,6 @@ def ps_pricing():
 
 
 # ============================================================
-# AKTIVSIM / DONUZ API
-# ============================================================
-def aktivsim_get(action, **params):
-    if not AKTIVSIM_API_KEY:
-        return {"ok": False, "error": "AKTIVSIM_API_KEY/DONUZ_API_KEY sozlanmagan"}
-
-    params["action"] = action
-    params["apikey"] = AKTIVSIM_API_KEY
-    try:
-        r = requests.get(
-            AKTIVSIM_BASE,
-            params=params,
-            timeout=20
-        )
-        try:
-            return r.json()
-        except Exception:
-            return {"ok": False, "error": "API JSON qaytarmadi"}
-    except Exception:
-        return {"ok": False, "error": "AktivSim API bilan aloqa xatosi"}
-
-
-def aktivsim_countries():
-    return aktivsim_get("getCountries")
-
-
-def aktivsim_balance():
-    return aktivsim_get("getBalance")
-
-
-def aktivsim_buy(country_code):
-    return aktivsim_get("buyNumber", country_code=country_code)
-
-
-def aktivsim_code(order_id):
-    return aktivsim_get("getCode", order_id=order_id)
-
-
-def aktivsim_sale_price(api_price):
-    return float(
-        Decimal(str(api_price or 0)) *
-        (Decimal("1") + AKTIVSIM_MARKUP_PERCENT / Decimal("100"))
-    )
-
-
-def save_external_order(
-    user_id,
-    provider,
-    service_type,
-    provider_order_id,
-    target,
-    quantity=0,
-    months=0,
-    price=0,
-    status="pending",
-):
-    c = conn()
-    now_s = datetime.now().isoformat()
-    try:
-        c.execute(
-            """
-            INSERT INTO external_orders
-            (user_id,provider,service_type,provider_order_id,target,
-             quantity,months,price,status,created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                user_id, provider, service_type, str(provider_order_id or ""),
-                target or "", float(quantity or 0), int(months or 0),
-                float(price or 0), status, now_s
-            )
-        )
-        # Also mirror it into the main orders table so existing
-        # admin/user order history can see all providers.
-        c.execute(
-            """
-            INSERT INTO orders
-            (user_id,product_name,player_id,sale_price,status,created_at,
-             updated_at,provider,service_type,target,quantity,months,
-             provider_order_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                user_id,
-                service_type,
-                target or "",
-                float(price or 0),
-                status,
-                now_s,
-                now_s,
-                provider,
-                service_type,
-                target or "",
-                float(quantity or 0),
-                int(months or 0),
-                str(provider_order_id or ""),
-            )
-        )
-        c.commit()
-    finally:
-        c.close()
-
-
-# ============================================================
 # PAYSTARS UI / FLOW
 # ============================================================
 def paystars_kb():
@@ -1232,150 +1170,6 @@ async def paystars_balance_admin(update, context):
         await q.message.reply_text(str(data))
     except Exception:
         await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
-
-
-# ============================================================
-# AKTIVSIM UI / FLOW
-# ============================================================
-async def aktivsim_countries_handler(update, context):
-    q = update.callback_query
-    if not AKTIVSIM_API_KEY:
-        return await q.message.reply_text(
-            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
-        )
-
-    res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
-        return await q.message.reply_text(
-            "❌ AktivSim davlatlar ro'yxatini olishda xatolik."
-        )
-
-    c = conn()
-    custom = {
-        row["country_code"]: row["custom_price"]
-        for row in c.execute(
-            "SELECT country_code,custom_price FROM custom_prices"
-        ).fetchall()
-    }
-    c.close()
-
-    rows = []
-    for country in res["result"][:50]:
-        code = country.get("country_code")
-        name = country.get("name", code)
-        flag = country.get("flag", "")
-        api_price = float(country.get("price", 0) or 0)
-        final = float(custom.get(code, aktivsim_sale_price(api_price)))
-        rows.append([
-            InlineKeyboardButton(
-                f"{flag} {name} — {final:,.0f} so'm",
-                callback_data=f"as_country_{code}"
-            )
-        ])
-
-    rows.append([
-        InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")
-    ])
-    await q.message.reply_text(
-        "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(rows)
-    )
-
-
-async def aktivsim_country_handler(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    code = q.data[len("as_country_"):]
-    res = await asyncio.to_thread(aktivsim_countries)
-    if not res.get("ok") or not res.get("result"):
-        return await q.message.reply_text("❌ AktivSim API xatosi.")
-
-    country = next(
-        (x for x in res["result"]
-         if str(x.get("country_code")) == str(code)),
-        None
-    )
-    if not country:
-        return await q.message.reply_text("❌ Davlat topilmadi.")
-
-    c = conn()
-    r = c.execute(
-        "SELECT custom_price FROM custom_prices WHERE country_code=?",
-        (code,)
-    ).fetchone()
-    c.close()
-
-    api_price = float(country.get("price", 0) or 0)
-    price = float(r["custom_price"]) if r else aktivsim_sale_price(api_price)
-
-    if get_balance(uid) < Decimal(str(price)):
-        return await q.message.reply_text(
-            f"❌ Balansingiz yetarli emas.\n"
-            f"Kerak: {price:,.0f} so'm\n"
-            f"Balans: {float(get_balance(uid)):,.0f} so'm"
-        )
-
-    await q.message.edit_text("⏳ Raqam olinmoqda, kuting...")
-    bought = await asyncio.to_thread(aktivsim_buy, code)
-
-    if not bought.get("ok") or not bought.get("result"):
-        return await q.message.edit_text(
-            "❌ Raqamni olishda xatolik.\nQaytadan urinib ko'ring."
-        )
-
-    result = bought["result"]
-    provider_oid = result.get("order_id", "")
-    phone = result.get("phone", "")
-    api_real_price = result.get("price", api_price)
-
-    # Agar provider qaytargan narx boshqacha bo'lsa, sotuv narxini
-    # oldindan tanlangan katalog narxida saqlaymiz.
-    add_balance(uid, -price, "purchase", f"AktivSim {code}")
-    save_external_order(
-        uid, "aktivsim", "virtual_number", provider_oid,
-        phone, 1, 0, price, "sold"
-    )
-
-    code_result = await asyncio.to_thread(aktivsim_code, provider_oid)
-    sms_code = ""
-    if code_result.get("ok") and code_result.get("result"):
-        sms_code = (
-            code_result["result"].get("code")
-            or code_result["result"].get("sms_code")
-            or ""
-        )
-
-    text = (
-        "✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
-        f"🌍 {country.get('name', code)}\n"
-        f"📞 <code>+{phone}</code>\n"
-        f"💰 {price:,.0f} so'm\n"
-        f"🆔 {provider_oid}\n"
-    )
-    if sms_code:
-        text += f"🔑 Kod: <code>{sms_code}</code>\n"
-    else:
-        text += "⏳ SMS kodi hali kelmagan bo'lishi mumkin.\n"
-
-    await q.message.edit_text(text, parse_mode="HTML")
-
-
-async def aktivsim_balance_admin(update, context):
-    q = update.callback_query
-    if q.from_user.id != bot_admin_id(context):
-        return
-    if not AKTIVSIM_API_KEY:
-        return await q.message.reply_text(
-            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
-        )
-    data = await asyncio.to_thread(aktivsim_balance)
-    if data.get("ok"):
-        await q.message.reply_text(
-            f"🔒 AktivSim balansi: {data.get('balance', 'Nomaʼlum')}"
-        )
-    else:
-        await q.message.reply_text("❌ AktivSim balansini olishda xatolik.")
 
 
 # ============================================================
@@ -2219,7 +2013,6 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🛍️ O'yinlar / Donat", callback_data="games")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
-        [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
         [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
@@ -2233,50 +2026,9 @@ def main_menu():
     ])
 
 
-async def admin_bot_balance_uzs(update, context):
-
-    q = update.callback_query
-
-    if q.from_user.id != bot_admin_id(context):
-        return
-
-    c = conn()
-
-    row = c.execute(
-        """
-        SELECT
-            COUNT(*) AS users_count,
-            COALESCE(SUM(balance), 0) AS total_balance,
-            COALESCE(MAX(balance), 0) AS max_balance
-        FROM users
-        """
-    ).fetchone()
-
-    c.close()
-
-    total = Decimal(str(row["total_balance"] or 0))
-    max_balance = Decimal(str(row["max_balance"] or 0))
-
-    await q.message.reply_text(
-        "💰 BOT BALANSI — UZS\n\n"
-        f"👥 Foydalanuvchilar: {row['users_count']} ta\n"
-        f"💵 Jami balans: {total:,.0f} so'm\n"
-        f"👤 Eng katta user balansi: {max_balance:,.0f} so'm\n\n"
-        "➕ / ➖ Balansni o'zgartirish uchun admin paneldagi "
-        "💰 Balans + / - tugmasidan foydalaning.",
-        reply_markup=admin_kb()
-    )
-
-
 def admin_kb():
 
     return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "💰 Bot balansi (UZS)",
-                callback_data="adm_bot_balance_uzs"
-            )
-        ],
         [
             InlineKeyboardButton(
                 "💰 Balans + / -",
@@ -2346,10 +2098,6 @@ def admin_kb():
             InlineKeyboardButton(
                 "⭐ PayStars balansi",
                 callback_data="adm_paystars_balance"
-            ),
-            InlineKeyboardButton(
-                "🔒 AktivSim balansi",
-                callback_data="adm_aktivsim_balance"
             ),
         ]
     ])
@@ -5501,14 +5249,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    if d == "adm_bot_balance_uzs":
-
-        await admin_bot_balance_uzs(
-            update,
-            context
-        )
-
-    elif d == "adm_addbalance":
+    if d == "adm_addbalance":
 
         await admin_addbalance_start(
             update,
@@ -5672,14 +5413,8 @@ async def callback_router(update, context):
         return await ps_confirm(update, context, "stars")
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
-    if d == "aktivsim_buy":
-        return await aktivsim_countries_handler(update, context)
-    if d.startswith("as_country_"):
-        return await aktivsim_country_handler(update, context)
     if d == "adm_paystars_balance":
         return await paystars_balance_admin(update, context)
-    if d == "adm_aktivsim_balance":
-        return await aktivsim_balance_admin(update, context)
     if d == "subscription":
         return await subscription_menu(update, context)
     if d.startswith("sub_buy_"):
