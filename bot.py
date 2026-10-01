@@ -59,6 +59,24 @@ PLAYPAY_BASE = "https://playpay.uz/api/v1"
 # PlayPay Game ID
 PUBG_GAME_ID = 141
 MOBILE_LEGENDS_GAME_ID = 54
+GRAND_MOBILE_GAME_ID = 999001
+
+# Grand Mobile — faqat manual buyurtma, narxlar o'zgartirilmaydi
+GRAND_MOBILE_PRICES = {
+    15: 3000,
+    30: 5500,
+    90: 15500,
+    150: 26000,
+    200: 34000,
+    300: 53000,
+    400: 71500,
+    500: 85000,
+    1000: 169000,
+    1500: 258000,
+    2000: 345000,
+    2500: 422000,
+    3000: 519000,
+}
 
 # 0 = PlayPay API narxining o'zi
 DEFAULT_MARKUP = Decimal("0")
@@ -2300,6 +2318,7 @@ def main_menu():
 
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
+        [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
         [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
@@ -2416,6 +2435,132 @@ async def start(update, context):
         "🎮 Donat botiga xush kelibsiz!",
         reply_markup=main_menu()
     )
+
+
+# ============================================================
+# GRAND MOBILE — MANUAL BUYURTMA
+# Narxlar foydalanuvchi bergan ro'yxat bo'yicha o'zgarmaydi.
+# ============================================================
+
+async def grand_mobile(update, context):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    kb = []
+    for gc, price in GRAND_MOBILE_PRICES.items():
+        kb.append([InlineKeyboardButton(
+            f"📱 {gc} GC — {price:,.0f} so'm 💸",
+            callback_data=f"grand:{gc}"
+        )])
+
+    await q.message.reply_text(
+        "🚗 Grand Mobile ID orqali 💸\n\n"
+        "📱 Paketni tanlang:\n\n"
+        "Oddiy narx GRAND MOBILE da nechi X bo'lsa,\n"
+        "shuncha baravar ko'p GC tushadi.\n"
+        "Misol: 5X → 1 GC o'rniga 5 GC tushadi.",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def grand_package(update, context):
+    q = update.callback_query
+    try:
+        await q.answer()
+        gc = int(q.data.split(":", 1)[1])
+    except Exception:
+        return await q.message.reply_text("❌ Grand Mobile paketi xato.")
+
+    if gc not in GRAND_MOBILE_PRICES:
+        return await q.message.reply_text("❌ Paket topilmadi.")
+
+    context.user_data.clear()
+    context.user_data.update({
+        "grand_gc": gc,
+        "grand_price": Decimal(str(GRAND_MOBILE_PRICES[gc])),
+        "state": "grand_player_id",
+    })
+
+    await q.message.reply_text(
+        f"🚗 Grand Mobile\n\n"
+        f"📦 {gc} GC\n"
+        f"💰 {GRAND_MOBILE_PRICES[gc]:,.0f} so'm\n\n"
+        "🆔 Grand Mobile ID ni yuboring:\n\n"
+        "⚠️ Bu buyurtma manual tekshiriladi.\n"
+        "Bekor qilish: /cancel"
+    )
+
+
+async def grand_confirm(update, context):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    uid = q.from_user.id
+    gc = int(context.user_data.get("grand_gc", 0))
+    price = Decimal(str(context.user_data.get("grand_price", 0)))
+    player_id = str(context.user_data.get("grand_player_id", "")).strip()
+
+    if gc not in GRAND_MOBILE_PRICES or not player_id:
+        await q.message.reply_text("❌ Buyurtma ma'lumotlari to'liq emas.")
+        context.user_data.clear()
+        return
+
+    balance = Decimal(str(get_balance(uid)))
+    if balance < price:
+        await q.message.reply_text(
+            f"❌ Balans yetarli emas.\n\n"
+            f"💰 Kerak: {price:,.0f} so'm\n"
+            f"💳 Balans: {balance:,.0f} so'm",
+            reply_markup=main_menu()
+        )
+        return
+
+    add_balance(uid, -price, "order_hold", f"Grand Mobile manual: {gc} GC")
+
+    c = conn()
+    cur = c.execute(
+        """INSERT INTO orders
+        (user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
+         cost_usd,charged_usd,sale_price,status,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (uid, "MANUAL", GRAND_MOBILE_GAME_ID, gc, f"Grand Mobile {gc} GC",
+         player_id, json.dumps({"grand_gc": gc, "manual": True}, ensure_ascii=False),
+         0, 0, float(price), "manual_pending", datetime.now().isoformat(), datetime.now().isoformat())
+    )
+    order_id = cur.lastrowid
+    c.commit()
+    c.close()
+
+    context.user_data.clear()
+
+    await q.message.reply_text(
+        f"✅ Grand Mobile buyurtma qabul qilindi!\n\n"
+        f"📦 {gc} GC\n"
+        f"🆔 ID: {player_id}\n"
+        f"💰 {price:,.0f} so'm\n"
+        f"🔢 Buyurtma: #{order_id}\n"
+        "📋 Status: Manual tekshiruvda",
+        reply_markup=main_menu()
+    )
+
+    try:
+        await context.bot.send_message(
+            bot_admin_id(context),
+            f"🚗 GRAND MOBILE MANUAL BUYURTMA #{order_id}\n\n"
+            f"👤 User ID: {uid}\n"
+            f"📦 {gc} GC\n"
+            f"🆔 Grand Mobile ID: {player_id}\n"
+            f"💰 Sotuv: {price:,.0f} so'm\n"
+            "📋 Status: Manual tekshiruvda"
+        )
+    except Exception:
+        log.exception("Grand Mobile admin xabari xatosi")
 
 
 # ============================================================
@@ -3666,6 +3811,35 @@ async def text_handler(update, context):
             f"🎁 Chegirma: {r['percent']}%"
         )
 
+        return
+
+    # ========================================================
+    # GRAND MOBILE ID
+    # ========================================================
+    if state == "grand_player_id":
+        if not text or len(text) > 100:
+            await update.message.reply_text("❌ Grand Mobile ID noto'g'ri.")
+            return
+
+        context.user_data["grand_player_id"] = text
+        gc = int(context.user_data.get("grand_gc", 0))
+        price = Decimal(str(context.user_data.get("grand_price", 0)))
+        balance = Decimal(str(get_balance(u.id)))
+        context.user_data["state"] = None
+
+        await update.message.reply_text(
+            f"🚗 Grand Mobile\n\n"
+            f"📦 {gc} GC\n"
+            f"💰 {price:,.0f} so'm\n"
+            f"🆔 Grand Mobile ID: {text}\n\n"
+            f"💳 Balans: {balance:,.0f} so'm\n\n"
+            "⚠️ Manual buyurtma admin tomonidan bajariladi.\n"
+            "Tasdiqlaysizmi?",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Tasdiqlash", callback_data="grand_confirm"),
+                InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
+            ]])
+        )
         return
 
     # ========================================================
@@ -5877,6 +6051,13 @@ async def callback_router(update, context):
     if d == "child_stats":
         orders,turn=child_turnover(context.bot.id)
         return await q.message.reply_text(f"📊 Statistika\n\n📦 Buyurtmalar: {orders}\n💰 Aylanma: {turn:,.0f} so'm")
+    if d == "grand_mobile":
+        return await grand_mobile(update, context)
+    if d.startswith("grand:"):
+        return await grand_package(update, context)
+    if d == "grand_confirm":
+        return await grand_confirm(update, context)
+
     if d == "back_home":
         context.user_data.clear()
         return await q.message.edit_text(
