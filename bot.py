@@ -70,7 +70,7 @@ PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 # PayStars: Telegram Stars / Premium
 PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
-PAYSTARS_MARKUP_PERCENT = Decimal(os.getenv("PAYSTARS_MARKUP_PERCENT", "4.5"))
+PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
 
 # AktivSim / Donuz: virtual raqamlar
 AKTIVSIM_API_KEY = os.getenv("AKTIVSIM_API_KEY", "").strip() or os.getenv("DONUZ_API_KEY", "").strip()
@@ -353,6 +353,12 @@ def init_db():
         ]
         for days, price in plans:
             c.execute("INSERT OR IGNORE INTO subscription_plans(days,price_uzs,active) VALUES (?,?,1)", (days, price))
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS custom_prices(
+                country_code TEXT PRIMARY KEY,
+                custom_price REAL NOT NULL
+            )
+        """)
         c.commit()
         c.close()
 
@@ -2227,9 +2233,50 @@ def main_menu():
     ])
 
 
+async def admin_bot_balance_uzs(update, context):
+
+    q = update.callback_query
+
+    if q.from_user.id != bot_admin_id(context):
+        return
+
+    c = conn()
+
+    row = c.execute(
+        """
+        SELECT
+            COUNT(*) AS users_count,
+            COALESCE(SUM(balance), 0) AS total_balance,
+            COALESCE(MAX(balance), 0) AS max_balance
+        FROM users
+        """
+    ).fetchone()
+
+    c.close()
+
+    total = Decimal(str(row["total_balance"] or 0))
+    max_balance = Decimal(str(row["max_balance"] or 0))
+
+    await q.message.reply_text(
+        "💰 BOT BALANSI — UZS\n\n"
+        f"👥 Foydalanuvchilar: {row['users_count']} ta\n"
+        f"💵 Jami balans: {total:,.0f} so'm\n"
+        f"👤 Eng katta user balansi: {max_balance:,.0f} so'm\n\n"
+        "➕ / ➖ Balansni o'zgartirish uchun admin paneldagi "
+        "💰 Balans + / - tugmasidan foydalaning.",
+        reply_markup=admin_kb()
+    )
+
+
 def admin_kb():
 
     return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(
+                "💰 Bot balansi (UZS)",
+                callback_data="adm_bot_balance_uzs"
+            )
+        ],
         [
             InlineKeyboardButton(
                 "💰 Balans + / -",
@@ -5454,7 +5501,14 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    if d == "adm_addbalance":
+    if d == "adm_bot_balance_uzs":
+
+        await admin_bot_balance_uzs(
+            update,
+            context
+        )
+
+    elif d == "adm_addbalance":
 
         await admin_addbalance_start(
             update,
