@@ -153,64 +153,541 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+
+# ============================================================
+# WEB SAYT API
+# ============================================================
+
+WEB_SESSION_HOURS = 2
+WEB_AUTH_MINUTES = 10
+
+def _json_bytes(data):
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+
+def _web_send_telegram_message(user_id, text):
+    if not BOT_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": int(user_id), "text": text},
+            timeout=15,
+        )
+        return bool(r.ok and r.json().get("ok"))
+    except Exception:
+        log.exception("Web auth Telegram xatosi")
+        return False
+
+
+def _web_cleanup():
+    now = datetime.now().isoformat()
+    c = main_conn()
+    c.execute("DELETE FROM web_auth_codes WHERE expires_at < ? OR used=1", (now,))
+    c.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now,))
+    c.commit()
+    c.close()
+
+
+def web_request_auth_code(user_id):
+    _web_cleanup()
+    c = main_conn()
+    user = c.execute(
+        "SELECT user_id FROM users WHERE user_id=?",
+        (int(user_id),)
+    ).fetchone()
+    if not user:
+        c.close()
+        return False, "Telegram botda /start bosing, keyin qayta urinib ko'ring."
+
+    code = str(uuid.uuid4().int)[-6:]
+    expires = datetime.now() + timedelta(minutes=WEB_AUTH_MINUTES)
+
+    c.execute(
+        "INSERT INTO web_auth_codes(user_id,code,expires_at,used,created_at) VALUES(?,?,?,?,?)",
+        (int(user_id), code, expires.isoformat(), 0, datetime.now().isoformat())
+    )
+    c.commit()
+    c.close()
+
+    sent = _web_send_telegram_message(
+        user_id,
+        "🌐 GAME DONAT saytiga kirish kodi:\n\n"
+        f"🔐 {code}\n\n"
+        f"⏱ Kod {WEB_AUTH_MINUTES} daqiqa amal qiladi.\n"
+        "Bu kodni hech kimga bermang."
+    )
+    if not sent:
+        return False, "Telegram xabarini yuborib bo'lmadi."
+    return True, "Tasdiqlash kodi Telegram botingizga yuborildi."
+
+
+def web_verify_auth_code(user_id, code):
+    _web_cleanup()
+    c = main_conn()
+    row = c.execute(
+        """
+        SELECT id FROM web_auth_codes
+        WHERE user_id=? AND code=? AND used=0 AND expires_at>=?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (int(user_id), str(code).strip(), datetime.now().isoformat())
+    ).fetchone()
+    if not row:
+        c.close()
+        return None
+
+    c.execute("UPDATE web_auth_codes SET used=1 WHERE id=?", (row["id"],))
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    expires = datetime.now() + timedelta(hours=WEB_SESSION_HOURS)
+    c.execute(
+        "INSERT INTO web_sessions(token,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+        (token, int(user_id), expires.isoformat(), datetime.now().isoformat())
+    )
+    c.commit()
+    c.close()
+    return token
+
+
+def web_session_user(token):
+    if not token:
+        return None
+    _web_cleanup()
+    c = main_conn()
+    row = c.execute(
+        "SELECT user_id FROM web_sessions WHERE token=? AND expires_at>=?",
+        (str(token), datetime.now().isoformat())
+    ).fetchone()
+    c.close()
+    return int(row["user_id"]) if row else None
+
+
+def web_catalog():
+    c = main_conn()
+    games = c.execute(
+        "SELECT game_id,name,id_label,requires_server,amount_based "
+        "FROM games WHERE active=1 ORDER BY game_id"
+    ).fetchall()
+    result = []
+
+    for g in games:
+        products = c.execute(
+            """
+            SELECT paket_id,package_name,api_price_uzs,sale_price
+            FROM products
+            WHERE game_id=? AND active=1
+            ORDER BY paket_id
+            """,
+            (g["game_id"],)
+        ).fetchall()
+
+        result.append({
+            "game_id": int(g["game_id"]),
+            "name": g["name"],
+            "id_label": g["id_label"],
+            "requires_server": bool(g["requires_server"]),
+            "amount_based": bool(g["amount_based"]),
+            "packages": [
+                {
+                    "paket_id": int(p["paket_id"]),
+                    "name": p["package_name"],
+                    "api_price_uzs": float(p["api_price_uzs"] or 0),
+                    "price": float(p["sale_price"] or 0),
+                }
+                for p in products
+            ],
+        })
+
+    c.close()
+
+    # Grand Mobile manual katalogi
+    result.append({
+        "game_id": GRAND_MOBILE_GAME_ID,
+        "name": "Grand Mobile",
+        "id_label": "Grand Mobile ID",
+        "requires_server": False,
+        "amount_based": False,
+        "manual": True,
+        "packages": [
+            {
+                "paket_id": int(gc),
+                "name": f"{gc} GC",
+                "api_price_uzs": float(price),
+                "price": float(price),
+            }
+            for gc, price in GRAND_MOBILE_PRICES.items()
+        ],
+    })
+    return result
+
+
+def web_check_id(payload):
+    game_id = int(payload.get("game_id", 0))
+    player_id = str(payload.get("player_id", "")).strip()
+    server_id = str(payload.get("server_id", "")).strip()
+    charname = str(payload.get("charname", "")).strip()
+
+    if not player_id:
+        return {"ok": False, "error": "ID kiritilmagan."}
+
+    if game_id == GRAND_MOBILE_GAME_ID:
+        return {
+            "ok": True,
+            "manual": True,
+            "player_id": player_id,
+            "message": "Grand Mobile buyurtmasi manual tekshiriladi."
+        }
+
+    status, data = playpay_check_id(
+        game_id, player_id,
+        server_id=server_id or None,
+        charname=charname or None
+    )
+
+    if status and isinstance(data, dict):
+        data["http_status"] = status
+        return data
+
+    return {"ok": False, "error": "ID tekshirishda xatolik."}
+
+
+def web_create_order(payload, user_id):
+    game_id = int(payload.get("game_id", 0))
+    paket_id = int(payload.get("paket_id", 0))
+    player_id = str(payload.get("player_id", "")).strip()
+    server_id = str(payload.get("server_id", "")).strip()
+
+    if not player_id:
+        return {"ok": False, "error": "ID kiritilmagan."}
+
+    c = main_conn()
+    p = c.execute(
+        """
+        SELECT * FROM products
+        WHERE game_id=? AND paket_id=? AND active=1
+        """,
+        (game_id, paket_id)
+    ).fetchone()
+    c.close()
+
+    if game_id == GRAND_MOBILE_GAME_ID:
+        if paket_id not in GRAND_MOBILE_PRICES:
+            return {"ok": False, "error": "Grand Mobile paketi topilmadi."}
+        price = Decimal(str(GRAND_MOBILE_PRICES[paket_id]))
+        product_name = f"Grand Mobile - {paket_id} GC"
+    else:
+        if not p:
+            return {"ok": False, "error": "Paket topilmadi."}
+        price = Decimal(str(p["sale_price"] or 0))
+        product_name = p["package_name"]
+
+    if price <= 0:
+        return {"ok": False, "error": "Narx noto'g'ri."}
+
+    balance = get_balance(user_id)
+    if balance < price:
+        return {
+            "ok": False,
+            "error": "Balans yetarli emas.",
+            "balance": float(balance),
+            "required": float(price),
+        }
+
+    # IDni qayta tekshirish: PlayPay o'yinlari uchun.
+    if game_id != GRAND_MOBILE_GAME_ID:
+        check = web_check_id({
+            "game_id": game_id,
+            "player_id": player_id,
+            "server_id": server_id,
+        })
+        if not check.get("ok"):
+            return {
+                "ok": False,
+                "error": "ID tekshirilmadi.",
+                "details": check,
+            }
+
+    web_token = uuid.uuid4().hex + uuid.uuid4().hex
+    now = datetime.now().isoformat()
+    c = main_conn()
+    c.execute(
+        """
+        INSERT INTO web_orders(
+            token,user_id,game_id,paket_id,product_name,player_id,
+            server_id,price,status,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            web_token, int(user_id), game_id, paket_id, product_name,
+            player_id, server_id, float(price), "processing", now, now
+        )
+    )
+    web_order_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    c.commit()
+    c.close()
+
+    # Balansni ushlab turamiz.
+    add_balance(
+        user_id, -price, "order_hold",
+        f"Web sayt buyurtma #{web_order_id}: {product_name}"
+    )
+
+    # Grand Mobile manual buyurtma
+    if game_id == GRAND_MOBILE_GAME_ID:
+        c = main_conn()
+        cur = c.execute(
+            """
+            INSERT INTO orders(
+                user_id,playpay_order_id,game_id,paket_id,product_name,
+                player_id,fields_json,cost_usd,charged_usd,sale_price,
+                status,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                int(user_id), f"WEB-{web_order_id}", game_id, paket_id,
+                product_name, player_id,
+                json.dumps({"player_id": player_id}, ensure_ascii=False),
+                0, 0, float(price), "manual_pending", now, now
+            )
+        )
+        local_id = cur.lastrowid
+        c.execute(
+            "UPDATE web_orders SET status='manual_pending',updated_at=? WHERE id=?",
+            (datetime.now().isoformat(), web_order_id)
+        )
+        c.commit()
+        c.close()
+
+        if ADMIN_ID:
+            _web_send_telegram_message(
+                ADMIN_ID,
+                "🆕 WEB GRAND MOBILE BUYURTMA\n\n"
+                f"📦 {product_name}\n"
+                f"🆔 ID: {player_id}\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"👤 Telegram ID: {user_id}\n"
+                f"📋 Buyurtma: #{local_id}"
+            )
+
+        return {
+            "ok": True,
+            "status": "manual_pending",
+            "order_id": local_id,
+            "message": "Buyurtma qabul qilindi. Grand Mobile buyurtmasi manual bajariladi.",
+        }
+
+    # PlayPay buyurtma
+    body = {
+        "game_id": game_id,
+        "paket_id": paket_id,
+        "player_id": player_id,
+    }
+    if server_id:
+        body["server_id"] = server_id
+
+    status, data = api_post("/order", body)
+
+    if not isinstance(data, dict) or not data.get("ok"):
+        add_balance(
+            user_id, price, "order_refund",
+            f"Web sayt PlayPay xatosi: {str(data)[:250]}"
+        )
+        c = main_conn()
+        c.execute(
+            "UPDATE web_orders SET status='failed',updated_at=? WHERE id=?",
+            (datetime.now().isoformat(), web_order_id)
+        )
+        c.commit()
+        c.close()
+        return {
+            "ok": False,
+            "error": "Buyurtmani bajarib bo'lmadi. Pul balansingizga qaytarildi.",
+        }
+
+    provider_order_id = str(data.get("order_id", ""))
+    c = main_conn()
+    c.execute(
+        "UPDATE web_orders SET status=?,playpay_order_id=?,updated_at=? WHERE id=?",
+        (
+            str(data.get("status", "processing")),
+            provider_order_id,
+            datetime.now().isoformat(),
+            web_order_id,
+        )
+    )
+    c.execute(
+        """
+        INSERT INTO orders(
+            user_id,playpay_order_id,game_id,paket_id,product_name,
+            player_id,fields_json,cost_usd,charged_usd,sale_price,
+            status,created_at,updated_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            int(user_id), provider_order_id, game_id, paket_id,
+            product_name, player_id,
+            json.dumps({"player_id": player_id, "server_id": server_id}, ensure_ascii=False),
+            float((data.get("price") or {}).get("amount", 0) or 0),
+            float((data.get("charged") or {}).get("amount", 0) or 0),
+            float(price), str(data.get("status", "processing")),
+            now, now,
+        )
+    )
+    local_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+    c.commit()
+    c.close()
+
+    return {
+        "ok": True,
+        "status": str(data.get("status", "processing")),
+        "order_id": local_id,
+        "provider_order_id": provider_order_id,
+        "message": "Buyurtma qabul qilindi.",
+    }
+
+
+class WebAPIHandler(BaseHTTPRequestHandler):
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
+    def _reply(self, data, status=200):
+        raw = _json_bytes(data)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _body(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(n) if n else b"{}"
+            return json.loads(raw.decode("utf-8"))
+        except Exception:
+            return {}
+
+    def _auth_token(self):
+        h = self.headers.get("Authorization", "")
+        if h.lower().startswith("bearer "):
+            return h[7:].strip()
+        return ""
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
+    def do_GET(self):
+        from urllib.parse import urlparse
+
+        path = urlparse(self.path).path
+
+        try:
+            if path == "/" or path == "/health":
+                return self._reply({
+                    "ok": True,
+                    "service": "GAME DONAT",
+                    "status": "online",
+                })
+
+            if path == "/api/catalog":
+                return self._reply({"ok": True, "games": web_catalog()})
+
+            if path == "/api/me":
+                uid = web_session_user(self._auth_token())
+                if not uid:
+                    return self._reply({"ok": False, "error": "Kirish talab qilinadi."}, 401)
+                return self._reply({
+                    "ok": True,
+                    "user_id": uid,
+                    "balance": float(get_balance(uid)),
+                })
+
+            return self._reply({"ok": False, "error": "Endpoint topilmadi."}, 404)
+
+        except Exception:
+            log.exception("Web GET API xatosi")
+            return self._reply({"ok": False, "error": "Server xatosi."}, 500)
+
+    def do_POST(self):
+        from urllib.parse import urlparse
+
+        path = urlparse(self.path).path
+        payload = self._body()
+
+        try:
+            if path == "/api/auth/request":
+                try:
+                    uid = int(payload.get("telegram_id", 0))
+                except Exception:
+                    uid = 0
+                if not uid:
+                    return self._reply({"ok": False, "error": "Telegram ID noto'g'ri."}, 400)
+                ok, msg = web_request_auth_code(uid)
+                return self._reply({"ok": ok, "message": msg}, 200 if ok else 400)
+
+            if path == "/api/auth/verify":
+                try:
+                    uid = int(payload.get("telegram_id", 0))
+                except Exception:
+                    uid = 0
+                token = web_verify_auth_code(uid, payload.get("code", ""))
+                if not token:
+                    return self._reply({"ok": False, "error": "Kod noto'g'ri yoki muddati tugagan."}, 401)
+                return self._reply({
+                    "ok": True,
+                    "token": token,
+                    "user_id": uid,
+                    "balance": float(get_balance(uid)),
+                })
+
+            if path == "/api/check-id":
+                result = web_check_id(payload)
+                return self._reply(result, 200 if result.get("ok") else 400)
+
+            if path == "/api/order":
+                uid = web_session_user(self._auth_token())
+                if not uid:
+                    return self._reply({"ok": False, "error": "Avval Telegram orqali kiring."}, 401)
+                result = web_create_order(payload, uid)
+                return self._reply(result, 200 if result.get("ok") else 400)
+
+            return self._reply({"ok": False, "error": "Endpoint topilmadi."}, 404)
+
+        except Exception:
+            log.exception("Web POST API xatosi")
+            return self._reply({"ok": False, "error": "Server xatosi."}, 500)
+
+
 # ============================================================
 # RENDER HEALTH SERVER
 # ============================================================
 
-class HealthHandler(BaseHTTPRequestHandler):
-
-    def do_GET(self):
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.end_headers()
-
-        self.wfile.write(
-            b"PLAYPAY DONAT BOT OK"
-        )
-
-    def do_HEAD(self):
-
-        self.send_response(200)
-
-        self.send_header(
-            "Content-Type",
-            "text/plain; charset=utf-8"
-        )
-
-        self.end_headers()
-
-    def log_message(self, format, *args):
-
-        return
+class HealthHandler(WebAPIHandler):
+    pass
 
 
 def start_health_server():
 
     try:
-
         server = HTTPServer(
             ("0.0.0.0", PORT),
-            HealthHandler
+            WebAPIHandler
         )
 
         log.info(
-            "Render HTTP server ishga tushdi: 0.0.0.0:%s",
+            "Render Web/API server ishga tushdi: 0.0.0.0:%s",
             PORT
         )
 
         server.serve_forever()
 
     except Exception:
-
-        log.exception(
-            "HTTP health server xatosi"
-        )
+        log.exception("HTTP Web/API server xatosi")
 
 
 # ============================================================
@@ -465,6 +942,45 @@ def ensure_external_schema():
                 price REAL DEFAULT 0,
                 status TEXT DEFAULT 'pending',
                 created_at TEXT
+            )
+        """)
+
+        # Web sayt uchun xavfsiz Telegram tasdiqlash
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS web_auth_codes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS web_sessions(
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS web_orders(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT UNIQUE NOT NULL,
+                user_id INTEGER,
+                game_id INTEGER,
+                paket_id INTEGER,
+                product_name TEXT,
+                player_id TEXT,
+                server_id TEXT DEFAULT '',
+                price REAL DEFAULT 0,
+                status TEXT DEFAULT 'pending',
+                playpay_order_id TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
             )
         """)
         c.commit()
@@ -2371,7 +2887,8 @@ def main_menu():
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
-        [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
+        # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
+        # xarid oqimi menyuda ko'rsatilmaydi.
         [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
         [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
@@ -5597,18 +6114,15 @@ async def admin_text_handler(update, context):
 
         try:
 
-            await send_channel_post(
+            sent, failed = await send_channel_post(
                 context,
-                text=context.user_data.get(
-                    "post_text",
-                    ""
-                )
+                text=context.user_data.get("post_text", "")
             )
 
             context.user_data.clear()
 
             await update.message.reply_text(
-                "✅ Matnli post yuborildi.",
+                f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
                 reply_markup=admin_kb()
             )
 
@@ -5634,48 +6148,33 @@ async def send_channel_post(
     animation_id=None,
     video_id=None
 ):
+    """Admin postini kanalga emas, shu botdagi foydalanuvchilarning shaxsiy chatlariga yuboradi."""
+    c = conn()
+    try:
+        rows = c.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL").fetchall()
+        user_ids = [int(row["user_id"]) for row in rows]
+    finally:
+        c.close()
 
-    channel_id = get_setting(
-        "channel_id",
-        ""
-    )
+    sent = 0
+    failed = 0
+    for user_id in user_ids:
+        try:
+            if photo_id:
+                await context.bot.send_photo(chat_id=user_id, photo=photo_id, caption=text or None)
+            elif animation_id:
+                await context.bot.send_animation(chat_id=user_id, animation=animation_id, caption=text or None)
+            elif video_id:
+                await context.bot.send_video(chat_id=user_id, video=video_id, caption=text or None)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=text)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            # Foydalanuvchi xabari yoki bot tokeni logga chiqarilmaydi.
+            log.info("Broadcast yuborilmadi: user_id=%s, error_type=%s", user_id, type(exc).__name__)
 
-    if not channel_id:
-
-        raise RuntimeError(
-            "channel_id sozlanmagan."
-        )
-
-    if photo_id:
-
-        await context.bot.send_photo(
-            channel_id,
-            photo_id,
-            caption=text or None
-        )
-
-    elif animation_id:
-
-        await context.bot.send_animation(
-            channel_id,
-            animation_id,
-            caption=text or None
-        )
-
-    elif video_id:
-
-        await context.bot.send_video(
-            channel_id,
-            video_id,
-            caption=text or None
-        )
-
-    else:
-
-        await context.bot.send_message(
-            channel_id,
-            text=text
-        )
+    return sent, failed
 
 
 async def admin_media_handler(
@@ -5702,38 +6201,26 @@ async def admin_media_handler(
 
         if update.message.photo:
 
-            await send_channel_post(
+            sent, failed = await send_channel_post(
                 context,
                 text=caption,
-                photo_id=(
-                    update.message
-                    .photo[-1]
-                    .file_id
-                )
+                photo_id=update.message.photo[-1].file_id
             )
 
         elif update.message.animation:
 
-            await send_channel_post(
+            sent, failed = await send_channel_post(
                 context,
                 text=caption,
-                animation_id=(
-                    update.message
-                    .animation
-                    .file_id
-                )
+                animation_id=update.message.animation.file_id
             )
 
         elif update.message.video:
 
-            await send_channel_post(
+            sent, failed = await send_channel_post(
                 context,
                 text=caption,
-                video_id=(
-                    update.message
-                    .video
-                    .file_id
-                )
+                video_id=update.message.video.file_id
             )
 
         else:
@@ -5743,7 +6230,7 @@ async def admin_media_handler(
         context.user_data.clear()
 
         await update.message.reply_text(
-            "✅ Post kanalga yuborildi.",
+            f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
             reply_markup=admin_kb()
         )
 
@@ -6125,12 +6612,10 @@ async def callback_router(update, context):
         return await ps_confirm(update, context, "stars")
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
-    if d == "aktivsim_buy":
-        return await aktivsim_intro_handler(update, context)
-    if d == "as_continue":
-        return await aktivsim_countries_handler(update, context)
-    if d.startswith("as_country_"):
-        return await aktivsim_country_handler(update, context)
+    if d == "aktivsim_buy" or d == "as_continue" or d.startswith("as_country_"):
+        return await q.message.reply_text(
+            "Virtual raqam orqali SMS tasdiqlash xaridi ushbu botda yoqilmagan."
+        )
     if d == "adm_paystars_balance":
         return await paystars_balance_admin(update, context)
     if d == "adm_aktivsim_balance":
@@ -6499,9 +6984,8 @@ def main():
         "       PLAYPAY DONAT BOT"
     )
 
-    print(
-        "       BOT ISHLAYAPTI"
-    )
+    print("[BOT] Telegram bot ishga tushmoqda")
+    print("[WEB] HTTP health server / yo'lida tayyor")
 
     print(
         f"       HTTP PORT: {PORT}"
@@ -6516,7 +7000,7 @@ def main():
     )
 
     print(
-        "       MARKUP: 0%"
+        "       MARKUP: 0% | WEB API: ON"
     )
 
     print(
