@@ -2911,8 +2911,6 @@ def main_menu():
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
         # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
         # xarid oqimi menyuda ko'rsatilmaydi.
-        [InlineKeyboardButton("🤖 Bot qo'shish", callback_data="bot_add")],
-        [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
         [InlineKeyboardButton("🏦 Omonat", callback_data="omonat")],
