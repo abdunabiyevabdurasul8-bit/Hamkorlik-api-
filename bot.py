@@ -1792,7 +1792,8 @@ def user_exists(uid):
 
 def get_balance(uid):
 
-    c = main_conn()
+    # Faol botning bazasidan balans olinadi: child botlarda ham alohida balans.
+    c = conn()
 
     r = c.execute(
         """
