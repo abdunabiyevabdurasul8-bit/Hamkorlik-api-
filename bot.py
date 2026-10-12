@@ -9,6 +9,7 @@ import contextvars
 import hashlib
 import base64
 import html
+import re
 from pathlib import Path
 
 try:
@@ -53,11 +54,15 @@ try:
 except (ValueError, TypeError):
     ADMIN_ID = 0
 
-PLAYPAY_API_KEY = os.getenv("PLAYPAY_API_KEY", "").strip()
+BAY2GAME_API_KEY = os.getenv("BAY2GAME_API_KEY", "").strip()
+BAY2GAME_BASE = os.getenv("BAY2GAME_BASE", "https://api.bay2game.xyz/api").rstrip("/")
+# Bay2Game narxlari USD da. Kurs Render ENV orqali beriladi; admin ustamasi bot ichida boshqariladi.
+try:
+    BAY2GAME_USD_UZS = Decimal(os.getenv("BAY2GAME_USD_UZS", "13000"))
+except Exception:
+    BAY2GAME_USD_UZS = Decimal("13000")
 
-PLAYPAY_BASE = "https://playpay.uz/api/v1"
-
-# PlayPay Game ID
+# Eski maxsus IDlar (Grand Mobile narxlari o'zgarmaydi)
 PUBG_GAME_ID = 141
 MOBILE_LEGENDS_GAME_ID = 54
 GRAND_MOBILE_GAME_ID = 999001
@@ -79,7 +84,7 @@ GRAND_MOBILE_PRICES = {
     3000: 519000,
 }
 
-# 0 = PlayPay API narxining o'zi
+# 0 = Bay2Game API narxiga ustama qo'shilmaydi
 DEFAULT_MARKUP = Decimal("0")
 
 # Balans to'ldirish kartasi
@@ -91,11 +96,8 @@ PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
 PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
 
-# VirtualSMSNumbers: API integratsiyasi provider hujjatlaridagi aniq endpointlar
-# tasdiqlanmaguncha xarid oqimi yoqilmaydi.
-VIRTUALSMS_API_KEY = os.getenv("VIRTUALSMS_API_KEY", "").strip()
-VIRTUALSMS_BASE = os.getenv("VIRTUALSMS_BASE", "https://virtualsmsnumbers.com/api/v1").rstrip("/")
-VIRTUALSMS_MARKUP_PERCENT = Decimal(os.getenv("VIRTUALSMS_MARKUP_PERCENT", "35"))
+# SIM ustamasi sozlamasi
+SIM_MARKUP_PERCENT = Decimal(os.getenv("SIM_MARKUP_PERCENT", "35"))
 
 # SQLite
 DB = "bot.db"
@@ -392,7 +394,7 @@ def web_create_order(payload, user_id):
             "required": float(price),
         }
 
-    # IDni qayta tekshirish: PlayPay o'yinlari uchun.
+    # ID qabul qilinadi; Bay2Game tekshiruvni buyurtma vaqtida bajaradi.
     if game_id != GRAND_MOBILE_GAME_ID:
         check = web_check_id({
             "game_id": game_id,
@@ -475,7 +477,7 @@ def web_create_order(payload, user_id):
             "message": "Buyurtma qabul qilindi. Grand Mobile buyurtmasi manual bajariladi.",
         }
 
-    # PlayPay buyurtma
+    # Bay2Game buyurtma
     body = {
         "game_id": game_id,
         "paket_id": paket_id,
@@ -489,7 +491,7 @@ def web_create_order(payload, user_id):
     if not isinstance(data, dict) or not data.get("ok"):
         add_balance(
             user_id, price, "order_refund",
-            f"Web sayt PlayPay xatosi: {str(data)[:250]}"
+            f"Web sayt Bay2Game xatosi: {str(data)[:250]}"
         )
         c = main_conn()
         c.execute(
@@ -869,7 +871,7 @@ def init_db():
     set_default("donat_markup_percent", DEFAULT_MARKUP)
     set_default("stars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("premium_markup_percent", PAYSTARS_MARKUP_PERCENT)
-    set_default("sim_markup_percent", VIRTUALSMS_MARKUP_PERCENT)
+    set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
 
@@ -964,6 +966,16 @@ def ensure_external_schema():
         for name, typ in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
+
+        # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
+        for table, cols in {
+            "games": {"provider_game_code": "TEXT DEFAULT ''", "game_fields_json": "TEXT DEFAULT '[]'"},
+            "products": {"provider_product_code": "TEXT DEFAULT ''"},
+        }.items():
+            present = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+            for col, typ in cols.items():
+                if col not in present:
+                    c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
 
         c.execute("""
             CREATE TABLE IF NOT EXISTS external_orders(
@@ -1499,11 +1511,6 @@ def ps_pricing():
     return ps_account().get("pricing", {})
 
 
-# ============================================================
-# VIRTUALSMSNUMBERS API — xarid endpointlari provider hujjatlari bilan tasdiqlanmagani uchun hozircha o‘chiq
-# ============================================================
-
-
 def save_external_order(
     user_id,
     provider,
@@ -1717,9 +1724,6 @@ async def paystars_balance_admin(update, context):
         await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
 
 
-# VirtualSMSNumbers xarid oqimi: provider endpointlari tasdiqlanmagani sababli hozircha o‘chiq.
-
-
 # ============================================================
 # USER
 # ============================================================
@@ -1792,8 +1796,7 @@ def user_exists(uid):
 
 def get_balance(uid):
 
-    # Faol botning bazasidan balans olinadi: child botlarda ham alohida balans.
-    c = conn()
+    c = main_conn()
 
     r = c.execute(
         """
@@ -1934,222 +1937,220 @@ def referral_stats(uid):
 
 
 # ============================================================
-# PLAYPAY API
+# BAY2GAME API
 # ============================================================
 
-def api_headers():
+def bay2game_internal_id(value):
+    """String game/product code ni DB uchun barqaror sonli ID ga aylantiradi."""
+    raw = str(value or "").strip()
+    if raw.isdigit():
+        number = int(raw)
+        # Grand Mobile va eski maxsus IDlar bilan to'qnashmasin.
+        if number not in (PUBG_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
+            return number
+    return 100000000 + (int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) % 800000000)
 
-    return {
-        "X-API-Key": PLAYPAY_API_KEY,
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
+
+def bay2game_request(path, params=None):
+    params = dict(params or {})
+    params["api_key"] = BAY2GAME_API_KEY
+    try:
+        response = requests.get(
+            f"{BAY2GAME_BASE}/{path.lstrip('/')}",
+            params=params,
+            timeout=35,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {"error": response.text[:500]}
+        if not isinstance(data, dict):
+            data = {"data": data}
+        # API javoblari barcha endpointlarda bir xil `ok` maydoniga ega bo'lmasligi mumkin.
+        data.setdefault("http_status", response.status_code)
+        if response.status_code >= 400:
+            data.setdefault("ok", False)
+            data.setdefault("error", data.get("message") or f"HTTP {response.status_code}")
+        elif "ok" not in data:
+            status_value = str(data.get("status", "")).lower()
+            explicit_failure = data.get("success") is False
+            data["ok"] = (not explicit_failure) and status_value not in ("error", "failed", "failure") and not data.get("error")
+        log.info("Bay2Game %s status=%s", path, response.status_code)
+        return response.status_code, data
+    except Exception as exc:
+        log.exception("Bay2Game API so'rovi xatosi: %s", path)
+        return 0, {"ok": False, "error": str(exc)}
+
+
+def api_headers():
+    # Eski boshqa kod bilan moslik uchun saqlangan; Bay2Game api_key query parametridan foydalanadi.
+    return {"Accept": "application/json", "Content-Type": "application/json"}
 
 
 def api_get(path, params=None):
-
-    try:
-
-        r = requests.get(
-            PLAYPAY_BASE + path,
-            headers=api_headers(),
-            params=params,
-            timeout=30
-        )
-
-        try:
-
-            data = r.json()
-
-        except Exception:
-
-            data = {
-                "ok": False,
-                "error": r.text
-            }
-
-        log.info(
-            "PlayPay GET %s | status=%s | data=%s",
-            path,
-            r.status_code,
-            data
-        )
-
-        return r.status_code, data
-
-    except Exception as e:
-
-        log.exception(
-            "PlayPay GET xatosi"
-        )
-
-        return 0, {
-            "ok": False,
-            "error": str(e)
-        }
-
-
-def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-
-    body = {
-        "game_id": int(game_id),
-        "player_id": str(player_id).strip(),
-    }
-
-    if server_id:
-        body["server_id"] = str(server_id).strip()
-
-    if charname:
-        body["charname"] = str(charname).strip()
-
-    return api_post_no_idempotency("/check_id", body)
-
-
-def api_post_no_idempotency(path, body):
-
-    try:
-
-        r = requests.post(
-            PLAYPAY_BASE + path,
-            headers=api_headers(),
-            json=body,
-            timeout=30
-        )
-
-        try:
-            data = r.json()
-        except Exception:
-            data = {
-                "ok": False,
-                "error": r.text
-            }
-
-        log.info(
-            "PlayPay POST %s | status=%s | data=%s",
-            path,
-            r.status_code,
-            data
-        )
-
-        return r.status_code, data
-
-    except Exception as e:
-
-        log.exception("PlayPay check_id xatosi")
-
-        return 0, {
-            "ok": False,
-            "error": str(e)
-        }
-
-
-def api_post(path, body):
-
-    try:
-
-        headers = {
-            **api_headers(),
-            "Idempotency-Key": str(
-                uuid.uuid4()
-            )
-        }
-
-        r = requests.post(
-            PLAYPAY_BASE + path,
-            headers=headers,
-            json=body,
-            timeout=30
-        )
-
-        try:
-
-            data = r.json()
-
-        except Exception:
-
-            data = {
-                "ok": False,
-                "error": r.text
-            }
-
-        log.info(
-            "PlayPay POST %s | status=%s | data=%s",
-            path,
-            r.status_code,
-            data
-        )
-
-        return r.status_code, data
-
-    except Exception as e:
-
-        log.exception(
-            "PlayPay POST xatosi"
-        )
-
-        return 0, {
-            "ok": False,
-            "error": str(e)
-        }
+    return bay2game_request(path, params)
 
 
 def get_games_api():
+    status, data = bay2game_request("/categories")
+    if not data.get("ok"):
+        log.error("Bay2Game categories xatosi: %s", data.get("error", data))
+        return []
+    categories = data.get("categories")
+    if categories is None and isinstance(data.get("data"), dict):
+        categories = data["data"].get("categories")
+    return categories if isinstance(categories, list) else []
 
-    status, data = api_get(
-        "/games"
-    )
 
-    if data.get("ok"):
-
-        return data.get(
-            "games",
-            []
-        )
-
-    log.error(
-        "PlayPay /games xatosi | status=%s | data=%s",
-        status,
-        data
-    )
-
-    return []
+def _field_names(game_fields):
+    names = []
+    if isinstance(game_fields, list):
+        for field in game_fields:
+            if isinstance(field, str):
+                names.append(field.lower())
+            elif isinstance(field, dict):
+                names.extend(str(field.get(k, "")).lower() for k in ("name", "code", "key", "field"))
+    elif isinstance(game_fields, dict):
+        names.extend(str(k).lower() for k in game_fields.keys())
+        names.extend(str(v).lower() for v in game_fields.values() if isinstance(v, str))
+    return re.sub(r"[^a-z0-9]", "", " ".join(names))
 
 
 def get_packages_api(game_id):
+    c = conn()
+    try:
+        row = c.execute("SELECT provider_game_code,name FROM games WHERE game_id=?", (int(game_id),)).fetchone()
+    finally:
+        c.close()
+    game_code = str(row["provider_game_code"] or "") if row else ""
+    if not game_code:
+        # Legacy callers can pass a numeric game_code directly.
+        game_code = str(game_id)
+    status, data = bay2game_request("/products", {"game_code": game_code})
+    if not data.get("ok"):
+        log.error("Bay2Game products xatosi game_code=%s: %s", game_code, data.get("error", data))
+        return None
+    products = data.get("products")
+    if products is None and isinstance(data.get("data"), dict):
+        products = data["data"].get("products")
+    if not isinstance(products, list):
+        return None
+    packages = []
+    for product in products:
+        if not isinstance(product, dict) or not product.get("product_code"):
+            continue
+        sell_price = product.get("sell_price", 0)
+        try:
+            usd = Decimal(str(sell_price or 0))
+        except Exception:
+            usd = Decimal("0")
+        packages.append({
+            "paket_id": bay2game_internal_id(product["product_code"]),
+            "product_code": str(product["product_code"]),
+            "name": str(product.get("name") or product.get("product_name") or product["product_code"]),
+            "price": {"usd": str(usd), "amount": str(usd * BAY2GAME_USD_UZS)},
+            "sell_price": str(usd),
+            "status": product.get("status", "active"),
+        })
+    return {"game_name": row["name"] if row else game_code, "game_code": game_code, "packages": packages}
 
-    status, data = api_get(
-        f"/games/{game_id}/packages",
-        {
-            "currency": "UZS"
-        }
-    )
 
-    if data.get("ok"):
+def playpay_check_id(game_id, player_id, server_id=None, charname=None):
+    # Bay2Game hujjatlarida alohida check-ID endpointi yo'q. Shuning uchun ID oldindan
+    # tekshirilmaydi; buyurtma API ga yuborilganda provider tekshiradi.
+    player_id = str(player_id or "").strip()
+    if not player_id:
+        return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
+    return 200, {
+        "ok": True,
+        "valid": True,
+        "player_name": player_id,
+        "message": "Bay2Game IDni oldindan tekshirmaydi; ID buyurtmada yuboriladi.",
+        "validation_supported": False,
+    }
 
-        return data
 
-    log.error(
-        "PlayPay packages xatosi | game_id=%s | status=%s | data=%s",
-        game_id,
-        status,
-        data
-    )
+def bay2game_create_order(product_code, player_id, server_id=""):
+    reference = "DONUZ-" + uuid.uuid4().hex[:24].upper()
+    params = {
+        "product_code": str(product_code),
+        "game_user_id": str(player_id).strip(),
+        "reference": reference,
+    }
+    if server_id:
+        params["game_zone_id"] = str(server_id).strip()
+    status, raw = bay2game_request("/create_order", params)
+    nested = raw.get("data") if isinstance(raw.get("data"), dict) else raw
+    payload = nested.get("order") if isinstance(nested.get("order"), dict) else nested
+    order_status = str(payload.get("status") or nested.get("status") or raw.get("status") or "processing").lower()
+    failed = (status < 200 or status >= 300 or not raw.get("ok") or order_status in ("failed", "failure", "error"))
+    if failed:
+        return status, {"ok": False, "error": raw.get("error") or raw.get("message") or "Bay2Game buyurtmani qabul qilmadi.", "raw": raw}
+    provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
+    normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
+    return status, {
+        "ok": True,
+        "order_id": provider_reference,
+        "reference": provider_reference,
+        "status": normalized_status,
+        "price": {"amount": payload.get("amount_usd", payload.get("sell_price", payload.get("amount", 0)))},
+        "charged": {"amount": payload.get("amount_usd", payload.get("sell_price", payload.get("amount", 0)))},
+        "raw": raw,
+    }
 
-    return None
+
+def api_post_no_idempotency(path, body):
+    if path == "/check_id":
+        return playpay_check_id(body.get("game_id"), body.get("player_id"), body.get("server_id"), body.get("charname"))
+    return 400, {"ok": False, "error": "Bay2Game bu endpointni qo'llamaydi."}
+
+
+def api_post(path, body):
+    if path != "/order":
+        return 400, {"ok": False, "error": "Bay2Game endpointi topilmadi."}
+    try:
+        game_id = int(body.get("game_id"))
+        paket_id = int(body.get("paket_id"))
+        player_id = str(body.get("player_id") or "").strip()
+        server_id = str(body.get("server_id") or "").strip()
+        c = conn()
+        product = c.execute(
+            "SELECT provider_product_code,price_usd FROM products WHERE game_id=? AND paket_id=? AND active=1",
+            (game_id, paket_id),
+        ).fetchone()
+        c.close()
+        if not product or not product["provider_product_code"]:
+            return 400, {"ok": False, "error": "Bay2Game product_code topilmadi. Katalogni yangilang."}
+        return bay2game_create_order(product["provider_product_code"], player_id, server_id)
+    except Exception as exc:
+        log.exception("Bay2Game order adapter xatosi")
+        return 0, {"ok": False, "error": str(exc)}
 
 
 def get_playpay_order(order_id):
-
-    return api_get(
-        f"/order/{order_id}"
-    )
+    status, data = bay2game_request("/check_order", {"reference": str(order_id)})
+    if not data.get("ok"):
+        return status, data
+    nested = data.get("data") if isinstance(data.get("data"), dict) else data
+    order = nested.get("order") if isinstance(nested.get("order"), dict) else nested
+    order_status = str(order.get("status") or nested.get("status") or data.get("status") or "processing").lower()
+    if order_status in ("completed", "complete", "done"):
+        order_status = "success"
+    return status, {"ok": True, "order": {"status": order_status, "reference": order.get("reference", order_id)}, "raw": data}
 
 
 def get_playpay_balance():
-
-    return api_get(
-        "/balance"
-    )
+    status, data = bay2game_request("/profile")
+    if not data.get("ok"):
+        return status, data
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else data
+    balance = profile.get("balance", profile.get("balance_usd", profile.get("api_balance", 0)))
+    if isinstance(balance, dict):
+        amount = balance.get("amount", balance.get("usd", balance.get("value", 0)))
+        currency = balance.get("currency", "USD")
+    else:
+        amount, currency = balance, "USD"
+    return status, {"ok": True, "balance": {"amount": amount, "currency": currency}, "profile": profile}
 
 
 # ============================================================
@@ -2304,9 +2305,10 @@ def save_package(
             api_price_uzs,
             sale_price,
             active,
-            updated_at
+            updated_at,
+            provider_product_code
         )
-        VALUES (?,?,?,?,?,?,?,?,?)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
         """,
         (
             game_id,
@@ -2320,7 +2322,8 @@ def save_package(
             float(uzs),
             float(sale_price),
             1,
-            datetime.now().isoformat()
+            datetime.now().isoformat(),
+            str(package.get("product_code") or "")
         )
     )
 
@@ -2406,300 +2409,79 @@ def ensure_mobile_legends():
 # ============================================================
 
 def sync_catalog():
+    """Bay2Game categories va products katalogini yangilaydi."""
+    categories = get_games_api()
+    if not categories:
+        return False, "Bay2Game katalogi olinmadi. API key va API balansini tekshiring."
 
     game_count = 0
-    package_count = 0
-    synced_ids = set()
-
-    games_api = get_games_api()
-
-    if not games_api:
-
-        ensure_pubg()
-        ensure_mobile_legends()
-
-        special_ok = False
-
-        for gid in (
-            PUBG_GAME_ID,
-            MOBILE_LEGENDS_GAME_ID
-        ):
-
-            data = get_packages_api(
-                gid
-            )
-
-            if not data:
-                continue
-
-            special_ok = True
-
-            name = data.get(
-                "game_name",
-                (
-                    "PUBG Mobile"
-                    if gid == PUBG_GAME_ID
-                    else "Mobile Legends"
-                )
-            )
-
-            save_game({
-                "game_id": gid,
-                "name": name,
-                "id_label": (
-                    "Player ID"
-                    if gid == PUBG_GAME_ID
-                    else "User ID"
-                ),
-                "requires_server": (
-                    gid == MOBILE_LEGENDS_GAME_ID
-                ),
-                "amount_based": False
-            })
-
-            synced_ids.add(gid)
-            game_count += 1
-
-            for package in data.get(
-                "packages",
-                []
-            ):
-
-                if not package.get(
-                    "paket_id"
-                ):
-                    continue
-
-                save_package(
-                    gid,
-                    name,
-                    package
-                )
-
-                package_count += 1
-
-        if not special_ok:
-
-            return (
-                False,
-                "PlayPay katalogi olinmadi."
-            )
-
-        return (
-            True,
-            f"✅ {game_count} ta o'yin, "
-            f"{package_count} ta paket yangilandi."
-        )
-
-    # Eski o'yinlarni yashiramiz
+    product_count = 0
     c = conn()
+    try:
+        c.execute("UPDATE games SET active=0")
+        c.execute("UPDATE products SET active=0")
+        c.commit()
+    finally:
+        c.close()
 
-    c.execute(
-        "UPDATE games SET active=0"
-    )
-
-    c.execute(
-        "UPDATE products SET active=0"
-    )
-
-    c.commit()
-    c.close()
-
-    # ========================================================
-    # PLAYPAY O'YINLARI
-    # ========================================================
-
-    for game_data in games_api:
-
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        game_code = str(category.get("game_code") or "").strip()
+        if not game_code:
+            continue
+        gid = bay2game_internal_id(game_code)
+        name = str(category.get("name") or category.get("game_name") or game_code)
+        fields = category.get("game_fields") or []
+        names = _field_names(fields)
+        requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
+        id_label = "User ID" if "userid" in names else "Player ID"
         try:
-
-            gid = int(
-                game_data["game_id"]
+            c = conn()
+            c.execute(
+                "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at,provider_game_code,game_fields_json) VALUES(?,?,?,?,?,?,?,?,?)",
+                (gid, name, id_label, 1 if requires_server else 0, 0, 1, datetime.now().isoformat(), game_code, json.dumps(fields, ensure_ascii=False)),
             )
-
+            c.commit()
+            c.close()
+            game_count += 1
         except Exception:
-
+            log.exception("Bay2Game game saqlash xatosi: %s", game_code)
+            try: c.close()
+            except Exception: pass
             continue
 
-        try:
-
-            save_game(
-                game_data
-            )
-
-            game_count += 1
-            synced_ids.add(gid)
-
-            game_name = game_data.get(
-                "name",
-                str(gid)
-            )
-
-            data = get_packages_api(
-                gid
-            )
-
-            if not data:
-                continue
-
-            for package in data.get(
-                "packages",
-                []
-            ):
-
-                if not package.get(
-                    "paket_id"
-                ):
+        data = get_packages_api(gid)
+        if not data:
+            continue
+        for product in data.get("packages", []):
+            try:
+                product_code = str(product.get("product_code") or "").strip()
+                if not product_code:
                     continue
-
-                save_package(
-                    gid,
-                    game_name,
-                    package
+                paket_id = bay2game_internal_id(product_code)
+                usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
+                api_uzs = usd * BAY2GAME_USD_UZS
+                sale_price = calc_sale_price(api_uzs)
+                product_status = str(product.get("status", "active")).lower()
+                active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
+                c = conn()
+                c.execute(
+                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (gid, paket_id, name, str(product.get("name") or product.get("product_name") or product_code), float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
                 )
-
-                package_count += 1
-
-        except Exception:
-
-            log.exception(
-                "Katalog sync xatosi: game_id=%s",
-                gid
-            )
-
-    # ========================================================
-    # PUBG 141
-    # ========================================================
-
-    try:
-
-        ensure_pubg()
-
-        if PUBG_GAME_ID not in synced_ids:
-
-            data = get_packages_api(
-                PUBG_GAME_ID
-            )
-
-            if data:
-
-                game_name = data.get(
-                    "game_name",
-                    "PUBG Mobile"
-                )
-
-                save_game({
-                    "game_id": PUBG_GAME_ID,
-                    "name": game_name,
-                    "id_label": "Player ID",
-                    "requires_server": False,
-                    "amount_based": False
-                })
-
-                game_count += 1
-                synced_ids.add(
-                    PUBG_GAME_ID
-                )
-
-                for package in data.get(
-                    "packages",
-                    []
-                ):
-
-                    if not package.get(
-                        "paket_id"
-                    ):
-                        continue
-
-                    save_package(
-                        PUBG_GAME_ID,
-                        game_name,
-                        package
-                    )
-
-                    package_count += 1
-
-    except Exception:
-
-        log.exception(
-            "PUBG 141 sync xatosi"
-        )
-
-    # ========================================================
-    # MOBILE LEGENDS 54
-    # ========================================================
-
-    try:
-
-        ensure_mobile_legends()
-
-        if MOBILE_LEGENDS_GAME_ID not in synced_ids:
-
-            data = get_packages_api(
-                MOBILE_LEGENDS_GAME_ID
-            )
-
-            if data:
-
-                game_name = data.get(
-                    "game_name",
-                    "Mobile Legends"
-                )
-
-                save_game({
-                    "game_id": MOBILE_LEGENDS_GAME_ID,
-                    "name": game_name,
-                    "id_label": "User ID",
-                    "requires_server": True,
-                    "amount_based": False
-                })
-
-                game_count += 1
-                synced_ids.add(
-                    MOBILE_LEGENDS_GAME_ID
-                )
-
-                for package in data.get(
-                    "packages",
-                    []
-                ):
-
-                    if not package.get(
-                        "paket_id"
-                    ):
-                        continue
-
-                    save_package(
-                        MOBILE_LEGENDS_GAME_ID,
-                        game_name,
-                        package
-                    )
-
-                    package_count += 1
-
-    except Exception:
-
-        log.exception(
-            "Mobile Legends 54 sync xatosi"
-        )
+                c.commit()
+                c.close()
+                product_count += 1
+            except Exception:
+                log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
+                try: c.close()
+                except Exception: pass
 
     if game_count == 0:
+        return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
+    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {BAY2GAME_USD_UZS:,.0f} so'm."
 
-        return (
-            False,
-            "PlayPay katalogi olinmadi."
-        )
-
-    return (
-        True,
-        f"✅ {game_count} ta o'yin, "
-        f"{package_count} ta paket yangilandi."
-    )
-
-
-# ============================================================
-# OMONAT — 1% foyda, bir kalendar oy o'tgach
-# ============================================================
 
 def add_one_calendar_month(value):
     """Sana/vaqtni keyingi kalendar oyga o'tkazadi; kun bo'lmasa oy oxiriga moslaydi."""
@@ -2988,7 +2770,7 @@ def admin_kb():
         ],
         [
             InlineKeyboardButton(
-                "🔐 PlayPay balansi",
+                "🔐 Bay2Game balansi",
                 callback_data="adm_playpay_balance"
             )
         ],
@@ -3396,7 +3178,7 @@ async def games(update, context):
     if not rows:
         await q.message.reply_text(
             "❌ O'yinlar topilmadi.\n\n"
-            "🔄 PlayPay katalogini yangilashda xatolik bo'ldi.\n"
+            "🔄 Bay2Game katalogini yangilashda xatolik bo'ldi.\n"
             "👑 Admin paneldagi 🔄 Katalog tugmasini ham bosib ko'ring."
         )
         return
@@ -3457,7 +3239,7 @@ async def game(update, context):
     c.close()
 
     # Paketlar lokal DB'da bo'lmasa, aynan tanlangan o'yin paketlarini
-    # PlayPay API'dan darhol yangilaymiz.
+    # Bay2Game katalogidan yangilaymiz.
     if g and not rows:
         try:
             data = await asyncio.to_thread(get_packages_api, game_id)
@@ -3800,7 +3582,7 @@ async def confirm_order(
 
 
 # ============================================================
-# CONFIRM -> PLAYPAY
+# CONFIRM -> BAY2GAME
 # ============================================================
 
 async def confirm(update, context):
@@ -3908,7 +3690,7 @@ async def confirm(update, context):
 
         return
 
-    # Buyurtma yuborilishidan oldin PlayPay ID tekshiruvi shart.
+    # Buyurtma yuborilishidan oldin Bay2Game uchun ID oldindan tekshirilmaydi; buyurtma API orqali yuboriladi.
     player_name = str(
         context.user_data.get("player_name", "")
     ).strip()
@@ -3950,11 +3732,11 @@ async def confirm(update, context):
         uid,
         -price,
         "order_hold",
-        f"PlayPay buyurtma: {game_id}/{paket_id}"
+        f"Bay2Game buyurtma: {game_id}/{paket_id}"
     )
 
     # ========================================================
-    # PLAYPAY
+    # BAY2GAME
     # ========================================================
 
     status, data = await asyncio.to_thread(
@@ -3969,7 +3751,7 @@ async def confirm(update, context):
             uid,
             price,
             "order_refund",
-            "PlayPay API xatosi: "
+            "Bay2Game API xatosi: "
             f"{data.get('error','unknown')}"
         )
 
@@ -4103,7 +3885,7 @@ async def confirm(update, context):
         f"🆔 {id_label}: {player_id}\n"
         f"{user_extra}"
         f"💰 {price:,.0f} so'm\n"
-        f"🔢 PlayPay order: {playpay_id}\n"
+        f"🔢 Bay2Game reference: {playpay_id}\n"
         f"📊 Status: {order_status}",
         reply_markup=main_menu()
     )
@@ -4129,7 +3911,7 @@ async def confirm(update, context):
             )
             +
             f"💰 Sotuv: {price:,.0f} so'm\n"
-            f"🔢 PlayPay ID: {playpay_id}\n"
+            f"🔢 Bay2Game reference: {playpay_id}\n"
             f"📊 {order_status}\n"
             f"💵 API charged: {charged_usd} USD"
         )
@@ -4683,9 +4465,9 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
-        if not PLAYPAY_API_KEY:
+        if not BAY2GAME_API_KEY:
             await update.message.reply_text(
-                "❌ PLAYPAY_API_KEY sozlanmagan. ID/nickname tekshiruvi ishlashi uchun Render ENV ga API key qo'shing."
+                "❌ BAY2GAME_API_KEY sozlanmagan. Render Environment ga Bay2Game API key kiriting."
             )
             context.user_data["state"] = None
             return
@@ -4703,7 +4485,7 @@ async def text_handler(update, context):
 
         if not isinstance(data, dict):
             await update.message.reply_text(
-                "❌ PlayPay javobi noto'g'ri formatda qaytdi."
+                "❌ Bay2Game javobi noto'g'ri formatda qaytdi."
             )
             context.user_data["state"] = None
             return
@@ -4736,22 +4518,16 @@ async def text_handler(update, context):
             or data.get("nickname")
             or data.get("name")
             or data.get("username")
-            or ""
+            or player_id
         ).strip()
-
-        if not player_name:
-            await update.message.reply_text(
-                "❌ ID to'g'ri, lekin nickname ma'lumoti qaytmadi. Buyurtma to'xtatildi."
-            )
-            context.user_data["state"] = None
-            return
 
         context.user_data["player_name"] = player_name
         context.user_data["state"] = None
 
         await update.message.reply_text(
-            f"✅ ID tasdiqlandi!\n\n"
-            f"👤 Nickname: <b>{player_name}</b>",
+            "✅ ID qabul qilindi.\n"
+            "ℹ️ Bay2Game IDni oldindan tekshirmaydi; tekshiruv buyurtma yuborilganda amalga oshadi.\n\n"
+            f"🆔 ID: <code>{html.escape(player_id)}</code>",
             parse_mode="HTML"
         )
 
@@ -5160,7 +4936,7 @@ async def orders_cb(update, context):
         text += (
             f"💰 {r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 PlayPay: "
+            f"🔢 Bay2Game: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -5649,7 +5425,7 @@ async def admin_orders(update, context):
             f"💰 Sotuv: "
             f"{r['sale_price']:,.0f} so'm\n"
             f"📊 {r['status']}\n"
-            f"🔢 PlayPay: "
+            f"🔢 Bay2Game: "
             f"{r['playpay_order_id']}\n"
             f"🕐 {r['created_at']}\n\n"
         )
@@ -5799,7 +5575,7 @@ async def admin_markup_start(update, context, kind):
         return
     labels = {
         "donat": ("🎮 Donat", "donat_markup_percent", DEFAULT_MARKUP),
-        "sim": ("📱 VirtualSMS raqam", "sim_markup_percent", VIRTUALSMS_MARKUP_PERCENT),
+        "sim": ("📱 SIM", "sim_markup_percent", SIM_MARKUP_PERCENT),
         "stars": ("⭐ Stars", "stars_markup_percent", PAYSTARS_MARKUP_PERCENT),
         "premium": ("💎 Premium", "premium_markup_percent", PAYSTARS_MARKUP_PERCENT),
     }
@@ -6882,23 +6658,20 @@ async def admin_callback(update, context):
 
         if data.get("ok"):
 
-            b = data.get(
-                "balance",
-                {}
-            )
-
+            b = data.get("balance", {})
+            if not isinstance(b, dict):
+                b = {"amount": b, "currency": "USD"}
+            profile = data.get("profile", {})
             await q.message.reply_text(
-                f"🔐 PLAYPAY BALANSI\n\n"
-                f"💵 USD: "
-                f"{b.get('amount', b.get('usd','0'))}\n"
-                f"💱 Valyuta: "
-                f"{b.get('currency','USD')}"
+                f"🔐 BAY2GAME BALANSI\n\n"
+                f"💵 USD: {b.get('amount', b.get('usd', '0'))}\n"
+                f"💱 Valyuta: {b.get('currency', 'USD')}"
             )
 
         else:
 
             await q.message.reply_text(
-                "❌ PlayPay balansini olishda xato:\n"
+                "❌ Bay2Game balansini olishda xato:\n"
                 f"{data.get('error','API xatosi')}"
             )
 
@@ -6909,7 +6682,7 @@ async def admin_callback(update, context):
     elif d == "a_sync":
 
         await q.message.reply_text(
-            "🔄 PlayPay katalogi yangilanmoqda..."
+            "🔄 Bay2Game katalogi yangilanmoqda..."
         )
 
         ok, result = await asyncio.to_thread(
@@ -6967,10 +6740,6 @@ async def callback_router(update, context):
         return await ps_confirm(update, context, "stars")
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
-    if d in ("virtualsms_buy", "aktivsim_buy", "as_continue") or d.startswith(("as_country_", "vs_country_")):
-        return await q.message.reply_text(
-            "📱 VirtualSMSNumbers integratsiyasi hozircha o‘chiq. Providerning tasdiqlangan API endpointlari sozlangach yoqiladi."
-        )
     if d == "adm_paystars_balance":
         return await paystars_balance_admin(update, context)
     if d == "bot_add":
@@ -7283,6 +7052,16 @@ def main():
     ensure_pubg()
     ensure_mobile_legends()
 
+    # Eski PlayPay katalogi Bay2Game product_code bo'lmagan holda sotuvga chiqmasin.
+    # Bay2Game katalogi admin panelidagi "Katalog" tugmasi orqali yangilanadi.
+    c = conn()
+    try:
+        c.execute("UPDATE products SET active=0 WHERE COALESCE(provider_product_code,'')=''")
+        c.execute("UPDATE games SET active=0 WHERE COALESCE(provider_game_code,'')=''")
+        c.commit()
+    finally:
+        c.close()
+
     # --------------------------------------------------------
     # ENV TEKSHIRISH
     # --------------------------------------------------------
@@ -7299,10 +7078,10 @@ def main():
             "❌ ADMIN_ID Environment Variable yozilmagan."
         )
 
-    if not PLAYPAY_API_KEY:
+    if not BAY2GAME_API_KEY:
 
         raise SystemExit(
-            "❌ PLAYPAY_API_KEY Environment Variable yozilmagan."
+            "❌ BAY2GAME_API_KEY Environment Variable yozilmagan."
         )
 
     if Fernet is None:
@@ -7343,7 +7122,7 @@ def main():
     )
 
     print(
-        "       DONUZ PLAYPAY BOT"
+        "       DONUZ BAY2GAME BOT"
     )
 
     print("[BOT] Telegram bot ishga tushmoqda")
