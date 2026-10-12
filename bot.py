@@ -8,8 +8,8 @@ import threading
 import contextvars
 import hashlib
 import base64
-import html
 from pathlib import Path
+from urllib.parse import urlparse, unquote
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -91,11 +91,13 @@ PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
 PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
 
-# VirtualSMSNumbers: API integratsiyasi provider hujjatlaridagi aniq endpointlar
-# tasdiqlanmaguncha xarid oqimi yoqilmaydi.
-VIRTUALSMS_API_KEY = os.getenv("VIRTUALSMS_API_KEY", "").strip()
-VIRTUALSMS_BASE = os.getenv("VIRTUALSMS_BASE", "https://virtualsmsnumbers.com/api/v1").rstrip("/")
-VIRTUALSMS_MARKUP_PERCENT = Decimal(os.getenv("VIRTUALSMS_MARKUP_PERCENT", "35"))
+# AktivSim / Donuz: virtual raqamlar
+AKTIVSIM_API_KEY = os.getenv("AKTIVSIM_API_KEY", "").strip() or os.getenv("DONUZ_API_KEY", "").strip()
+AKTIVSIM_BASE = os.getenv(
+    "AKTIVSIM_BASE",
+    "https://ws2524.wineclo.com/AktivSimBot/api/v2/"
+)
+AKTIVSIM_MARKUP_PERCENT = Decimal(os.getenv("AKTIVSIM_MARKUP_PERCENT", "35"))
 
 # SQLite
 DB = "bot.db"
@@ -580,18 +582,43 @@ class WebAPIHandler(BaseHTTPRequestHandler):
         self._cors()
         self.end_headers()
 
+    def _serve_file(self, rel_path, content_type=None):
+        root = Path(__file__).resolve().parent
+        # Support both root files and static/ files.
+        candidates = [root / rel_path, root / "static" / rel_path] if not rel_path.startswith("static/") else [root / rel_path]
+        file_path = next((x for x in candidates if x.is_file()), None)
+        if not file_path:
+            return self._reply({"ok": False, "error": "Fayl topilmadi."}, 404)
+        raw = file_path.read_bytes()
+        if not content_type:
+            content_type = {".css":"text/css; charset=utf-8", ".js":"application/javascript; charset=utf-8", ".html":"text/html; charset=utf-8"}.get(file_path.suffix.lower(), "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(raw)
+        return
+
     def do_GET(self):
         from urllib.parse import urlparse
 
         path = urlparse(self.path).path
 
         try:
-            if path == "/" or path == "/health":
+            if path == "/health":
                 return self._reply({
                     "ok": True,
                     "service": "GAME DONAT",
                     "status": "online",
                 })
+
+            # Sayt bosh sahifasi va static fayllar
+            if path == "/" or path == "/index.html":
+                return self._serve_file("index.html", "text/html; charset=utf-8")
+            if path.startswith("/static/"):
+                rel = unquote(path[len("/static/"):]).lstrip("/")
+                return self._serve_file(rel, None)
 
             if path == "/api/catalog":
                 return self._reply({"ok": True, "games": web_catalog()})
@@ -797,28 +824,6 @@ def init_db():
         value TEXT
     );
 
-    CREATE TABLE IF NOT EXISTS main_bot_users(
-        user_id INTEGER PRIMARY KEY,
-        first_started_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS referrals(
-        invited_user_id INTEGER PRIMARY KEY,
-        referrer_user_id INTEGER NOT NULL,
-        bonus REAL NOT NULL DEFAULT 100,
-        created_at TEXT NOT NULL
-    );
-
-    CREATE TABLE IF NOT EXISTS withdrawals(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        payment_details TEXT NOT NULL,
-        status TEXT NOT NULL DEFAULT 'pending',
-        created_at TEXT NOT NULL,
-        decided_at TEXT DEFAULT ''
-    );
-
     CREATE TABLE IF NOT EXISTS balance_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
@@ -827,20 +832,6 @@ def init_db():
         note TEXT,
         created_at TEXT
     );
-
-    CREATE TABLE IF NOT EXISTS omonats(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER NOT NULL,
-        principal REAL NOT NULL,
-        profit REAL NOT NULL,
-        status TEXT NOT NULL DEFAULT 'active',
-        started_at TEXT NOT NULL,
-        matures_at TEXT NOT NULL,
-        closed_at TEXT DEFAULT '',
-        paid_at TEXT DEFAULT ''
-    );
-    CREATE INDEX IF NOT EXISTS idx_omonats_due ON omonats(status, matures_at);
-    CREATE INDEX IF NOT EXISTS idx_omonats_user ON omonats(user_id, id);
 
     CREATE TABLE IF NOT EXISTS child_bots(
         bot_id INTEGER PRIMARY KEY,
@@ -869,9 +860,8 @@ def init_db():
     set_default("donat_markup_percent", DEFAULT_MARKUP)
     set_default("stars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("premium_markup_percent", PAYSTARS_MARKUP_PERCENT)
-    set_default("sim_markup_percent", VIRTUALSMS_MARKUP_PERCENT)
+    set_default("sim_markup_percent", AKTIVSIM_MARKUP_PERCENT)
     set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
-    set_default("referral_bonus_uzs", "100")
 
     if active_db() == MAIN_DB:
         c = conn()
@@ -906,41 +896,56 @@ def set_default(key, value):
 
 
 def get_setting(key, default=""):
-
+    """Global sozlamalarni asosiy botdan o'qiydi; child botlarda ham aynan shu sozlamalar ishlaydi."""
     c = conn()
-
-    r = c.execute(
-        """
-        SELECT value
-        FROM settings
-        WHERE key=?
-        """,
-        (key,)
-    ).fetchone()
-
+    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     c.close()
+    if r:
+        return r["value"]
 
-    return r["value"] if r else default
+    # Child DBda yo'q bo'lsa, asosiy bot sozlamasidan foydalanamiz.
+    if active_db() != MAIN_DB:
+        try:
+            c = main_conn()
+            r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+            c.close()
+            if r:
+                return r["value"]
+        except Exception:
+            log.exception("Global sozlamani asosiy DBdan o'qishda xato")
+    return default
 
 
 def set_setting(key, value):
+    """Asosiy bot sozlamalarini saqlaydi va child botlarga ham sinxronlaydi."""
+    # Global sozlamalar har doim MAIN_DBda saqlanadi.
+    if key in {
+        "payment_card", "donat_markup_percent", "stars_markup_percent",
+        "premium_markup_percent", "sim_markup_percent", "paystars_markup_percent"
+    }:
+        c = main_conn()
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+        c.commit(); c.close()
+
+        # Child DBlar uchun ham nusxasini yangilaymiz.
+        try:
+            c = main_conn()
+            rows = c.execute("SELECT db_path FROM child_bots").fetchall()
+            c.close()
+            for row in rows:
+                try:
+                    cc = sqlite3.connect(row["db_path"], timeout=30)
+                    cc.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+                    cc.commit(); cc.close()
+                except Exception:
+                    log.exception("Child sozlamasini sync qilish xatosi")
+        except Exception:
+            log.exception("Child sozlamalarini topishda xato")
+        return
 
     c = conn()
-
-    c.execute(
-        """
-        INSERT OR REPLACE INTO settings
-        (key,value)
-        VALUES (?,?)
-        """,
-        (
-            key,
-            str(value)
-        )
-    )
-
-    c.commit()
-    c.close()
+    c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+    c.commit(); c.close()
 
 
 # ============================================================
@@ -1203,7 +1208,7 @@ def copy_catalog_to_child(db_path):
     src = main_conn()
     games_rows = src.execute("SELECT * FROM games").fetchall()
     prod_rows = src.execute("SELECT * FROM products").fetchall()
-    settings_rows = src.execute("SELECT key,value FROM settings WHERE key IN ('payment_card','channel_id')").fetchall()
+    settings_rows = src.execute("SELECT key,value FROM settings WHERE key IN ('payment_card','donat_markup_percent','stars_markup_percent','premium_markup_percent','sim_markup_percent','paystars_markup_percent')").fetchall()
     src.close()
     c = sqlite3.connect(db_path, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
@@ -1321,7 +1326,7 @@ async def bot_list(update, context):
     q=update.callback_query
     c=main_conn(); rows=c.execute("SELECT * FROM child_bots WHERE owner_user_id=? ORDER BY created_at DESC",(q.from_user.id,)).fetchall(); c.close()
     if not rows:
-        return await q.message.reply_text("🤖 Sizda hali qo'shilgan bot yo'q.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Bot qo'shish",callback_data="bot_add")]]))
+        return await q.message.reply_text("🤖 Sizda hali qo'shilgan bot yo'q.")
     kb=[[InlineKeyboardButton(f"@{r['bot_username'] or r['bot_id']} — {child_status(r)}",callback_data=f"bot_manage_{r['bot_id']}")] for r in rows]
     await q.message.reply_text("🤖 Botlaringiz:",reply_markup=InlineKeyboardMarkup(kb))
 
@@ -1500,8 +1505,88 @@ def ps_pricing():
 
 
 # ============================================================
-# VIRTUALSMSNUMBERS API — xarid endpointlari provider hujjatlari bilan tasdiqlanmagani uchun hozircha o‘chiq
+# AKTIVSIM / DONUZ API
 # ============================================================
+def aktivsim_get(action, **params):
+    """AktivSim API chaqiruvini barqaror formatga keltiradi."""
+    if not AKTIVSIM_API_KEY:
+        return {"ok": False, "error": "AKTIVSIM_API_KEY/DONUZ_API_KEY sozlanmagan"}
+
+    params = dict(params)
+    params["action"] = action
+    # AktivSim/VirtualSim turidagi API'larda ikkala nom ham uchraydi.
+    params["apikey"] = AKTIVSIM_API_KEY
+    params.setdefault("api_key", AKTIVSIM_API_KEY)
+
+    try:
+        r = requests.get(
+            AKTIVSIM_BASE.rstrip("/") + "/",
+            params=params,
+            timeout=30,
+            headers={"Accept": "application/json", "User-Agent": "DonuzBot/1.0"},
+        )
+        raw = r.text[:4000]
+        try:
+            data = r.json()
+        except Exception:
+            return {
+                "ok": False,
+                "error": f"HTTP {r.status_code}: API JSON qaytarmadi: {raw[:500]}"
+            }
+
+        log.info("AktivSim %s | HTTP %s | %s", action, r.status_code, data)
+
+        if not r.ok:
+            return {"ok": False, "error": f"HTTP {r.status_code}", "raw": data}
+
+        # Turli AktivSim gateway formatlarini bitta formatga o'tkazamiz.
+        if isinstance(data, dict):
+            if data.get("ok") is True:
+                return data
+            if str(data.get("status", "")).lower() in ("success", "ok", "true"):
+                result = data.get("result", data.get("data", data))
+                return {"ok": True, "result": result, **data}
+            if "error" in data and not data.get("result") and not data.get("data"):
+                return {"ok": False, "error": str(data.get("error")), "raw": data}
+            if "data" in data and data.get("data") is not None:
+                return {"ok": True, "result": data["data"], **data}
+            if "result" in data:
+                return {"ok": True, "result": data["result"], **data}
+
+        # Ba'zi providerlar getCountries'ni to'g'ridan-to'g'ri dict/list qaytaradi.
+        if action == "getCountries" and isinstance(data, (list, dict)):
+            return {"ok": True, "result": data}
+
+        return {"ok": False, "error": "AktivSim API kutilmagan javob qaytardi", "raw": data}
+    except Exception as e:
+        log.exception("AktivSim API xatosi: %s", action)
+        return {"ok": False, "error": f"AktivSim API bilan aloqa xatosi: {e}"}
+
+
+def aktivsim_countries():
+    return aktivsim_get("getCountries")
+
+
+def aktivsim_balance():
+    return aktivsim_get("getBalance")
+
+
+def aktivsim_buy(country_code):
+    return aktivsim_get("buyNumber", country_code=country_code)
+
+
+def aktivsim_code(order_id):
+    return aktivsim_get("getCode", order_id=order_id)
+
+def aktivsim_sale_price(api_price):
+    try:
+        markup = Decimal(str(get_setting("sim_markup_percent", AKTIVSIM_MARKUP_PERCENT)))
+    except Exception:
+        markup = AKTIVSIM_MARKUP_PERCENT
+    return float(
+        Decimal(str(api_price or 0)) *
+        (Decimal("1") + markup / Decimal("100"))
+    )
 
 
 def save_external_order(
@@ -1717,7 +1802,222 @@ async def paystars_balance_admin(update, context):
         await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
 
 
-# VirtualSMSNumbers xarid oqimi: provider endpointlari tasdiqlanmagani sababli hozircha o‘chiq.
+# ============================================================
+# AKTIVSIM UI / FLOW
+# ============================================================
+
+async def aktivsim_intro_handler(update, context):
+    """Virtual raqam bosilganda avval qoidalar/ogohlantirish oynasini ko'rsatadi."""
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+
+    text = (
+        "🏠 <b>Asosiy menyudasiz.</b>\n\n"
+        "🚀 Bizning bot orqali taqdim etilayotgan akkauntlar — "
+        "tayyor ochilgan Telegram akkauntlar bazasidan olinadi va sotib "
+        "olishdan oldin ma'lumotlarni tekshirish sizning vazifangizdir:\n\n"
+        "⚠️ <b>Kod faqat Telegram ilovasi orqali yuborilishi lozim!</b> "
+        "Agar Telegramning rasmiy ilovasidan kod yuborilsa, kod yetib "
+        "bormasligi yoki xatoliklar bo'lishi mumkin — buning uchun adminlar "
+        "javobgar emas!\n\n"
+        "✔️ Raqamni to'g'ri ishlatish, spamdan saqlash va xavfsizlik "
+        "choralariga rioya qilish — butunlay foydalanuvchi mas'uliyatidadir.\n\n"
+        "☝️ Qoidalar bilan tanishib chiqing va "
+        "<b>«Davom etish»</b> tugmasini bosing!"
+    )
+
+    kb = [[InlineKeyboardButton("Davom etish", callback_data="as_continue")]]
+    await q.message.reply_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+
+async def aktivsim_countries_handler(update, context):
+    q = update.callback_query
+    await q.answer()
+    if not AKTIVSIM_API_KEY:
+        return await q.message.reply_text(
+            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
+        )
+
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok"):
+        log.error("AktivSim countries failed: %s", res)
+        err = str(res.get("error", "Noma'lum xato"))[:500]
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxatini olishda xatolik.\n"
+            f"Sabab: {err}"
+        )
+
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        # {"1": "Russia"} yoki {"1": {"name": "Russia", ...}}
+        countries = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("country_code", item.get("id", key))
+                item.setdefault("name", item.get("eng") or item.get("name") or key)
+                countries.append(item)
+            else:
+                countries.append({"country_code": key, "name": str(value)})
+    elif isinstance(raw, list):
+        countries = raw
+    else:
+        countries = []
+
+    if not countries:
+        return await q.message.reply_text(
+            "❌ AktivSim davlatlar ro'yxati bo'sh yoki API formati o'zgargan."
+        )
+
+    c = conn()
+    try:
+        custom = {
+            str(row["country_code"]): row["custom_price"]
+            for row in c.execute(
+                "SELECT country_code,custom_price FROM custom_prices"
+            ).fetchall()
+        }
+    except Exception:
+        custom = {}
+    finally:
+        c.close()
+
+    rows = []
+    for country in countries[:50]:
+        if not isinstance(country, dict):
+            continue
+        code = str(country.get("country_code", country.get("id", "")))
+        if not code:
+            continue
+        name = country.get("name") or country.get("eng") or country.get("rus") or code
+        flag = country.get("flag", "")
+        api_price = float(country.get("price", country.get("cost", 0)) or 0)
+        final = float(custom.get(code, aktivsim_sale_price(api_price)))
+        price_text = f" — {final:,.0f} so'm" if api_price or code in custom else ""
+        rows.append([InlineKeyboardButton(
+            f"{flag} {name}{price_text}",
+            callback_data=f"as_country_{code}"
+        )])
+
+    if not rows:
+        return await q.message.reply_text("❌ AktivSim davlatlar ro'yxatida yaroqli davlat topilmadi.")
+
+    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
+    await q.message.reply_text(
+        "🌍 <b>Virtual raqam</b>\n\nDavlatni tanlang:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(rows)
+    )
+
+
+async def aktivsim_country_handler(update, context):
+    q = update.callback_query
+    uid = q.from_user.id
+    code = q.data[len("as_country_"):]
+    res = await asyncio.to_thread(aktivsim_countries)
+    if not res.get("ok"):
+        await notify_bot_owner_technical(context, uid)
+        return await q.message.reply_text(
+            "❌ Hozircha xizmatni ishga tushirib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring."
+        )
+
+    raw = res.get("result", [])
+    if isinstance(raw, dict):
+        raw = [dict(v, country_code=k) if isinstance(v, dict) else {"country_code": k, "name": str(v)} for k, v in raw.items()]
+    country = next(
+        (x for x in raw if str(x.get("country_code", x.get("id", ""))) == str(code)),
+        None
+    )
+    if not country:
+        return await q.message.reply_text("❌ Davlat topilmadi.")
+
+    c = conn()
+    r = c.execute(
+        "SELECT custom_price FROM custom_prices WHERE country_code=?",
+        (code,)
+    ).fetchone()
+    c.close()
+
+    api_price = float(country.get("price", 0) or 0)
+    price = float(r["custom_price"]) if r else aktivsim_sale_price(api_price)
+
+    if get_balance(uid) < Decimal(str(price)):
+        return await q.message.reply_text(
+            f"❌ Balansingiz yetarli emas.\n"
+            f"Kerak: {price:,.0f} so'm\n"
+            f"Balans: {float(get_balance(uid)):,.0f} so'm"
+        )
+
+    await q.message.edit_text("⏳ Raqam olinmoqda, kuting...")
+    bought = await asyncio.to_thread(aktivsim_buy, code)
+
+    if not bought.get("ok") or not bought.get("result"):
+        await notify_bot_owner_technical(context, uid)
+        return await q.message.edit_text(
+            "❌ Buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring."
+        )
+
+    result = bought["result"]
+    provider_oid = result.get("order_id", "")
+    phone = result.get("phone", "")
+    api_real_price = result.get("price", api_price)
+
+    # Agar provider qaytargan narx boshqacha bo'lsa, sotuv narxini
+    # oldindan tanlangan katalog narxida saqlaymiz.
+    add_balance(uid, -price, "purchase", f"AktivSim {code}")
+    save_external_order(
+        uid, "aktivsim", "virtual_number", provider_oid,
+        phone, 1, 0, price, "sold"
+    )
+
+    code_result = await asyncio.to_thread(aktivsim_code, provider_oid)
+    sms_code = ""
+    if code_result.get("ok") and code_result.get("result"):
+        sms_code = (
+            code_result["result"].get("code")
+            or code_result["result"].get("sms_code")
+            or ""
+        )
+
+    text = (
+        "✅ <b>Raqam muvaffaqiyatli olindi!</b>\n\n"
+        f"🌍 {country.get('name', code)}\n"
+        f"📞 <code>+{phone}</code>\n"
+        f"💰 {price:,.0f} so'm\n"
+        f"🆔 {provider_oid}\n"
+    )
+    if sms_code:
+        text += f"🔑 Kod: <code>{sms_code}</code>\n"
+    else:
+        text += "⏳ SMS kodi hali kelmagan bo'lishi mumkin.\n"
+
+    await q.message.edit_text(text, parse_mode="HTML")
+
+
+async def aktivsim_balance_admin(update, context):
+    q = update.callback_query
+    if q.from_user.id != bot_admin_id(context):
+        return
+    if not AKTIVSIM_API_KEY:
+        return await q.message.reply_text(
+            "❌ AKTIVSIM_API_KEY yoki DONUZ_API_KEY sozlanmagan."
+        )
+    data = await asyncio.to_thread(aktivsim_balance)
+    if data.get("ok"):
+        await q.message.reply_text(
+            f"🔒 AktivSim balansi: {data.get('balance', 'Nomaʼlum')}"
+        )
+    else:
+        await q.message.reply_text("❌ AktivSim balansini olishda xatolik.")
 
 
 # ============================================================
@@ -1791,144 +2091,56 @@ def user_exists(uid):
 
 
 def get_balance(uid):
-
-    # Faol botning bazasidan balans olinadi: child botlarda ham alohida balans.
-    c = conn()
-
-    r = c.execute(
-        """
-        SELECT balance
-        FROM users
-        WHERE user_id=?
-        """,
-        (uid,)
-    ).fetchone()
-
-    c.close()
-
-    return (
-        Decimal(str(r["balance"]))
-        if r
-        else Decimal("0")
-    )
-
-
-def add_balance(
-    uid,
-    amount,
-    tx_type="manual",
-    note=""
-):
-
-    amount = Decimal(str(amount))
-
-    c = main_conn()
-
-    c.execute(
-        """
-        UPDATE users
-        SET balance=balance+?
-        WHERE user_id=?
-        """,
-        (
-            float(amount),
-            uid
-        )
-    )
-
-    c.execute(
-        """
-        INSERT INTO balance_history
-        (user_id,amount,type,note,created_at)
-        VALUES (?,?,?,?,?)
-        """,
-        (
-            uid,
-            float(amount),
-            tx_type,
-            note,
-            datetime.now().isoformat()
-        )
-    )
-
-    c.commit()
-    c.close()
-
-
-def mark_main_bot_user(uid):
-    """Return True only the first time this Telegram user starts the main bot."""
-    c = main_conn()
-    try:
-        cur = c.execute(
-            "INSERT OR IGNORE INTO main_bot_users(user_id, first_started_at) VALUES(?,?)",
-            (int(uid), datetime.now().isoformat()),
-        )
-        c.commit()
-        return cur.rowcount == 1
-    finally:
-        c.close()
-
-
-def register_referral(invited_uid, payload):
-    """Register one valid referral and award the configured bonus once."""
-    try:
-        referrer_uid = int(str(payload).removeprefix("ref_"))
-    except (TypeError, ValueError):
-        return None
-
-    if referrer_uid <= 0 or referrer_uid == int(invited_uid):
-        return None
-
-    c = main_conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
-        referrer = c.execute(
-            "SELECT user_id FROM users WHERE user_id=?", (referrer_uid,)
-        ).fetchone()
-        already = c.execute(
-            "SELECT 1 FROM referrals WHERE invited_user_id=?", (int(invited_uid),)
-        ).fetchone()
-        if not referrer or already:
-            c.rollback()
-            return None
-
-        setting = c.execute(
-            "SELECT value FROM settings WHERE key='referral_bonus_uzs'"
-        ).fetchone()
-        try:
-            bonus = max(0.0, float(setting["value"] if setting else 100))
-        except (TypeError, ValueError):
-            bonus = 100.0
-
-        now = datetime.now().isoformat()
-        c.execute(
-            "INSERT INTO referrals(invited_user_id,referrer_user_id,bonus,created_at) VALUES(?,?,?,?)",
-            (int(invited_uid), referrer_uid, bonus, now),
-        )
-        if bonus > 0:
-            c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (bonus, referrer_uid))
-            c.execute(
-                "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
-                (referrer_uid, bonus, "referral_bonus", f"Referal: {invited_uid}", now),
-            )
-        c.commit()
-        return {"referrer_id": referrer_uid, "bonus": bonus}
-    except Exception:
-        c.rollback()
-        log.exception("Referalni ro'yxatdan o'tkazishda xato")
-        return None
-    finally:
-        c.close()
-
-
-def referral_stats(uid):
+    """Har doim asosiy Donuz bazasidagi balansni qaytaradi."""
     c = main_conn()
     try:
         row = c.execute(
-            "SELECT COUNT(*) AS total, COALESCE(SUM(bonus),0) AS earned FROM referrals WHERE referrer_user_id=?",
-            (int(uid),),
+            "SELECT balance FROM users WHERE user_id=?",
+            (int(uid),)
         ).fetchone()
-        return int(row["total"] or 0), float(row["earned"] or 0)
+        return Decimal(str(row["balance"] or 0)) if row else Decimal("0")
+    finally:
+        c.close()
+
+
+def add_balance(uid, amount, tx_type="manual", note=""):
+    """Balans va tarixni bitta tranzaksiyada asosiy bazada yangilaydi."""
+    uid = int(uid)
+    amount = Decimal(str(amount))
+    c = main_conn()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT balance FROM users WHERE user_id=?",
+            (uid,)
+        ).fetchone()
+
+        if row is None:
+            c.execute(
+                "INSERT INTO users(user_id, username, first_name, balance, created_at) VALUES(?, '', '', 0, ?)",
+                (uid, datetime.now().isoformat())
+            )
+            old_balance = Decimal("0")
+        else:
+            old_balance = Decimal(str(row["balance"] or 0))
+
+        new_balance = old_balance + amount
+        if new_balance < 0:
+            raise ValueError("Donuz balansi yetarli emas.")
+
+        c.execute(
+            "UPDATE users SET balance=? WHERE user_id=?",
+            (float(new_balance), uid)
+        )
+        c.execute(
+            "INSERT INTO balance_history(user_id, amount, type, note, created_at) VALUES(?,?,?,?,?)",
+            (uid, float(amount), str(tx_type), str(note), datetime.now().isoformat())
+        )
+        c.commit()
+        return new_balance
+    except Exception:
+        c.rollback()
+        raise
     finally:
         c.close()
 
@@ -2698,209 +2910,6 @@ def sync_catalog():
 
 
 # ============================================================
-# OMONAT — 1% foyda, bir kalendar oy o'tgach
-# ============================================================
-
-def add_one_calendar_month(value):
-    """Sana/vaqtni keyingi kalendar oyga o'tkazadi; kun bo'lmasa oy oxiriga moslaydi."""
-    import calendar
-    month_index = value.month  # 1..12
-    year = value.year + (1 if month_index == 12 else 0)
-    month = 1 if month_index == 12 else month_index + 1
-    day = min(value.day, calendar.monthrange(year, month)[1])
-    return value.replace(year=year, month=month, day=day)
-
-
-def process_due_omonats(notify=True):
-    """Muddat yetgan omonatni bir marta yopib, asosiy summa + 1% foydani qaytaradi."""
-    now = datetime.now()
-    due_ids = []
-    c = main_conn()
-    try:
-        due = c.execute(
-            "SELECT id FROM omonats WHERE status='active' AND matures_at<=? ORDER BY id",
-            (now.isoformat(),)
-        ).fetchall()
-        due_ids = [int(row["id"]) for row in due]
-        for oid in due_ids:
-            c.execute("BEGIN IMMEDIATE")
-            row = c.execute(
-                "SELECT * FROM omonats WHERE id=? AND status='active' AND matures_at<=?",
-                (oid, now.isoformat())
-            ).fetchone()
-            if not row:
-                c.commit()
-                continue
-            total = round(float(row["principal"]) + float(row["profit"]), 2)
-            c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (total, row["user_id"]))
-            c.execute(
-                "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
-                (row["user_id"], total, "omonat_maturity", f"Omonat #{oid}: asosiy summa va 1% foyda", now.isoformat())
-            )
-            c.execute(
-                "UPDATE omonats SET status='matured', paid_at=?, closed_at=? WHERE id=? AND status='active'",
-                (now.isoformat(), now.isoformat(), oid)
-            )
-            c.commit()
-            if notify and BOT_TOKEN:
-                try:
-                    requests.post(
-                        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                        json={
-                            "chat_id": int(row["user_id"]),
-                            "text": (
-                                f"🏦 Omonat #{oid} muddati tugadi!\n\n"
-                                f"💰 Omonat: {float(row['principal']):,.0f} so'm\n"
-                                f"📈 Foyda (1%): {float(row['profit']):,.0f} so'm\n"
-                                f"✅ Balansga qaytarildi: {total:,.0f} so'm"
-                            )
-                        }, timeout=10
-                    )
-                except Exception:
-                    log.exception("Omonat muddati tugagani haqida xabar yuborilmadi: %s", oid)
-    except Exception:
-        c.rollback()
-        log.exception("Omonatlarni muddatida qaytarish xatosi")
-    finally:
-        c.close()
-
-
-def omonat_worker():
-    """Render qayta ishga tushganda ham muddati o'tgan omonatlarni tekshiradi."""
-    while True:
-        try:
-            process_due_omonats(notify=True)
-        except Exception:
-            log.exception("Omonat worker xatosi")
-        import time
-        time.sleep(30)
-
-
-async def omonat_menu(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    process_due_omonats(notify=True)
-    c = main_conn()
-    active = c.execute(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(principal),0) AS total FROM omonats WHERE user_id=? AND status='active'",
-        (uid,)
-    ).fetchone()
-    c.close()
-    await q.message.reply_text(
-        "🏦 OMONAT\n\n"
-        "📈 Oylik foyda: 1%\n"
-        "🗓 Muddat: 1 kalendar oy\n"
-        "⏰ Foyda omonat ochilgan vaqtga mos ravishda bir oy o'tgach hisoblanadi.\n"
-        "✅ Muddat tugaganda asosiy summa va foyda balansga bir marta qaytariladi.\n"
-        "⚠️ Muddatidan oldin yopilsa, faqat asosiy summa qaytadi; foyda hisoblanmaydi.\n\n"
-        f"💰 Balans: {get_balance(uid):,.0f} so'm\n"
-        f"📂 Faol omonatlar: {int(active['n'])}\n"
-        f"🔒 Omonatdagi summa: {float(active['total']):,.0f} so'm",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Omonat ochish", callback_data="omonat_open")],
-            [InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")],
-            [InlineKeyboardButton("⬅️ Asosiy menyu", callback_data="back_home")],
-        ])
-    )
-
-
-async def omonat_open_start(update, context):
-    q = update.callback_query
-    context.user_data["state"] = "omonat_amount"
-    await q.message.reply_text(
-        "➕ Omonat ochish\n\n"
-        f"💰 Balansingiz: {get_balance(q.from_user.id):,.0f} so'm\n"
-        "Omonatga qo'ymoqchi bo'lgan summani yuboring (so'mda).\n"
-        "Bekor qilish: /cancel"
-    )
-
-
-async def omonat_history(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    process_due_omonats(notify=True)
-    c = main_conn()
-    rows = c.execute(
-        "SELECT * FROM omonats WHERE user_id=? ORDER BY id DESC LIMIT 15",
-        (uid,)
-    ).fetchall()
-    c.close()
-    if not rows:
-        return await q.message.reply_text(
-            "📜 Omonat tarixi hozircha bo'sh.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")]])
-        )
-    lines = ["📜 OMONAT TARIXI\n"]
-    buttons = []
-    for row in rows:
-        started = datetime.fromisoformat(row["started_at"]).strftime("%d.%m.%Y %H:%M")
-        matures = datetime.fromisoformat(row["matures_at"]).strftime("%d.%m.%Y %H:%M")
-        status = {"active": "🟡 Faol", "matured": "✅ Muddat tugadi", "closed": "⚪ Erta yopildi"}.get(row["status"], row["status"])
-        lines.append(
-            f"\n#{row['id']} — {status}\n"
-            f"💰 Summa: {float(row['principal']):,.0f} so'm\n"
-            f"📈 Kutilgan foyda: {float(row['profit']):,.0f} so'm\n"
-            f"🗓 Ochilgan: {started}\n"
-            f"⏰ Muddat: {matures}"
-        )
-        if row["status"] == "active":
-            buttons.append([InlineKeyboardButton(f"🔒 #{row['id']} omonatni yopish", callback_data=f"omonat_close_{row['id']}")])
-    buttons.append([InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")])
-    await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons))
-
-
-async def omonat_close_prompt(update, context, omonat_id):
-    q = update.callback_query
-    c = main_conn()
-    row = c.execute("SELECT * FROM omonats WHERE id=? AND user_id=? AND status='active'", (omonat_id, q.from_user.id)).fetchone()
-    c.close()
-    if not row:
-        return await q.message.reply_text("❌ Faol omonat topilmadi yoki u allaqachon yopilgan.")
-    await q.message.reply_text(
-        f"⚠️ #{omonat_id} omonatni muddatidan oldin yopmoqchimisiz?\n\n"
-        f"💰 Qaytariladigan asosiy summa: {float(row['principal']):,.0f} so'm\n"
-        "📉 Muddatidan oldin yopilgani uchun 1% foyda berilmaydi.\n\n"
-        "Yopishni tasdiqlaysizmi?",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Ha, yopish", callback_data=f"omonat_close_yes_{omonat_id}")],
-            [InlineKeyboardButton("❌ Yo'q", callback_data="omonat_history")],
-        ])
-    )
-
-
-async def omonat_close_confirm(update, context, omonat_id):
-    q = update.callback_query
-    now = datetime.now().isoformat()
-    c = main_conn()
-    try:
-        c.execute("BEGIN IMMEDIATE")
-        row = c.execute("SELECT * FROM omonats WHERE id=? AND user_id=? AND status='active'", (omonat_id, q.from_user.id)).fetchone()
-        if not row:
-            c.rollback()
-            return await q.message.reply_text("❌ Omonat allaqachon yopilgan yoki topilmadi.")
-        # Agar worker bu vaqt ichida muddati yetgan omonatni qaytargan bo'lsa, ikkinchi to'lov bo'lmaydi.
-        if row["matures_at"] <= now:
-            c.rollback()
-            process_due_omonats(notify=True)
-            return await q.message.reply_text("⏰ Omonat muddati tugagan. Asosiy summa va foyda balansga qaytarildi.")
-        amount = float(row["principal"])
-        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, q.from_user.id))
-        c.execute("INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)", (q.from_user.id, amount, "omonat_early_close", f"Omonat #{omonat_id}: muddatidan oldin yopildi", now))
-        c.execute("UPDATE omonats SET status='closed', closed_at=? WHERE id=? AND status='active'", (now, omonat_id))
-        c.commit()
-    except Exception:
-        c.rollback()
-        log.exception("Omonatni yopishda xatolik")
-        return await q.message.reply_text("❌ Omonatni yopib bo'lmadi. Keyinroq urinib ko'ring.")
-    finally:
-        c.close()
-    await q.message.reply_text(
-        f"✅ Omonat #{omonat_id} yopildi.\n\n💰 Balansga qaytarildi: {amount:,.0f} so'm\n📈 Foyda hisoblanmadi.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")], [InlineKeyboardButton("⬅️ Omonat", callback_data="omonat")]])
-    )
-
-
-# ============================================================
 # MENU
 # ============================================================
 
@@ -2910,13 +2919,11 @@ def main_menu():
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
         [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
-        # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
-        # xarid oqimi menyuda ko'rsatilmaydi.
+        [InlineKeyboardButton("🇺🇿 Virtual raqam", callback_data="aktivsim_buy")],
+        [InlineKeyboardButton("🤖 Botlarim", callback_data="bot_list")],
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
+        [InlineKeyboardButton("💰 Donuz balans", callback_data="balance")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
-        [InlineKeyboardButton("🏦 Omonat", callback_data="omonat")],
-        [InlineKeyboardButton("💸 Balans yechish", callback_data="withdraw")],
-        [InlineKeyboardButton("🔗 Referal", callback_data="referral")],
         [InlineKeyboardButton("📦 Buyurtmalarim", callback_data="orders")],
         [
             InlineKeyboardButton("🎁 Promo kod", callback_data="promo"),
@@ -2958,7 +2965,6 @@ def admin_kb():
             InlineKeyboardButton("🎮 Donat ustama", callback_data="adm_markup_donat"),
             InlineKeyboardButton("📱 SIM ustama", callback_data="adm_markup_sim")
         ],
-        [InlineKeyboardButton("🔗 Referal bonusini sozlash", callback_data="adm_referral_bonus")],
         [
             InlineKeyboardButton("⭐ Stars ustama", callback_data="adm_markup_stars"),
             InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
@@ -2978,7 +2984,7 @@ def admin_kb():
         ],
         [
             InlineKeyboardButton(
-                "📢 Post",
+                "📢 Foydalanuvchilarga post",
                 callback_data="adm_post"
             ),
             InlineKeyboardButton(
@@ -3000,6 +3006,10 @@ def admin_kb():
                 "⭐ PayStars balansi",
                 callback_data="adm_paystars_balance"
             ),
+            InlineKeyboardButton(
+                "🔒 AktivSim balansi",
+                callback_data="adm_aktivsim_balance"
+            ),
         ]
     ])
 
@@ -3013,30 +3023,9 @@ async def start(update, context):
     set_request_db(context)
     if not await child_platform_access(update, context):
         return
-    is_main_bot = int(getattr(context.bot, "id", 0) or 0) == int(MAIN_BOT_ID or 0)
-    is_new_main_user = mark_main_bot_user(update.effective_user.id) if is_main_bot else False
-    ensure_user(update.effective_user)
-
-    # Referal faqat asosiy DONUZ botini birinchi marta ochgan yangi foydalanuvchi uchun hisoblanadi.
-    referral_result = None
-    if (
-        is_new_main_user
-        and update.message
-        and context.args
-        and context.args[0].startswith("ref_")
-    ):
-        referral_result = register_referral(update.effective_user.id, context.args[0])
-        if referral_result:
-            try:
-                await context.bot.send_message(
-                    chat_id=referral_result["referrer_id"],
-                    text=(
-                        "🎉 Referalingiz botga qo'shildi!\n"
-                        f"💰 Bonus: {referral_result['bonus']:,.0f} so'm balansingizga qo'shildi."
-                    ),
-                )
-            except Exception:
-                pass
+    ensure_user(
+        update.effective_user
+    )
 
     if not update.message:
         return
@@ -3046,161 +3035,6 @@ async def start(update, context):
         "🎮 Donat botiga xush kelibsiz!",
         reply_markup=main_menu()
     )
-
-
-# ============================================================
-# REFERAL VA BALANS YECHISH
-# ============================================================
-
-async def referral_menu(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    bonus_raw = get_setting("referral_bonus_uzs", "100")
-    try:
-        bonus = float(bonus_raw)
-    except (TypeError, ValueError):
-        bonus = 100.0
-    count, earned = referral_stats(uid)
-    username = MAIN_BOT_USERNAME
-    if not username:
-        try:
-            me = await context.bot.get_me()
-            username = me.username or ""
-        except Exception:
-            username = ""
-    link = f"https://t.me/{username}?start=ref_{uid}" if username else "Bot username topilmadi."
-    await q.message.reply_text(
-        "🔗 <b>Sizning referal havolangiz</b>\n\n"
-        f"{link}\n\n"
-        f"👥 Taklif qilganlaringiz: <b>{count}</b> ta\n"
-        f"💰 Jami referal bonusi: <b>{earned:,.0f} so'm</b>\n"
-        f"🎁 Har bir yangi foydalanuvchi uchun: <b>{bonus:,.0f} so'm</b>\n\n"
-        "Bonus faqat yangi foydalanuvchi havola orqali botni birinchi marta ochganda beriladi.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menyu", callback_data="back_home")]]),
-        disable_web_page_preview=True,
-    )
-
-
-async def withdrawal_start(update, context):
-    q = update.callback_query
-    uid = q.from_user.id
-    balance = get_balance(uid)
-    if balance < 50000:
-        return await q.message.reply_text(
-            "❌ Balans yechish uchun kamida 50 000 so'm kerak.\n\n"
-            f"💰 Hozirgi balansingiz: {balance:,.0f} so'm",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menyu", callback_data="back_home")]]),
-        )
-    context.user_data["state"] = "withdraw_amount"
-    context.user_data.pop("withdraw_amount", None)
-    await q.message.reply_text(
-        "💸 <b>Balans yechish</b>\n\n"
-        f"💰 Balansingiz: {balance:,.0f} so'm\n"
-        "📉 Minimal yechish: 50 000 so'm\n\n"
-        "Yechmoqchi bo'lgan summangizni yuboring:",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]]),
-    )
-
-
-async def handle_withdrawal_text(update, context, state, text):
-    uid = update.effective_user.id
-    if state == "withdraw_amount":
-        try:
-            amount_text = text.lower().replace("so'm", "").replace(" ", "").replace(",", "")
-            if amount_text.count(".") == 1 and len(amount_text.split(".")[-1]) == 3:
-                amount_text = amount_text.replace(".", "")
-            amount = Decimal(amount_text)
-        except (InvalidOperation, ValueError):
-            await update.message.reply_text("❌ Summani raqam bilan yuboring. Masalan: 50000")
-            return True
-        if amount != amount.to_integral_value() or amount < 50000:
-            await update.message.reply_text("❌ Minimal yechish summasi 50 000 so'm. Butun summani yuboring.")
-            return True
-        if amount > get_balance(uid):
-            await update.message.reply_text(
-                f"❌ Balansingiz yetarli emas. Hozirgi balans: {get_balance(uid):,.0f} so'm."
-            )
-            return True
-        context.user_data["withdraw_amount"] = int(amount)
-        context.user_data["state"] = "withdraw_details"
-        await update.message.reply_text(
-            f"💸 Yechiladigan summa: {amount:,.0f} so'm\n\n"
-            "Pul tushishi uchun karta raqami yoki to'lov rekvizitlarini yuboring.\n"
-            "Masalan: karta raqami va karta egasining ismi."
-        )
-        return True
-
-    if state == "withdraw_details":
-        details = text.strip()
-        if len(details) < 5 or len(details) > 300:
-            await update.message.reply_text("❌ Rekvizitlarni to'g'ri yuboring (5–300 belgi).")
-            return True
-        amount = int(context.user_data.get("withdraw_amount", 0) or 0)
-        if amount < 50000:
-            context.user_data.clear()
-            await update.message.reply_text("❌ So'rov bekor qilindi. Qaytadan boshlang.", reply_markup=main_menu())
-            return True
-
-        c = main_conn()
-        request_id = None
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            user_row = c.execute("SELECT balance, username, first_name FROM users WHERE user_id=?", (uid,)).fetchone()
-            if not user_row or float(user_row["balance"] or 0) < amount:
-                c.rollback()
-                context.user_data.clear()
-                await update.message.reply_text("❌ Balansingiz yetarli emas. So'rov yaratilmadi.", reply_markup=main_menu())
-                return True
-            now = datetime.now().isoformat()
-            c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (amount, uid))
-            c.execute(
-                "INSERT INTO withdrawals(user_id,amount,payment_details,status,created_at) VALUES(?,?,?,'pending',?)",
-                (uid, amount, details, now),
-            )
-            request_id = c.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
-            c.execute(
-                "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
-                (uid, -amount, "withdrawal_pending", f"Yechish so'rovi #{request_id}", now),
-            )
-            c.commit()
-        except Exception:
-            c.rollback()
-            log.exception("Balans yechish so'rovi yaratilmadi")
-            await update.message.reply_text("❌ So'rovni yaratishda xatolik. Keyinroq urinib ko'ring.")
-            return True
-        finally:
-            c.close()
-
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Balans yechish so'rovi yuborildi!\n\n"
-            f"🆔 So'rov: #{request_id}\n"
-            f"💰 Summa: {amount:,.0f} so'm\n"
-            "⏳ Admin tekshiruvidan keyin to'lov amalga oshiriladi.",
-            reply_markup=main_menu(),
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    f"💸 <b>Yangi balans yechish so'rovi #{request_id}</b>\n\n"
-                    f"👤 {html.escape(user_row['first_name'] or 'Foydalanuvchi')} (@{html.escape(user_row['username'] or 'yo‘q')})\n"
-                    f"🆔 User ID: <code>{uid}</code>\n"
-                    f"💰 Summa: <b>{amount:,.0f} so'm</b>\n"
-                    f"💳 Rekvizitlar: <code>{html.escape(details)}</code>"
-                ),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ To'landi", callback_data=f"adm_wd_ok_{request_id}"),
-                    InlineKeyboardButton("❌ Rad etish", callback_data=f"adm_wd_no_{request_id}"),
-                ]]),
-            )
-        except Exception:
-            log.exception("Admin balans yechish so'rovi haqida xabardor qilinmadi")
-        return True
-    return False
 
 
 # ============================================================
@@ -4281,10 +4115,6 @@ async def text_handler(update, context):
         "state"
     )
 
-    if state in ("withdraw_amount", "withdraw_details"):
-        if await handle_withdrawal_text(update, context, state, text):
-            return
-
     # ========================================================
     # PAYSTARS: STARS USERNAME
     # ========================================================
@@ -4417,6 +4247,16 @@ async def text_handler(update, context):
             me, created = await create_child_bot(u.id, u.username or "", text)
             context.user_data.clear()
             status = child_bot_row(me["id"])
+            # Ulangan bot orqali egasiga /admin haqida xabar berishga urinib ko'ramiz.
+            try:
+                child_app = CHILD_APPS.get(int(me["id"]))
+                if child_app:
+                    await child_app.bot.send_message(
+                        chat_id=int(u.id),
+                        text="🤖 Botingiz sozlamalari uchun /admin yozing."
+                    )
+            except Exception:
+                log.info("Child bot egasiga xabar yuborilmadi; avval botga /start bosishi mumkin.")
             bot_action = "✅ Bot qo'shildi!" if created else "✅ Bot yangilandi!"
             await update.message.reply_text(
                 f"{bot_action}\n\n"
@@ -4440,66 +4280,6 @@ async def text_handler(update, context):
         c=main_conn(); c.execute("UPDATE child_bots SET markup_uzs=? WHERE bot_id=? AND owner_user_id=?",(float(amount),bot_id,u.id)); c.commit(); c.close()
         context.user_data.clear()
         await update.message.reply_text(f"✅ Ustama saqlandi: {amount:,.0f} so'm",reply_markup=main_menu())
-        return
-
-    # ========================================================
-    # OMONAT SUMMASI
-    # ========================================================
-
-    if state == "omonat_amount":
-        try:
-            amount = Decimal(text.replace(",", "").replace(" ", ""))
-        except InvalidOperation:
-            await update.message.reply_text("❌ Summani raqamda yuboring. Masalan: 50000")
-            return
-        if amount <= 0 or amount != amount.to_integral_value():
-            await update.message.reply_text("❌ Summani musbat butun so'mda yuboring.")
-            return
-        amount = amount.quantize(Decimal("1"))
-        uid = u.id
-        balance = get_balance(uid)
-        if balance < amount:
-            await update.message.reply_text(
-                f"❌ Balans yetarli emas.\n💰 Kerak: {amount:,.0f} so'm\n💳 Balans: {balance:,.0f} so'm"
-            )
-            return
-        started = datetime.now()
-        matures = add_one_calendar_month(started)
-        profit = (amount * Decimal("0.01")).quantize(Decimal("1"))
-        c = main_conn()
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            user_row = c.execute("SELECT balance FROM users WHERE user_id=?", (uid,)).fetchone()
-            if not user_row or Decimal(str(user_row["balance"] or 0)) < amount:
-                c.rollback()
-                await update.message.reply_text("❌ Balans yetarli emas. Balansingizni tekshirib qayta urinib ko'ring.")
-                return
-            c.execute("UPDATE users SET balance=balance-? WHERE user_id=?", (float(amount), uid))
-            c.execute("INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)", (uid, -float(amount), "omonat_open", "Omonat ochildi", started.isoformat()))
-            cur = c.execute("INSERT INTO omonats(user_id,principal,profit,status,started_at,matures_at) VALUES(?,?,?,'active',?,?)", (uid, float(amount), float(profit), started.isoformat(), matures.isoformat()))
-            omonat_id = cur.lastrowid
-            c.commit()
-        except Exception:
-            c.rollback()
-            log.exception("Omonat ochishda xatolik")
-            await update.message.reply_text("❌ Omonat ochilmadi. Qayta urinib ko'ring.")
-            return
-        finally:
-            c.close()
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Omonat #{omonat_id} ochildi!\n\n"
-            f"💰 Summa: {amount:,.0f} so'm\n"
-            f"📈 1% foyda: {profit:,.0f} so'm\n"
-            f"💵 Muddat tugaganda jami: {amount + profit:,.0f} so'm\n"
-            f"🗓 Ochilgan: {started.strftime('%d.%m.%Y %H:%M:%S')}\n"
-            f"⏰ Tugash vaqti: {matures.strftime('%d.%m.%Y %H:%M:%S')}\n\n"
-            "Muddat tugaganda summa va foyda balansingizga avtomatik qaytariladi.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📜 Omonat tarixi", callback_data="omonat_history")],
-                [InlineKeyboardButton("🏦 Omonat menyusi", callback_data="omonat")]
-            ])
-        )
         return
 
     # ========================================================
@@ -5799,7 +5579,7 @@ async def admin_markup_start(update, context, kind):
         return
     labels = {
         "donat": ("🎮 Donat", "donat_markup_percent", DEFAULT_MARKUP),
-        "sim": ("📱 VirtualSMS raqam", "sim_markup_percent", VIRTUALSMS_MARKUP_PERCENT),
+        "sim": ("📱 SIM / Virtual raqam", "sim_markup_percent", AKTIVSIM_MARKUP_PERCENT),
         "stars": ("⭐ Stars", "stars_markup_percent", PAYSTARS_MARKUP_PERCENT),
         "premium": ("💎 Premium", "premium_markup_percent", PAYSTARS_MARKUP_PERCENT),
     }
@@ -5873,7 +5653,7 @@ async def admin_post_start(update, context):
     ] = "post_content"
 
     await q.message.reply_text(
-        "📢 Kanalga post yuborish.\n\n"
+        "📢 Foydalanuvchilarga post yuborish.\n\n"
         "Avval post matnini yuboring.\n"
         "Keyin rasm/GIF/video yuboring.\n\n"
         "Faqat matn bo'lsa MATN deb yozing."
@@ -5899,27 +5679,6 @@ async def admin_text_handler(update, context):
     if not state:
 
         return False
-
-    # ========================================================
-    # REFERAL BONUSI
-    # ========================================================
-    if state == "referral_bonus":
-        try:
-            bonus = Decimal(text.replace(" ", "").replace(",", ""))
-        except Exception:
-            await update.message.reply_text("❌ Bonusni raqamda yuboring. Masalan: 100")
-            return True
-        if bonus < 0 or bonus > 100000000:
-            await update.message.reply_text("❌ Bonus 0 dan 100 000 000 so'mgacha bo'lishi kerak.")
-            return True
-        set_setting("referral_bonus_uzs", str(int(bonus)))
-        context.user_data.clear()
-        await update.message.reply_text(
-            f"✅ Referal bonusi saqlandi: {int(bonus):,} so'm\n"
-            "Bu qiymat keyingi yangi referallarga qo'llanadi.",
-            reply_markup=admin_kb()
-        )
-        return True
 
     # ========================================================
     # ALOHIDA USTAMALAR
@@ -6396,7 +6155,7 @@ async def admin_text_handler(update, context):
 
         try:
 
-            sent, failed = await send_channel_post(
+            sent, failed = await send_broadcast_post(
                 context,
                 text=context.user_data.get("post_text", "")
             )
@@ -6404,7 +6163,7 @@ async def admin_text_handler(update, context):
             context.user_data.clear()
 
             await update.message.reply_text(
-                f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
+                f"✅ Matnli post foydalanuvchilarga yuborildi.\n\n📨 Yetib bordi: {sent}\n❌ Yuborilmadi: {failed}",
                 reply_markup=admin_kb()
             )
 
@@ -6423,38 +6182,36 @@ async def admin_text_handler(update, context):
 # CHANNEL POST
 # ============================================================
 
-async def send_channel_post(
+async def send_broadcast_post(
     context,
     text="",
     photo_id=None,
     animation_id=None,
     video_id=None
 ):
-    """Admin postini kanalga emas, shu botdagi foydalanuvchilarning shaxsiy chatlariga yuboradi."""
-    c = conn()
-    try:
-        rows = c.execute("SELECT user_id FROM users WHERE user_id IS NOT NULL").fetchall()
-        user_ids = [int(row["user_id"]) for row in rows]
-    finally:
-        c.close()
+    """Postni kanalga emas, aynan shu botdan foydalangan foydalanuvchilarga yuboradi."""
+    db_path = active_db()
+    c = sqlite3.connect(db_path, timeout=30)
+    rows = c.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+    c.close()
 
     sent = 0
     failed = 0
-    for user_id in user_ids:
+    for (user_id,) in rows:
         try:
             if photo_id:
-                await context.bot.send_photo(chat_id=user_id, photo=photo_id, caption=text or None)
+                await context.bot.send_photo(int(user_id), photo_id, caption=text or None)
             elif animation_id:
-                await context.bot.send_animation(chat_id=user_id, animation=animation_id, caption=text or None)
+                await context.bot.send_animation(int(user_id), animation_id, caption=text or None)
             elif video_id:
-                await context.bot.send_video(chat_id=user_id, video=video_id, caption=text or None)
+                await context.bot.send_video(int(user_id), video_id, caption=text or None)
             else:
-                await context.bot.send_message(chat_id=user_id, text=text)
+                await context.bot.send_message(int(user_id), text=text)
             sent += 1
-        except Exception as exc:
+            await asyncio.sleep(0.04)
+        except Exception as e:
             failed += 1
-            # Foydalanuvchi xabari yoki bot tokeni logga chiqarilmaydi.
-            log.info("Broadcast yuborilmadi: user_id=%s, error_type=%s", user_id, type(exc).__name__)
+            log.warning("Broadcast user %s ga yuborilmadi: %s", user_id, e)
 
     return sent, failed
 
@@ -6463,64 +6220,37 @@ async def admin_media_handler(
     update,
     context
 ):
-
     if update.effective_user.id != bot_admin_id(context):
-
         return
 
-    if context.user_data.get(
-        "admin_state"
-    ) != "post_wait_media":
-
+    if context.user_data.get("admin_state") != "post_wait_media":
         return
 
-    caption = context.user_data.get(
-        "post_text",
-        ""
-    )
+    caption = context.user_data.get("post_text", "")
 
     try:
-
         if update.message.photo:
-
-            sent, failed = await send_channel_post(
-                context,
-                text=caption,
-                photo_id=update.message.photo[-1].file_id
+            sent, failed = await send_broadcast_post(
+                context, text=caption, photo_id=update.message.photo[-1].file_id
             )
-
         elif update.message.animation:
-
-            sent, failed = await send_channel_post(
-                context,
-                text=caption,
-                animation_id=update.message.animation.file_id
+            sent, failed = await send_broadcast_post(
+                context, text=caption, animation_id=update.message.animation.file_id
             )
-
         elif update.message.video:
-
-            sent, failed = await send_channel_post(
-                context,
-                text=caption,
-                video_id=update.message.video.file_id
+            sent, failed = await send_broadcast_post(
+                context, text=caption, video_id=update.message.video.file_id
             )
-
         else:
-
             return
 
         context.user_data.clear()
-
         await update.message.reply_text(
-            f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
+            f"✅ Post foydalanuvchilarga yuborildi.\n\n📨 Yetib bordi: {sent}\n❌ Yuborilmadi: {failed}",
             reply_markup=admin_kb()
         )
-
     except Exception as e:
-
-        await update.message.reply_text(
-            f"❌ Post yuborilmadi: {e}"
-        )
+        await update.message.reply_text(f"❌ Post yuborilmadi: {e}")
 
 
 # ============================================================
@@ -6715,68 +6445,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    if d.startswith("adm_wd_ok_") or d.startswith("adm_wd_no_"):
-        if q.from_user.id != ADMIN_ID:
-            return await q.message.reply_text("❌ Bu amal faqat platforma admini uchun.")
-        try:
-            request_id = int(d.rsplit("_", 1)[1])
-        except (ValueError, IndexError):
-            return await q.message.reply_text("❌ So'rov raqami noto'g'ri.")
-        approve = d.startswith("adm_wd_ok_")
-        c = main_conn()
-        row = None
-        try:
-            c.execute("BEGIN IMMEDIATE")
-            row = c.execute("SELECT * FROM withdrawals WHERE id=?", (request_id,)).fetchone()
-            if not row or row["status"] != "pending":
-                c.rollback()
-                return await q.message.reply_text("ℹ️ Bu so'rov allaqachon ko'rib chiqilgan yoki topilmadi.")
-            now = datetime.now().isoformat()
-            new_status = "approved" if approve else "rejected"
-            c.execute("UPDATE withdrawals SET status=?, decided_at=? WHERE id=? AND status='pending'", (new_status, now, request_id))
-            if not approve:
-                amount = float(row["amount"])
-                c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (amount, row["user_id"]))
-                c.execute(
-                    "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
-                    (row["user_id"], amount, "withdrawal_refund", f"Yechish so'rovi #{request_id} rad etildi", now),
-                )
-            c.commit()
-        except Exception:
-            c.rollback()
-            log.exception("Yechish so'rovini ko'rib chiqishda xato")
-            return await q.message.reply_text("❌ So'rovni yangilashda xatolik.")
-        finally:
-            c.close()
-        result_text = (f"✅ #{request_id} so'rov to'langan deb belgilandi." if approve else f"❌ #{request_id} so'rov rad etildi, pul foydalanuvchi balansiga qaytarildi.")
-        try:
-            await context.bot.send_message(
-                chat_id=row["user_id"],
-                text=(
-                    f"✅ Balans yechish so'rovingiz #{request_id} tasdiqlandi. Admin to'lovni amalga oshirgan bo'lishi kerak."
-                    if approve else
-                    f"❌ Balans yechish so'rovingiz #{request_id} rad etildi. {float(row['amount']):,.0f} so'm balansingizga qaytarildi."
-                ),
-            )
-        except Exception:
-            pass
-        try:
-            await q.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-        return await q.message.reply_text(result_text)
-
-    if d == "adm_referral_bonus":
-        context.user_data.clear()
-        context.user_data["admin_state"] = "referral_bonus"
-        await q.message.reply_text(
-            "🔗 Referal bonusi sozlamasi\n\n"
-            f"Hozirgi bonus: {get_setting('referral_bonus_uzs', '100')} so'm\n"
-            "Har bir yangi taklif uchun bonus summasini yuboring.\n"
-            "Masalan: 100"
-        )
-
-    elif d == "adm_addbalance":
+    if d == "adm_addbalance":
 
         await admin_addbalance_start(
             update,
@@ -6942,18 +6611,6 @@ async def callback_router(update, context):
 
     d = q.data
 
-    # Omonat menyusi va tarixi
-    if d == "omonat":
-        return await omonat_menu(update, context)
-    if d == "omonat_open":
-        return await omonat_open_start(update, context)
-    if d == "omonat_history":
-        return await omonat_history(update, context)
-    if d.startswith("omonat_close_yes_"):
-        return await omonat_close_confirm(update, context, int(d.rsplit("_", 1)[1]))
-    if d.startswith("omonat_close_"):
-        return await omonat_close_prompt(update, context, int(d.rsplit("_", 1)[1]))
-
     # Qo'shimcha providerlar
     if d == "paystars":
         return await paystars_menu(update, context)
@@ -6967,14 +6624,16 @@ async def callback_router(update, context):
         return await ps_confirm(update, context, "stars")
     if d == "ps_confirm_premium":
         return await ps_confirm(update, context, "premium")
-    if d in ("virtualsms_buy", "aktivsim_buy", "as_continue") or d.startswith(("as_country_", "vs_country_")):
-        return await q.message.reply_text(
-            "📱 VirtualSMSNumbers integratsiyasi hozircha o‘chiq. Providerning tasdiqlangan API endpointlari sozlangach yoqiladi."
-        )
+    if d == "aktivsim_buy":
+        return await aktivsim_intro_handler(update, context)
+    if d == "as_continue":
+        return await aktivsim_countries_handler(update, context)
+    if d.startswith("as_country_"):
+        return await aktivsim_country_handler(update, context)
     if d == "adm_paystars_balance":
         return await paystars_balance_admin(update, context)
-    if d == "bot_add":
-        return await add_bot_start(update, context)
+    if d == "adm_aktivsim_balance":
+        return await aktivsim_balance_admin(update, context)
     if d == "bot_list":
         return await bot_list(update, context)
     if d.startswith("bot_manage_"):
@@ -7050,12 +6709,6 @@ async def callback_router(update, context):
                 update,
                 context
             )
-
-        elif d == "referral":
-            await referral_menu(update, context)
-
-        elif d == "withdraw":
-            await withdrawal_start(update, context)
 
         elif d == "orders":
 
@@ -7150,9 +6803,14 @@ async def callback_router(update, context):
 
         try:
 
-            await q.message.reply_text(
-                f"❌ Xatolik:\n{e}"
-            )
+            if q.from_user.id == bot_admin_id(context):
+                await q.message.reply_text(
+                    f"❌ Ichki xatolik yuz berdi. Tafsilot logda saqlandi."
+                )
+            else:
+                await q.message.reply_text(
+                    "❌ Xizmatda vaqtinchalik texnik nosozlik yuz berdi. Birozdan keyin qayta urinib ko'ring."
+                )
 
         except Exception:
 
@@ -7308,9 +6966,6 @@ def main():
     if Fernet is None:
         raise SystemExit("❌ cryptography o'rnatilmagan. requirements.txt ga cryptography qo'shing.")
 
-    # Omonat muddatlarini fon rejimida tekshirish (har 30 soniyada).
-    threading.Thread(target=omonat_worker, daemon=True, name="omonat-worker").start()
-
     # --------------------------------------------------------
     # TELEGRAM APP
     # --------------------------------------------------------
@@ -7343,11 +6998,12 @@ def main():
     )
 
     print(
-        "       DONUZ PLAYPAY BOT"
+        "       PLAYPAY DONAT BOT"
     )
 
-    print("[BOT] Telegram bot ishga tushmoqda")
-    print("[WEB] HTTP health server / yo'lida tayyor")
+    print(
+        "       BOT ISHLAYAPTI"
+    )
 
     print(
         f"       HTTP PORT: {PORT}"
