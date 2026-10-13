@@ -2058,46 +2058,110 @@ def _field_names(game_fields):
 
 
 def get_packages_api(game_id):
+    """API qaytargan PUBG va boshqa o'yinlarning barcha paketlarini oladi."""
     c = conn()
     try:
-        row = c.execute("SELECT provider_game_code,name FROM games WHERE game_id=?", (int(game_id),)).fetchone()
+        row = c.execute(
+            "SELECT provider_game_code,name FROM games WHERE game_id=?",
+            (int(game_id),),
+        ).fetchone()
     finally:
         c.close()
+
     game_code = str(row["provider_game_code"] or "") if row else ""
     if not game_code:
-        # Legacy callers can pass a numeric game_code directly.
         game_code = str(game_id)
+
     status, data = bay2game_request("/products", {"game_code": game_code})
     if not data.get("ok"):
         log.error("Bay2Game products xatosi game_code=%s: %s", game_code, data.get("error", data))
         return None
-    products = data.get("products") or data.get("items") or data.get("results") or data.get("data")
-    if isinstance(products, dict):
-        products = products.get("products") or products.get("items") or products.get("results") or products.get("data")
-    if not isinstance(products, list):
+
+    # API turli javob formatlaridan foydalanishi mumkin:
+    # products/items/results, yoki data ichidagi shu maydonlar.
+    def find_product_list(value, depth=0):
+        if depth > 5:
+            return None
+        if isinstance(value, list):
+            dict_items = [item for item in value if isinstance(item, dict)]
+            if dict_items and any(
+                any(key in item for key in (
+                    "product_code", "productCode", "code", "sku", "product_id", "id"
+                ))
+                for item in dict_items
+            ):
+                return dict_items
+            # Ba'zi APIlar ro'yxatni data ichida yana o'rab yuboradi.
+            for item in value:
+                found = find_product_list(item, depth + 1)
+                if found is not None:
+                    return found
+            return None
+        if isinstance(value, dict):
+            for key in ("products", "items", "results", "data", "packages", "records"):
+                if key in value:
+                    found = find_product_list(value[key], depth + 1)
+                    if found is not None:
+                        return found
+        return None
+
+    products = find_product_list(data)
+    if products is None:
         log.warning("Bay2Game products javob formatini aniqlab bo'lmadi: keys=%s", list(data.keys()))
         return None
+
     packages = []
+    seen_codes = set()
     for product in products:
-        if not isinstance(product, dict):
-            continue
-        product_code = product.get("product_code") or product.get("productCode") or product.get("code") or product.get("sku") or product.get("id")
+        product_code = (
+            product.get("product_code") or product.get("productCode") or
+            product.get("product_id") or product.get("code") or
+            product.get("sku") or product.get("id")
+        )
         if product_code in (None, ""):
             continue
-        sell_price = product.get("sell_price", 0)
+        product_code = str(product_code).strip()
+        if not product_code or product_code in seen_codes:
+            continue
+        seen_codes.add(product_code)
+
+        # Narx API formatiga qarab sell_price, price yoki nested price ichida kelishi mumkin.
+        raw_price = product.get("sell_price")
+        if raw_price is None:
+            raw_price = product.get("price_usd")
+        if raw_price is None:
+            raw_price = product.get("price")
+        if isinstance(raw_price, dict):
+            raw_price = raw_price.get("usd", raw_price.get("amount", raw_price.get("value", 0)))
         try:
-            usd = Decimal(str(sell_price or 0))
+            usd = Decimal(str(raw_price or 0))
         except Exception:
-            usd = Decimal("0")
+            log.warning("Bay2Game mahsulot narxi noto'g'ri: code=%s", product_code)
+            continue
+        if usd < 0:
+            continue
+
         packages.append({
             "paket_id": bay2game_internal_id(product_code),
-            "product_code": str(product_code),
-            "name": str(product.get("name") or product.get("product_name") or product.get("title") or product_code),
-            "price": {"usd": str(usd), "amount": str(usd * get_bay2game_usd_uzs())},
+            "product_code": product_code,
+            "name": str(
+                product.get("name") or product.get("product_name") or
+                product.get("title") or product.get("amount") or product_code
+            ),
+            "price": {
+                "usd": str(usd),
+                "amount": str(usd * get_bay2game_usd_uzs()),
+            },
             "sell_price": str(usd),
             "status": product.get("status", "active"),
         })
-    return {"game_name": row["name"] if row else game_code, "game_code": game_code, "packages": packages}
+
+    log.info("Bay2Game products olindi | game_code=%s | packages=%s", game_code, len(packages))
+    return {
+        "game_name": row["name"] if row else game_code,
+        "game_code": game_code,
+        "packages": packages,
+    }
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
