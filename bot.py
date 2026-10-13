@@ -869,6 +869,7 @@ def init_db():
         PAYMENT_CARD
     )
     set_default("donat_markup_percent", DEFAULT_MARKUP)
+    set_default("bay2game_usd_uzs", os.getenv("BAY2GAME_USD_UZS", "13000"))
     set_default("stars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("premium_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
@@ -1940,6 +1941,16 @@ def referral_stats(uid):
 # BAY2GAME API
 # ============================================================
 
+def get_bay2game_usd_uzs():
+    """USD kursini DB sozlamasidan oladi; admin o'zgartirishi mumkin."""
+    try:
+        value = Decimal(str(get_setting("bay2game_usd_uzs", BAY2GAME_USD_UZS)))
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return BAY2GAME_USD_UZS
+
 def bay2game_internal_id(value):
     """String game/product code ni DB uchun barqaror sonli ID ga aylantiradi."""
     raw = str(value or "").strip()
@@ -2048,7 +2059,7 @@ def get_packages_api(game_id):
             "paket_id": bay2game_internal_id(product["product_code"]),
             "product_code": str(product["product_code"]),
             "name": str(product.get("name") or product.get("product_name") or product["product_code"]),
-            "price": {"usd": str(usd), "amount": str(usd * BAY2GAME_USD_UZS)},
+            "price": {"usd": str(usd), "amount": str(usd * get_bay2game_usd_uzs())},
             "sell_price": str(usd),
             "status": product.get("status", "active"),
         })
@@ -2140,17 +2151,28 @@ def get_playpay_order(order_id):
 
 
 def get_playpay_balance():
+    """Bay2Game reseller profili va API balansini turli javob shakllaridan o'qiydi."""
     status, data = bay2game_request("/profile")
     if not data.get("ok"):
         return status, data
-    profile = data.get("profile") if isinstance(data.get("profile"), dict) else data
-    balance = profile.get("balance", profile.get("balance_usd", profile.get("api_balance", 0)))
+    nested = data.get("data") if isinstance(data.get("data"), dict) else data
+    profile = data.get("profile") if isinstance(data.get("profile"), dict) else None
+    if profile is None and isinstance(nested.get("profile"), dict):
+        profile = nested.get("profile")
+    if profile is None:
+        profile = nested
+    balance = profile.get("balance", profile.get("balance_usd", profile.get("api_balance", nested.get("balance", 0))))
     if isinstance(balance, dict):
         amount = balance.get("amount", balance.get("usd", balance.get("value", 0)))
         currency = balance.get("currency", "USD")
     else:
         amount, currency = balance, "USD"
-    return status, {"ok": True, "balance": {"amount": amount, "currency": currency}, "profile": profile}
+    return status, {
+        "ok": True,
+        "balance": {"amount": amount, "currency": currency},
+        "profile": profile,
+        "raw": data,
+    }
 
 
 # ============================================================
@@ -2461,7 +2483,7 @@ def sync_catalog():
                     continue
                 paket_id = bay2game_internal_id(product_code)
                 usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
-                api_uzs = usd * BAY2GAME_USD_UZS
+                api_uzs = usd * get_bay2game_usd_uzs()
                 sale_price = calc_sale_price(api_uzs)
                 product_status = str(product.get("status", "active")).lower()
                 active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
@@ -2480,7 +2502,7 @@ def sync_catalog():
 
     if game_count == 0:
         return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
-    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {BAY2GAME_USD_UZS:,.0f} so'm."
+    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
 
 
 def add_one_calendar_month(value):
@@ -2683,6 +2705,127 @@ async def omonat_close_confirm(update, context, omonat_id):
 
 
 # ============================================================
+# FOYDALANUVCHILAR O'RTASIDA PUL O'TKAZISH
+# ============================================================
+
+async def transfer_start(update, context):
+    q = update.callback_query
+    context.user_data["state"] = "transfer_recipient"
+    context.user_data.pop("transfer_to", None)
+    context.user_data.pop("transfer_amount", None)
+    await q.message.reply_text(
+        "💸 <b>Balansdan pul o'tkazish</b>\n\n"
+        "Pul yubormoqchi bo'lgan foydalanuvchining Telegram ID raqamini yuboring.\n\n"
+        "⚠️ Qabul qiluvchi ushbu botni avval ishga tushirgan bo'lishi kerak.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]])
+    )
+
+
+async def transfer_confirm(update, context):
+    q = update.callback_query
+    sender_id = q.from_user.id
+    recipient_id = context.user_data.get("transfer_to")
+    amount_value = context.user_data.get("transfer_amount")
+
+    try:
+        recipient_id = int(recipient_id)
+        amount = Decimal(str(amount_value))
+    except Exception:
+        context.user_data.pop("state", None)
+        await q.message.reply_text("❌ O'tkazma ma'lumotlari topilmadi. Qaytadan boshlang.", reply_markup=main_menu())
+        return
+
+    if recipient_id == sender_id or amount <= 0:
+        await q.message.reply_text("❌ O'zingizga pul yubora olmaysiz yoki summa noto'g'ri.", reply_markup=main_menu())
+        context.user_data.clear()
+        return
+
+    c = main_conn()
+    try:
+        # Bir vaqtning o'zida kelgan so'rovlar balansni manfiyga tushirmasligi uchun.
+        c.execute("BEGIN IMMEDIATE")
+        sender = c.execute("SELECT balance FROM users WHERE user_id=?", (sender_id,)).fetchone()
+        recipient = c.execute("SELECT user_id, username, first_name FROM users WHERE user_id=?", (recipient_id,)).fetchone()
+
+        if sender is None:
+            c.rollback()
+            await q.message.reply_text("❌ Sizning hisobingiz topilmadi. /start bosing.", reply_markup=main_menu())
+            context.user_data.clear()
+            return
+        if recipient is None:
+            c.rollback()
+            await q.message.reply_text("❌ Qabul qiluvchi topilmadi. U avval botni /start bilan ishga tushirsin.")
+            return
+        if Decimal(str(sender["balance"] or 0)) < amount:
+            c.rollback()
+            await q.message.reply_text(
+                f"❌ Balansingiz yetarli emas.\n\n💰 Balans: {Decimal(str(sender['balance'] or 0)):,.0f} so'm\n💸 Kerak: {amount:,.0f} so'm",
+                reply_markup=main_menu()
+            )
+            context.user_data.clear()
+            return
+
+        cur = c.execute(
+            "UPDATE users SET balance=balance-? WHERE user_id=? AND balance>=?",
+            (float(amount), sender_id, float(amount))
+        )
+        if cur.rowcount != 1:
+            c.rollback()
+            await q.message.reply_text("❌ Balans o'zgargan bo'lishi mumkin. Qayta urinib ko'ring.", reply_markup=main_menu())
+            context.user_data.clear()
+            return
+
+        c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (float(amount), recipient_id))
+        now = datetime.now().isoformat()
+        c.execute(
+            "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
+            (sender_id, -float(amount), "transfer_out", f"Pul o'tkazildi: {recipient_id}", now)
+        )
+        c.execute(
+            "INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
+            (recipient_id, float(amount), "transfer_in", f"Pul qabul qilindi: {sender_id}", now)
+        )
+        c.commit()
+        new_sender_balance = c.execute("SELECT balance FROM users WHERE user_id=?", (sender_id,)).fetchone()["balance"]
+        new_recipient_balance = c.execute("SELECT balance FROM users WHERE user_id=?", (recipient_id,)).fetchone()["balance"]
+    except Exception:
+        c.rollback()
+        log.exception("Foydalanuvchilar o'rtasida pul o'tkazish xatosi")
+        await q.message.reply_text("❌ O'tkazma bajarilmadi. Mablag'lar o'zgartirilmadi, qayta urinib ko'ring.", reply_markup=main_menu())
+        context.user_data.clear()
+        return
+    finally:
+        c.close()
+
+    context.user_data.clear()
+    recipient_name = (recipient["first_name"] or "")
+    if recipient["username"]:
+        recipient_name += f" (@{recipient['username']})"
+    await q.message.reply_text(
+        "✅ <b>Pul muvaffaqiyatli o'tkazildi!</b>\n\n"
+        f"👤 Qabul qiluvchi: {recipient_name or 'Foydalanuvchi'}\n"
+        f"🆔 Telegram ID: <code>{recipient_id}</code>\n"
+        f"💸 O'tkazildi: <b>{amount:,.0f} so'm</b>\n"
+        f"💰 Qolgan balans: <b>{Decimal(str(new_sender_balance)):,.0f} so'm</b>",
+        parse_mode="HTML",
+        reply_markup=main_menu()
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text=("💰 <b>Balansingizga pul tushdi!</b>\n\n"
+                  f"👤 Yuboruvchi ID: <code>{sender_id}</code>\n"
+                  f"➕ Qabul qilindi: <b>{amount:,.0f} so'm</b>\n"
+                  f"💰 Yangi balans: <b>{Decimal(str(new_recipient_balance)):,.0f} so'm</b>"),
+            parse_mode="HTML"
+        )
+    except Exception:
+        # Pul o'tkazmasi bajarilgan; bildirishnoma yuborilmasligi hisob-kitobni bekor qilmaydi.
+        log.info("Transfer qabul qiluvchiga Telegram bildirishnomasi yuborilmadi: %s", recipient_id)
+
+
+# ============================================================
 # MENU
 # ============================================================
 
@@ -2696,6 +2839,7 @@ def main_menu():
         # xarid oqimi menyuda ko'rsatilmaydi.
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
         [InlineKeyboardButton("💳 Balans to'ldirish", callback_data="deposit")],
+        [InlineKeyboardButton("💸 Pul o'tkazish", callback_data="transfer_start")],
         [InlineKeyboardButton("🏦 Omonat", callback_data="omonat")],
         [InlineKeyboardButton("💸 Balans yechish", callback_data="withdraw")],
         [InlineKeyboardButton("🔗 Referal", callback_data="referral")],
@@ -2744,6 +2888,9 @@ def admin_kb():
         [
             InlineKeyboardButton("⭐ Stars ustama", callback_data="adm_markup_stars"),
             InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
+        ],
+        [
+            InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")
         ],
         [
             InlineKeyboardButton("💵 Donat narxlari", callback_data="adm_prices")
@@ -4066,6 +4213,85 @@ async def text_handler(update, context):
     if state in ("withdraw_amount", "withdraw_details"):
         if await handle_withdrawal_text(update, context, state, text):
             return
+
+    # ========================================================
+    # FOYDALANUVCHILAR O'RTASIDA PUL O'TKAZISH
+    # ========================================================
+    if state == "transfer_recipient":
+        try:
+            recipient_id = int(text.strip())
+        except Exception:
+            await update.message.reply_text("❌ Telegram ID faqat raqam bo'lishi kerak. Masalan: 123456789")
+            return
+        if recipient_id <= 0 or recipient_id == u.id:
+            await update.message.reply_text("❌ O'zingizga pul yubora olmaysiz. Boshqa foydalanuvchi ID sini kiriting.")
+            return
+        c = main_conn()
+        try:
+            recipient = c.execute("SELECT user_id, username, first_name FROM users WHERE user_id=?", (recipient_id,)).fetchone()
+        finally:
+            c.close()
+        if recipient is None:
+            await update.message.reply_text("❌ Foydalanuvchi topilmadi. U botni avval /start bilan ishga tushirsin.")
+            return
+        context.user_data["transfer_to"] = recipient_id
+        context.user_data["state"] = "transfer_amount"
+        name = recipient["first_name"] or "Foydalanuvchi"
+        username = f" (@{recipient['username']})" if recipient["username"] else ""
+        await update.message.reply_text(
+            f"👤 Qabul qiluvchi: {name}{username}\n🆔 ID: {recipient_id}\n\n"
+            "💸 Qancha pul o'tkazmoqchisiz? Summani so'mda yuboring.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]])
+        )
+        return
+
+    if state == "transfer_amount":
+        try:
+            amount = Decimal(text.replace(" ", "").replace(",", "").replace("so'm", ""))
+        except Exception:
+            await update.message.reply_text("❌ Summani raqamda yuboring. Masalan: 5000")
+            return
+        if amount != amount.to_integral_value() or amount < 1000 or amount > 1000000000:
+            await update.message.reply_text("❌ O'tkazma summasi butun son bo'lishi va 1 000 dan 1 000 000 000 so'mgacha bo'lishi kerak.")
+            return
+        recipient_id = context.user_data.get("transfer_to")
+        if not recipient_id or int(recipient_id) == u.id:
+            context.user_data.clear()
+            await update.message.reply_text("❌ Qabul qiluvchi ma'lumoti yo'q. Qaytadan boshlang.", reply_markup=main_menu())
+            return
+        balance = get_balance(u.id)
+        if balance < amount:
+            await update.message.reply_text(f"❌ Balansingiz yetarli emas.\n💰 Balans: {balance:,.0f} so'm\n💸 Kerak: {amount:,.0f} so'm", reply_markup=main_menu())
+            context.user_data.clear()
+            return
+        c = main_conn()
+        try:
+            recipient = c.execute("SELECT username, first_name FROM users WHERE user_id=?", (int(recipient_id),)).fetchone()
+        finally:
+            c.close()
+        if recipient is None:
+            context.user_data.clear()
+            await update.message.reply_text("❌ Qabul qiluvchi topilmadi. Qaytadan boshlang.", reply_markup=main_menu())
+            return
+        context.user_data["transfer_amount"] = int(amount)
+        context.user_data["state"] = "transfer_confirm"
+        recipient_name = recipient["first_name"] or "Foydalanuvchi"
+        if recipient["username"]:
+            recipient_name += f" (@{recipient['username']})"
+        await update.message.reply_text(
+            "🔎 <b>O'tkazmani tasdiqlang</b>\n\n"
+            f"👤 Qabul qiluvchi: {recipient_name}\n"
+            f"🆔 ID: <code>{int(recipient_id)}</code>\n"
+            f"💸 Summa: <b>{amount:,.0f} so'm</b>\n"
+            f"💰 Hozirgi balans: {balance:,.0f} so'm\n"
+            f"💰 O'tkazmadan keyin: {balance - amount:,.0f} so'm",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Tasdiqlash", callback_data="transfer_confirm")],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]
+            ])
+        )
+        return
 
     # ========================================================
     # PAYSTARS: STARS USERNAME
@@ -5677,6 +5903,34 @@ async def admin_text_handler(update, context):
         return False
 
     # ========================================================
+    # BAY2GAME USD KURSI
+    # ========================================================
+    if state == "bay2game_usd_uzs":
+        try:
+            rate = Decimal(text.replace(" ", "").replace(",", ".").replace("so'm", ""))
+        except Exception:
+            await update.message.reply_text("❌ Kursni raqamda yuboring. Masalan: 13000")
+            return True
+        if rate < 1 or rate > 100000000:
+            await update.message.reply_text("❌ Kurs 1 dan 100 000 000 so'mgacha bo'lishi kerak.")
+            return True
+        set_setting("bay2game_usd_uzs", str(rate))
+        context.user_data.clear()
+        await update.message.reply_text(
+            f"✅ Bay2Game USD kursi saqlandi: 1 USD = {rate:,.2f} so'm\n"
+            "🔄 Katalog va paket narxlari yangilanmoqda..."
+        )
+        ok, result = await asyncio.to_thread(sync_catalog)
+        if ok:
+            await asyncio.to_thread(sync_all_child_catalogs)
+        await update.message.reply_text(
+            f"{'✅' if ok else '⚠️'} {result}\n\n"
+            "Yangi kurs katalogdagi Bay2Game paketlariga qo'llandi.",
+            reply_markup=admin_kb()
+        )
+        return True
+
+    # ========================================================
     # REFERAL BONUSI
     # ========================================================
     if state == "referral_bonus":
@@ -6650,6 +6904,21 @@ async def admin_callback(update, context):
             context
         )
 
+    elif d == "adm_bay2game_rate":
+        if q.from_user.id != bot_admin_id(context):
+            await q.answer("Siz admin emassiz.", show_alert=True)
+            return
+        current_rate = get_bay2game_usd_uzs()
+        context.user_data.clear()
+        context.user_data["admin_state"] = "bay2game_usd_uzs"
+        await q.message.reply_text(
+            "💱 BAY2GAME USD KURSI\n\n"
+            f"Hozirgi kurs: 1 USD = {current_rate:,.2f} so'm\n\n"
+            "Yangi kursni so'mda yuboring.\n"
+            "Masalan: 13000\n\n"
+            "Kurs saqlangach katalogdagi paketlar narxi avtomatik yangilanadi."
+        )
+
     elif d == "adm_playpay_balance":
 
         status, data = await asyncio.to_thread(
@@ -6662,10 +6931,59 @@ async def admin_callback(update, context):
             if not isinstance(b, dict):
                 b = {"amount": b, "currency": "USD"}
             profile = data.get("profile", {})
+            if not isinstance(profile, dict):
+                profile = {}
+            # Ba'zi Bay2Game javoblarida maydonlar profile ichida, boshqalarida root darajada keladi.
+            raw = data.get("raw", {}) if isinstance(data.get("raw"), dict) else {}
+            def pval(*keys, default="—"):
+                for source in (profile, raw):
+                    for key in keys:
+                        value = source.get(key)
+                        if value not in (None, ""):
+                            return value
+                return default
+            amount = b.get('amount', b.get('usd', '0'))
+            currency = b.get('currency', 'USD')
+            telegram_id = pval("telegram_id", "user_id", "id")
+            username = pval("username", "user_name")
+            role = pval("role", default="reseller")
+            profile_balance = pval("balance", "balance_usd", "api_balance", default=amount)
+            if isinstance(profile_balance, dict):
+                profile_balance = profile_balance.get("amount", profile_balance.get("usd", amount))
+            profile_balance_text = str(profile_balance)
+            if "USD" not in profile_balance_text.upper() and not profile_balance_text.startswith("$"):
+                profile_balance_text = f"${profile_balance_text} USD"
+            elif not profile_balance_text.startswith("$"):
+                profile_balance_text = "$" + profile_balance_text
+            total_orders = pval("total_orders", "orders_count", "orders", default=0)
+            total_spent = pval("total_spent", "spent", "spent_usd", default=0)
+            spent_text = str(total_spent)
+            if "USD" not in spent_text.upper() and not spent_text.startswith("$"):
+                spent_text = f"${spent_text}"
+            elif not spent_text.startswith("$"):
+                spent_text = "$" + spent_text
+            joined = pval("joined", "joined_at", "created_at", default="—")
+            profile_status = str(pval("status", default="active")).lower()
+            status_text = "✅ Active" if profile_status in ("active", "enabled", "ok", "true", "1") else f"⚠️ {profile_status.title()}"
+            profile_text = (
+                "\n\n👤 My Profile\n\n"
+                f"┌ 🆔 Telegram ID: {telegram_id}\n"
+                f"├ 📝 Username: {('@' + str(username).lstrip('@')) if username != '—' else '—'}\n"
+                f"├ 👑 Role: {role}\n"
+                f"├ 💰 Balance: {profile_balance_text}\n"
+                f"├ 📊 Status: {status_text}\n"
+                f"├ 🛍️ Total Orders: {total_orders}\n"
+                f"├ 💸 Total Spent: {spent_text}\n"
+                f"└ 📅 Joined: {joined}"
+            )
             await q.message.reply_text(
                 f"🔐 BAY2GAME BALANSI\n\n"
-                f"💵 USD: {b.get('amount', b.get('usd', '0'))}\n"
-                f"💱 Valyuta: {b.get('currency', 'USD')}"
+                f"💵 USD: {amount}\n"
+                f"💱 Valyuta: {currency}\n"
+                f"💱 Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm"
+                f"{profile_text}\n\n"
+                "✨ Balansni to'ldirish yoki buyurtmalar tarixini ko'rish uchun Bay2Game profilidan foydalaning.\n"
+                "💡 Yordam kerakmi? Bay2Game qo'llab-quvvatlash xizmatiga murojaat qiling."
             )
 
         else:
@@ -6714,6 +7032,13 @@ async def callback_router(update, context):
         pass
 
     d = q.data
+
+    # Foydalanuvchilar o'rtasida pul o'tkazish
+    if d == "transfer_start":
+        ensure_user(q.from_user)
+        return await transfer_start(update, context)
+    if d == "transfer_confirm":
+        return await transfer_confirm(update, context)
 
     # Omonat menyusi va tarixi
     if d == "omonat":
