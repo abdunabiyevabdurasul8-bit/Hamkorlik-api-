@@ -2071,14 +2071,18 @@ def get_packages_api(game_id):
     if not data.get("ok"):
         log.error("Bay2Game products xatosi game_code=%s: %s", game_code, data.get("error", data))
         return None
-    products = data.get("products")
-    if products is None and isinstance(data.get("data"), dict):
-        products = data["data"].get("products")
+    products = data.get("products") or data.get("items") or data.get("results") or data.get("data")
+    if isinstance(products, dict):
+        products = products.get("products") or products.get("items") or products.get("results") or products.get("data")
     if not isinstance(products, list):
+        log.warning("Bay2Game products javob formatini aniqlab bo'lmadi: keys=%s", list(data.keys()))
         return None
     packages = []
     for product in products:
-        if not isinstance(product, dict) or not product.get("product_code"):
+        if not isinstance(product, dict):
+            continue
+        product_code = product.get("product_code") or product.get("productCode") or product.get("code") or product.get("sku") or product.get("id")
+        if product_code in (None, ""):
             continue
         sell_price = product.get("sell_price", 0)
         try:
@@ -2086,9 +2090,9 @@ def get_packages_api(game_id):
         except Exception:
             usd = Decimal("0")
         packages.append({
-            "paket_id": bay2game_internal_id(product["product_code"]),
-            "product_code": str(product["product_code"]),
-            "name": str(product.get("name") or product.get("product_name") or product["product_code"]),
+            "paket_id": bay2game_internal_id(product_code),
+            "product_code": str(product_code),
+            "name": str(product.get("name") or product.get("product_name") or product.get("title") or product_code),
             "price": {"usd": str(usd), "amount": str(usd * get_bay2game_usd_uzs())},
             "sell_price": str(usd),
             "status": product.get("status", "active"),
@@ -2506,17 +2510,18 @@ def sync_catalog():
         if not isinstance(category, dict):
             continue
         game_code = str(
-            category.get("game_code") or category.get("category_code") or
-            category.get("code") or category.get("id") or ""
+            category.get("game_code") or category.get("gameCode") or category.get("category_code") or
+            category.get("categoryCode") or category.get("game_id") or category.get("category_id") or
+            category.get("code") or category.get("slug") or category.get("id") or ""
         ).strip()
         name = str(
-            category.get("name") or category.get("game_name") or
-            category.get("category_name") or category.get("title") or game_code
+            category.get("name") or category.get("game_name") or category.get("gameName") or
+            category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
-        fields = category.get("game_fields") or category.get("fields") or category.get("required_fields") or []
+        fields = category.get("game_fields") or category.get("gameFields") or category.get("fields") or category.get("required_fields") or category.get("input_fields") or []
         names = _field_names(fields)
         requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
         id_label = "User ID" if "userid" in names else "Player ID"
@@ -2913,9 +2918,10 @@ def main_menu():
     ])
 
 
-def admin_kb():
-
-    return InlineKeyboardMarkup([
+def admin_kb(context=None):
+    # Maxsus platforma tugmalari faqat asosiy DONUZ/Bay2Game admin botida ko'rinadi.
+    show_platform_controls = context is not None and not is_child_bot(context)
+    rows = [
         [
             InlineKeyboardButton(
                 "💰 Balans + / -",
@@ -2952,9 +2958,6 @@ def admin_kb():
             InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
         ],
         [
-            InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")
-        ],
-        [
             InlineKeyboardButton("💵 Donat narxlari", callback_data="adm_prices")
         ],
         [
@@ -2967,32 +2970,17 @@ def admin_kb():
                 callback_data="adm_card"
             )
         ],
-        [
-            InlineKeyboardButton(
-                "📢 Post",
-                callback_data="adm_post"
-            ),
-            InlineKeyboardButton(
-                "🔄 Katalog",
-                callback_data="a_sync"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔐 Bay2Game balansi",
-                callback_data="adm_playpay_balance"
-            )
-        ],
+        [InlineKeyboardButton("📢 Post", callback_data="adm_post")],
         [
             InlineKeyboardButton("🤖 Bot boshqarish", callback_data="adm_bots"),
         ],
-        [
-            InlineKeyboardButton(
-                "⭐ PayStars balansi",
-                callback_data="adm_paystars_balance"
-            ),
-        ]
-    ])
+    ]
+    if show_platform_controls:
+        rows.insert(6, [InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")])
+        rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
+        rows.append([InlineKeyboardButton("🔐 Bay2Game balansi", callback_data="adm_playpay_balance")])
+        rows.append([InlineKeyboardButton("⭐ PayStars balansi", callback_data="adm_paystars_balance")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ============================================================
@@ -3386,9 +3374,7 @@ async def games(update, context):
 
     if not rows:
         await q.message.reply_text(
-            "❌ O'yinlar topilmadi.\n\n"
-            "🔄 O'yinlar katalogini yuklashda xatolik bo'ldi.\n"
-            "Iltimos, keyinroq qayta urinib ko'ring."
+            "❌ Xatolik"
         )
         return
 
@@ -3966,8 +3952,7 @@ async def confirm(update, context):
 
         # Foydalanuvchiga provider/API yoki sayt nomi ko'rsatilmaydi.
         await q.message.reply_text(
-            "❌ Hozircha buyurtmani bajarib bo'lmadi.\n\n"
-            "🛠 Texnik nosozlik yuz berdi. Iltimos, birozdan keyin qayta urinib ko'ring.\n\n"
+            "❌ Xatolik\n\n"
             f"💰 Pul balansingizga qaytarildi: {price:,.0f} so'm",
             reply_markup=main_menu()
         )
@@ -5276,7 +5261,7 @@ async def admin_command(update, context):
 
     await update.message.reply_text(
         "👑 ADMIN PANEL",
-        reply_markup=admin_kb()
+        reply_markup=admin_kb(context)
     )
 
 
@@ -5988,7 +5973,7 @@ async def admin_text_handler(update, context):
         await update.message.reply_text(
             f"{'✅' if ok else '⚠️'} {result}\n\n"
             "Yangi kurs katalogdagi Bay2Game paketlariga qo'llandi.",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
         return True
 
@@ -6009,7 +5994,7 @@ async def admin_text_handler(update, context):
         await update.message.reply_text(
             f"✅ Referal bonusi saqlandi: {int(bonus):,} so'm\n"
             "Bu qiymat keyingi yangi referallarga qo'llanadi.",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
         return True
 
@@ -6033,7 +6018,7 @@ async def admin_text_handler(update, context):
         await update.message.reply_text(
             f"✅ {labels[kind]} ustamasi saqlandi: {percent:g}%\n\n"
             "Bu xizmatning ustamasi boshqalardan alohida.",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
         return True
 
@@ -6161,7 +6146,7 @@ async def admin_text_handler(update, context):
             f"{abs(amount):,.0f} so'm\n"
             f"💰 Yangi balans: "
             f"{new_balance:,.0f} so'm",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
         context.user_data.clear()
@@ -6284,7 +6269,7 @@ async def admin_text_handler(update, context):
             f"✅ Balans qo'shildi.\n"
             f"👤 {payment['user_id']}\n"
             f"➕ {amount:,.0f} so'm",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
         context.user_data.clear()
@@ -6353,7 +6338,7 @@ async def admin_text_handler(update, context):
         await update.message.reply_text(
             f"✅ Baza narx o'zgartirildi: {price:,.0f} so'm\n"
             "🤖 Barcha mijoz botlariga yangilandi.",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
         context.user_data.clear()
@@ -6376,7 +6361,7 @@ async def admin_text_handler(update, context):
         await update.message.reply_text(
             f"✅ Karta saqlandi:\n"
             f"{get_setting('payment_card')}",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
         return True
@@ -6449,7 +6434,7 @@ async def admin_text_handler(update, context):
             f"🎁 {code}\n"
             f"💸 {percent}%\n"
             f"🔢 Limit: {limit}",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
         return True
@@ -6497,7 +6482,7 @@ async def admin_text_handler(update, context):
 
             await update.message.reply_text(
                 f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
-                reply_markup=admin_kb()
+                reply_markup=admin_kb(context)
             )
 
         except Exception as e:
@@ -6605,7 +6590,7 @@ async def admin_media_handler(
 
         await update.message.reply_text(
             f"📣 Yuborish yakunlandi.\n\n✅ Yetkazildi: {sent}\n❌ Yuborilmadi: {failed}",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
     except Exception as e:
@@ -6806,6 +6791,11 @@ async def admin_callback(update, context):
         return
 
     d = q.data
+
+    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "adm_paystars_balance", "a_sync"}
+    if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
+        await q.answer("Xatolik", show_alert=True)
+        return
 
     if d.startswith("adm_wd_ok_") or d.startswith("adm_wd_no_"):
         if q.from_user.id != ADMIN_ID:
@@ -7050,10 +7040,7 @@ async def admin_callback(update, context):
 
         else:
 
-            await q.message.reply_text(
-                "❌ Xizmat balansini olishda xatolik yuz berdi:\n"
-                f"{data.get('error','API xatosi')}"
-            )
+            await q.message.reply_text("❌ Xatolik")
 
     # ========================================================
     # FAQAT ADMIN KATALOG YANGILAYDI
@@ -7073,7 +7060,7 @@ async def admin_callback(update, context):
 
         await q.message.reply_text(
             f"{'✅' if ok else '❌'} {result}",
-            reply_markup=admin_kb()
+            reply_markup=admin_kb(context)
         )
 
 
@@ -7389,7 +7376,7 @@ async def cancel_command(update, context):
     await update.message.reply_text(
         "❌ Bekor qilindi.",
         reply_markup=(
-            admin_kb()
+            admin_kb(context)
             if update.effective_user.id == ADMIN_ID
             else main_menu()
         )
