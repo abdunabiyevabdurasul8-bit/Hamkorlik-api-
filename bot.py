@@ -64,6 +64,7 @@ except Exception:
 
 # Eski maxsus IDlar (Grand Mobile narxlari o'zgarmaydi)
 PUBG_GAME_ID = 141
+PUBG_GLOBAL_GAME_ID = 142  # PUBG Mobile Global, alohida API katalogi bo'lsa
 MOBILE_LEGENDS_GAME_ID = 54
 GRAND_MOBILE_GAME_ID = 999001
 
@@ -1957,7 +1958,7 @@ def bay2game_internal_id(value):
     if raw.isdigit():
         number = int(raw)
         # Grand Mobile va eski maxsus IDlar bilan to'qnashmasin.
-        if number not in (PUBG_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
+        if number not in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID, GRAND_MOBILE_GAME_ID):
             return number
     return 100000000 + (int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) % 800000000)
 
@@ -2035,6 +2036,9 @@ def bay2game_game_internal_id(game_code, name=""):
     label = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
     code = str(game_code or "").strip()
     if "pubg" in label:
+        # Global va oddiy PUBG yozuvlarini bitta DB ID ostida birlashtirmaymiz.
+        if "global" in label:
+            return PUBG_GLOBAL_GAME_ID
         return PUBG_GAME_ID
     if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
         return MOBILE_LEGENDS_GAME_ID
@@ -2551,9 +2555,19 @@ def sync_catalog():
         ).lower()
         for item in categories
     )
-    if not pubg_in_catalog:
-        for path in ("/categories", "/games"):
-            st, response = bay2game_request(path, {"search": "pubg", "q": "pubg"})
+    # PUBG Global API katalogida alohida nom bilan bo'lsa, uni ham izlaymiz.
+    # API uni alohida qaytarmasa, oddiy PUBG mahsulotini Global deb taxmin qilmaymiz.
+    if not pubg_in_catalog or not any(
+        isinstance(item, dict) and "pubg" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower() and "global" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower()
+        for item in categories
+    ):
+        for search_term in ("pubg global", "pubg"):
+          for path in ("/categories", "/games"):
+            st, response = bay2game_request(path, {"search": search_term, "q": search_term})
             if st and response.get("ok"):
                 options = []
                 for key in ("categories", "games", "items", "results", "data"):
@@ -2566,9 +2580,13 @@ def sync_catalog():
                             if isinstance(sub, list):
                                 options.extend(x for x in sub if isinstance(x, dict))
                 pubg_options = [x for x in options if "pubg" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()]
+                if search_term == "pubg global":
+                    pubg_options = [x for x in pubg_options if "global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()]
                 if pubg_options:
                     categories.extend(pubg_options)
                     break
+          if any("global" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower() for x in categories if isinstance(x, dict)):
+            break
 
     for category in categories:
         if not isinstance(category, dict):
@@ -2582,6 +2600,10 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
+        # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
+        region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
+        if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
+            name = f"{name} Global"
         if not game_code:
             continue
         gid = bay2game_game_internal_id(game_code, name)
@@ -3397,12 +3419,14 @@ async def games(update, context):
             CASE
                 WHEN game_id=? THEN 0
                 WHEN game_id=? THEN 1
-                ELSE 2
+                WHEN game_id=? THEN 2
+                ELSE 3
             END,
             name
         """,
         (
             PUBG_GAME_ID,
+            PUBG_GLOBAL_GAME_ID,
             MOBILE_LEGENDS_GAME_ID
         )
     ).fetchall()
@@ -3432,7 +3456,7 @@ async def games(update, context):
                     END,
                     name
                 """,
-                (PUBG_GAME_ID, MOBILE_LEGENDS_GAME_ID)
+                (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID, MOBILE_LEGENDS_GAME_ID)
             ).fetchall()
             c.close()
 
@@ -3538,7 +3562,7 @@ async def game(update, context):
     id_label = g["id_label"] or "Player ID"
     requires_server = bool(g["requires_server"])
 
-    if game_id == PUBG_GAME_ID:
+    if game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
         id_label = "Player ID"
         requires_server = False
     elif game_id == MOBILE_LEGENDS_GAME_ID:
@@ -3651,7 +3675,7 @@ async def offer(update, context):
         id_label = "User ID"
         requires_server = True
 
-    elif game_id == PUBG_GAME_ID:
+    elif game_id in (PUBG_GAME_ID, PUBG_GLOBAL_GAME_ID):
 
         id_label = "Player ID"
         requires_server = False
