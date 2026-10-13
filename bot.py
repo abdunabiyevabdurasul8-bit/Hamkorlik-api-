@@ -2003,14 +2003,44 @@ def api_get(path, params=None):
 
 
 def get_games_api():
+    """Bay2Game katalogidagi barcha o'yinlarni turli API javob formatlaridan oladi."""
     status, data = bay2game_request("/categories")
     if not data.get("ok"):
         log.error("Bay2Game categories xatosi: %s", data.get("error", data))
         return []
-    categories = data.get("categories")
-    if categories is None and isinstance(data.get("data"), dict):
-        categories = data["data"].get("categories")
-    return categories if isinstance(categories, list) else []
+
+    # API javobi categories, games yoki data ichida kelishi mumkin.
+    candidates = [data.get("categories"), data.get("games"), data.get("items"), data.get("results")]
+    nested = data.get("data")
+    if isinstance(nested, list):
+        candidates.append(nested)
+    elif isinstance(nested, dict):
+        candidates.extend([
+            nested.get("categories"), nested.get("games"), nested.get("items"),
+            nested.get("results"), nested.get("data")
+        ])
+
+    for categories in candidates:
+        if isinstance(categories, list):
+            # Faqat o'yin/category obyektlarini qabul qilamiz.
+            valid = [x for x in categories if isinstance(x, dict)]
+            if valid:
+                return valid
+    log.error("Bay2Game katalog javobida o'yinlar ro'yxati topilmadi: keys=%s", list(data.keys()))
+    return []
+
+
+def bay2game_game_internal_id(game_code, name=""):
+    """PUBG/ML eski IDlarini saqlaydi, qolgan API o'yinlariga barqaror ID beradi."""
+    label = re.sub(r"[^a-z0-9]", "", str(name or "").lower())
+    code = str(game_code or "").strip()
+    if "pubg" in label:
+        return PUBG_GAME_ID
+    if "mobilelegends" in label or "mobilelegend" in label or label in ("mlbb",):
+        return MOBILE_LEGENDS_GAME_ID
+    if "grandmobile" in label:
+        return GRAND_MOBILE_GAME_ID
+    return bay2game_internal_id(code)
 
 
 def _field_names(game_fields):
@@ -2446,15 +2476,47 @@ def sync_catalog():
     finally:
         c.close()
 
+    # PUBG umumiy katalog javobida tushib qolsa, API qidiruvi orqali ham izlaymiz.
+    pubg_in_catalog = any(
+        isinstance(item, dict) and "pubg" in str(
+            item.get("name") or item.get("game_name") or item.get("category_name") or item.get("title") or ""
+        ).lower()
+        for item in categories
+    )
+    if not pubg_in_catalog:
+        for path in ("/categories", "/games"):
+            st, response = bay2game_request(path, {"search": "pubg", "q": "pubg"})
+            if st and response.get("ok"):
+                options = []
+                for key in ("categories", "games", "items", "results", "data"):
+                    val = response.get(key)
+                    if isinstance(val, list):
+                        options.extend(x for x in val if isinstance(x, dict))
+                    elif isinstance(val, dict):
+                        for inner in ("categories", "games", "items", "results", "data"):
+                            sub = val.get(inner)
+                            if isinstance(sub, list):
+                                options.extend(x for x in sub if isinstance(x, dict))
+                pubg_options = [x for x in options if "pubg" in str(x.get("name") or x.get("game_name") or x.get("category_name") or x.get("title") or "").lower()]
+                if pubg_options:
+                    categories.extend(pubg_options)
+                    break
+
     for category in categories:
         if not isinstance(category, dict):
             continue
-        game_code = str(category.get("game_code") or "").strip()
+        game_code = str(
+            category.get("game_code") or category.get("category_code") or
+            category.get("code") or category.get("id") or ""
+        ).strip()
+        name = str(
+            category.get("name") or category.get("game_name") or
+            category.get("category_name") or category.get("title") or game_code
+        ).strip()
         if not game_code:
             continue
-        gid = bay2game_internal_id(game_code)
-        name = str(category.get("name") or category.get("game_name") or game_code)
-        fields = category.get("game_fields") or []
+        gid = bay2game_game_internal_id(game_code, name)
+        fields = category.get("game_fields") or category.get("fields") or category.get("required_fields") or []
         names = _field_names(fields)
         requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
         id_label = "User ID" if "userid" in names else "Player ID"
@@ -3325,8 +3387,8 @@ async def games(update, context):
     if not rows:
         await q.message.reply_text(
             "❌ O'yinlar topilmadi.\n\n"
-            "🔄 Bay2Game katalogini yangilashda xatolik bo'ldi.\n"
-            "👑 Admin paneldagi 🔄 Katalog tugmasini ham bosib ko'ring."
+            "🔄 O'yinlar katalogini yuklashda xatolik bo'ldi.\n"
+            "Iltimos, keyinroq qayta urinib ko'ring."
         )
         return
 
@@ -3411,7 +3473,7 @@ async def game(update, context):
     if not g:
         await q.message.reply_text(
             "❌ O'yin topilmadi.\n\n"
-            "👑 Admin paneldan 🔄 Katalog tugmasini bosib yangilang."
+            "Iltimos, keyinroq tugmasini bosib yangilang."
         )
         return
 
@@ -3561,9 +3623,9 @@ async def offer(update, context):
     if not r:
 
         await q.message.reply_text(
-            "❌ Paket katalogda topilmadi.\n\n"
-            "👑 Admin paneldan 🔄 Katalog "
-            "tugmasini bosib katalogni yangilang."
+            "❌ Paket hozir mavjud emas.\n\n"
+            "Iltimos, keyinroq "
+            "qayta urinib ko'ring."
         )
 
         return
@@ -4032,7 +4094,7 @@ async def confirm(update, context):
         f"🆔 {id_label}: {player_id}\n"
         f"{user_extra}"
         f"💰 {price:,.0f} so'm\n"
-        f"🔢 Bay2Game reference: {playpay_id}\n"
+        f"🔢 Buyurtma raqami: {playpay_id}\n"
         f"📊 Status: {order_status}",
         reply_markup=main_menu()
     )
@@ -4058,7 +4120,7 @@ async def confirm(update, context):
             )
             +
             f"💰 Sotuv: {price:,.0f} so'm\n"
-            f"🔢 Bay2Game reference: {playpay_id}\n"
+            f"🔢 Buyurtma raqami: {playpay_id}\n"
             f"📊 {order_status}\n"
             f"💵 API charged: {charged_usd} USD"
         )
@@ -6982,14 +7044,14 @@ async def admin_callback(update, context):
                 f"💱 Valyuta: {currency}\n"
                 f"💱 Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm"
                 f"{profile_text}\n\n"
-                "✨ Balansni to'ldirish yoki buyurtmalar tarixini ko'rish uchun Bay2Game profilidan foydalaning.\n"
-                "💡 Yordam kerakmi? Bay2Game qo'llab-quvvatlash xizmatiga murojaat qiling."
+                "✨ Xizmat balansini boshqarish uchun administrator bilan bog'laning.\n"
+                "💡 Yordam kerak bo'lsa, qo'llab-quvvatlashga yozing."
             )
 
         else:
 
             await q.message.reply_text(
-                "❌ Bay2Game balansini olishda xato:\n"
+                "❌ Xizmat balansini olishda xatolik yuz berdi:\n"
                 f"{data.get('error','API xatosi')}"
             )
 
