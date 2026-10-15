@@ -95,7 +95,9 @@ PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 # PayStars: Telegram Stars / Premium
 PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
 PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
-PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
+PAYSTARS_MARKUP_PERCENT = Decimal(os.getenv("PAYSTARS_MARKUP_PERCENT", "4.5"))
+# PayStars USD narxini botdagi UZS balansiga o'tkazish kursi.
+PAYSTARS_USD_UZS = Decimal(os.getenv("PAYSTARS_USD_UZS", os.getenv("BAY2GAME_USD_UZS", "13000")))
 
 # SIM ustamasi sozlamasi
 SIM_MARKUP_PERCENT = Decimal(os.getenv("SIM_MARKUP_PERCENT", "35"))
@@ -1082,19 +1084,22 @@ def bot_admin_id(context):
     return child_owner_id(context.bot.id) if is_child_bot(context) else ADMIN_ID
 
 
-async def notify_bot_owner_technical(context, user_id=None):
-    """Child bot egasiga provider/API nomini ko'rsatmasdan texnik xabar yuboradi."""
+async def notify_bot_owner_technical(context, user_id=None, details=None):
+    """Bot egasiga texnik xabar yuboradi; mijozga maxfiy API tafsilotlari ko'rsatilmaydi."""
     try:
         owner_id = int(bot_admin_id(context) or 0)
         if not owner_id or (user_id is not None and int(owner_id) == int(user_id)):
             return
+        detail_text = str(details or "").strip()
+        if len(detail_text) > 700:
+            detail_text = detail_text[:700] + "..."
         await context.bot.send_message(
             chat_id=owner_id,
             text=(
-                "⚠️ Texnik nosozlik\n\n"
-                "Ulangan botda buyurtmani bajarish vaqtida muammo yuz berdi.\n"
-                "Xizmat vaqtincha ishlamayapti yoki balans yetarli emas.\n"
-                "Iltimos, tekshirib ko'ring."
+                "⚠️ Avtomatik buyurtma bajarilmadi.\n\n"
+                "Ulangan botda buyurtma API tomonidan qabul qilinmadi.\n"
+                "Balans, API kaliti, katalogdagi mahsulot kodi va Render loglarini tekshiring."
+                + (f"\n\n🔎 Xato tafsiloti: {detail_text}" if detail_text else "")
             )
         )
     except Exception:
@@ -1476,28 +1481,66 @@ def ps_check_user(username, kind):
     )
 
 
-def ps_buy_stars(username, quantity, token):
-    return ps_post(
-        "/stars/buy",
-        {
-            "username": username,
-            "quantity": quantity,
-            "verification_token": token,
-        },
-        "stars_" + str(uuid.uuid4()),
-    )
+def ps_quote(username, kind, quantity=None, months=None):
+    """PayStars'dan aynan shu foydalanuvchi/xizmat uchun USD quote oladi."""
+    name = ps_normalize_username(username)
+    if kind not in ("stars", "premium"):
+        raise ValueError("Quote turi noto'g'ri")
+    payload = {"kind": kind, "username": name}
+    if kind == "stars":
+        quantity = int(quantity or 0)
+        if quantity < 50:
+            raise ValueError("Minimal 50 Stars")
+        payload["quantity"] = quantity
+    else:
+        months = int(months or 0)
+        if months not in (3, 6, 12):
+            raise ValueError("Premium muddati 3, 6 yoki 12 bo'lishi kerak")
+        payload["months"] = months
+    data = ps_post("/usd/quote", payload)
+    try:
+        usd = Decimal(str(data["usd"]))
+    except (KeyError, InvalidOperation, TypeError):
+        raise RuntimeError("PayStars quote javobida usd narxi yo'q")
+    if not usd.is_finite() or usd <= 0:
+        raise RuntimeError("PayStars noto'g'ri narx qaytardi")
+    return usd
 
 
-def ps_buy_premium(username, months, token):
-    return ps_post(
-        "/premium/buy",
-        {
-            "username": username,
-            "months": months,
-            "verification_token": token,
-        },
-        "premium_" + str(uuid.uuid4()),
-    )
+def ps_quote_to_uzs(usd, kind="stars"):
+    """USD quote'ni UZSga o'tkazib, ustama qo'shadi."""
+    rate = Decimal(str(PAYSTARS_USD_UZS))
+    if not rate.is_finite() or rate <= 0:
+        raise RuntimeError("PAYSTARS_USD_UZS kursi noto'g'ri sozlangan")
+    base_uzs = Decimal(str(usd)) * rate
+    key = "stars_markup_percent" if kind == "stars" else "premium_markup_percent"
+    try:
+        markup = Decimal(str(get_setting(key, PAYSTARS_MARKUP_PERCENT)))
+    except Exception:
+        markup = PAYSTARS_MARKUP_PERCENT
+    if not markup.is_finite() or markup < 0:
+        markup = PAYSTARS_MARKUP_PERCENT
+    return int((base_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1")))
+
+
+def ps_buy_stars(username, quantity, token, max_usd, idempotency_key):
+    return ps_post("/stars/buy", {
+        "username": ps_normalize_username(username),
+        "quantity": int(quantity),
+        "verification_token": token,
+        "currency": "USD",
+        "max_usd": float(Decimal(str(max_usd))),
+    }, idempotency_key)
+
+
+def ps_buy_premium(username, months, token, max_usd, idempotency_key):
+    return ps_post("/premium/buy", {
+        "username": ps_normalize_username(username),
+        "months": int(months),
+        "verification_token": token,
+        "currency": "USD",
+        "max_usd": float(Decimal(str(max_usd))),
+    }, idempotency_key)
 
 
 def ps_sell(value, kind="stars"):
@@ -1510,7 +1553,8 @@ def ps_sell(value, kind="stars"):
 
 
 def ps_pricing():
-    return ps_account().get("pricing", {})
+    # Unified API v3: GET /account pricing may not be returned.
+    return ps_account()
 
 
 def save_external_order(
@@ -1590,22 +1634,12 @@ def paystars_kb():
 
 async def paystars_menu(update, context):
     q = update.callback_query
-    try:
-        p = await asyncio.to_thread(ps_pricing)
-        star = ps_sell(p.get("star_price", 0), "stars")
-        p3 = ps_sell(p.get("premium_3_price", 0), "premium")
-        p6 = ps_sell(p.get("premium_6_price", 0), "premium")
-        p12 = ps_sell(p.get("premium_12_price", 0), "premium")
-        text = (
-            "⭐ <b>Telegram xizmatlari</b>\n\n"
-            f"⭐ 1 Stars: {star:,.0f} so'm\n"
-            "⭐ Minimal: 50 Stars\n\n"
-            f"💎 Premium 3 oy: {p3:,.0f} so'm\n"
-            f"💎 Premium 6 oy: {p6:,.0f} so'm\n"
-            f"💎 Premium 12 oy: {p12:,.0f} so'm"
-        )
-    except Exception:
-        text = "⭐ Telegram Stars va 💎 Telegram Premium"
+    text = (
+        "⭐ <b>Telegram xizmatlari</b>\n\n"
+        "⭐ Telegram Stars — minimal 50 ta\n"
+        "💎 Telegram Premium — 3, 6 yoki 12 oy\n\n"
+        "💰 Aniq narx username va miqdor kiritilgandan keyin PayStars API'dan olinadi."
+    )
     await q.message.reply_text(text, parse_mode="HTML", reply_markup=paystars_kb())
 
 
@@ -1676,10 +1710,14 @@ async def ps_confirm(update, context, kind):
 
     add_balance(uid, -price, "purchase", f"PayStars {label}")
     try:
+        quote_usd = Decimal(str(context.user_data.get("ps_quote_usd", "0")))
+        idem_key = str(context.user_data.get("ps_idempotency_key") or "")
+        if quote_usd <= 0 or not idem_key:
+            raise RuntimeError("Quote yoki idempotency kaliti topilmadi")
         result = await asyncio.to_thread(
-            ps_buy_stars, username, quantity, token
+            ps_buy_stars, username, quantity, token, quote_usd, idem_key
         ) if kind == "stars" else await asyncio.to_thread(
-            ps_buy_premium, username, months, token
+            ps_buy_premium, username, months, token, quote_usd, idem_key
         )
         oid = str(result.get("order_id", ""))
         status = str(result.get("status", "processing"))
@@ -1720,8 +1758,9 @@ async def paystars_balance_admin(update, context):
             "❌ PAYSTARS_API_KEY Environment Variable sozlanmagan."
         )
     try:
-        data = await asyncio.to_thread(ps_account)
-        await q.message.reply_text(str(data))
+        data = await asyncio.to_thread(ps_get, "/usd/wallet")
+        usd = (data.get("usd") or {}).get("balance", "Noma'lum")
+        await q.message.reply_text(f"PayStars USD balans: ${usd}")
     except Exception:
         await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
 
@@ -1987,7 +2026,14 @@ def bay2game_request(path, params=None):
             status_value = str(data.get("status", "")).lower()
             explicit_failure = data.get("success") is False
             data["ok"] = (not explicit_failure) and status_value not in ("error", "failed", "failure") and not data.get("error")
-        log.info("Bay2Game %s status=%s", path, response.status_code)
+        log.info(
+            "Provider API request path=%s HTTP=%s status=%s ok=%s error=%s",
+            path,
+            response.status_code,
+            str(data.get("status", ""))[:80],
+            data.get("ok"),
+            str(data.get("error") or data.get("message") or "")[:300],
+        )
         return response.status_code, data
     except Exception as exc:
         log.exception("Bay2Game API so'rovi xatosi: %s", path)
@@ -2169,16 +2215,20 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    # Bay2Game hujjatlarida alohida check-ID endpointi yo'q. Shuning uchun ID oldindan
-    # tekshirilmaydi; buyurtma API ga yuborilganda provider tekshiradi.
+    """Faqat kiritilgan ID mavjudligini tekshiradi; o'yinchi nickini tasdiqlamaydi.
+
+    Hozirgi buyurtma API adapterida ID->nickname tekshiruv endpointi yo'q.
+    Shuning uchun IDni nickname deb ko'rsatish yoki valid=True deb yolg'on
+    tasdiqlash mumkin emas.
+    """
     player_id = str(player_id or "").strip()
     if not player_id:
         return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
     return 200, {
         "ok": True,
-        "valid": True,
-        "player_name": player_id,
-        "message": "Bay2Game IDni oldindan tekshirmaydi; ID buyurtmada yuboriladi.",
+        "valid": None,
+        "player_name": "",
+        "message": "Nickname tekshiruvi bu API orqali qo'llab-quvvatlanmaydi.",
         "validation_supported": False,
     }
 
@@ -2196,9 +2246,21 @@ def bay2game_create_order(product_code, player_id, server_id=""):
     nested = raw.get("data") if isinstance(raw.get("data"), dict) else raw
     payload = nested.get("order") if isinstance(nested.get("order"), dict) else nested
     order_status = str(payload.get("status") or nested.get("status") or raw.get("status") or "processing").lower()
-    failed = (status < 200 or status >= 300 or not raw.get("ok") or order_status in ("failed", "failure", "error"))
+    failed = (
+        status < 200 or status >= 300 or not raw.get("ok")
+        or order_status in ("failed", "failure", "error", "rejected", "cancelled")
+    )
     if failed:
-        return status, {"ok": False, "error": raw.get("error") or raw.get("message") or "Bay2Game buyurtmani qabul qilmadi.", "raw": raw}
+        error_text = str(
+            raw.get("error") or raw.get("message") or
+            nested.get("error") or nested.get("message") or
+            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
+        )
+        log.error(
+            "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
+            status, order_status, error_text[:500], list(raw.keys())
+        )
+        return status, {"ok": False, "error": error_text, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -3460,7 +3522,8 @@ async def games(update, context):
                     CASE
                         WHEN game_id=? THEN 0
                         WHEN game_id=? THEN 1
-                        ELSE 2
+                        WHEN game_id=? THEN 2
+                        ELSE 3
                     END,
                     name
                 """,
@@ -3981,16 +4044,9 @@ async def confirm(update, context):
 
         return
 
-    # Buyurtma yuborilishidan oldin Bay2Game uchun ID oldindan tekshirilmaydi; buyurtma API orqali yuboriladi.
-    player_name = str(
-        context.user_data.get("player_name", "")
-    ).strip()
-
-    if not player_name:
-        await q.message.reply_text(
-            "❌ ID hali tekshirilmagan. Iltimos, ID ni qaytadan yuboring."
-        )
-        return
+    # Nickname tekshiruvi mavjud bo'lmagan o'yinlarda ham buyurtma oqimi ishlaydi.
+    # Muhimi: tekshirilmagan IDni nickname sifatida ko'rsatmaymiz.
+    player_name = str(context.user_data.get("player_name", "")).strip()
 
     if game_id is None or paket_id is None:
 
@@ -4053,7 +4109,11 @@ async def confirm(update, context):
             reply_markup=main_menu()
         )
 
-        await notify_bot_owner_technical(context, uid)
+        await notify_bot_owner_technical(
+            context,
+            uid,
+            details=data.get("error") or data.get("message") or f"HTTP status: {status}",
+        )
 
         return
 
@@ -4484,12 +4544,16 @@ async def text_handler(update, context):
             await update.message.reply_text("❌ Minimal 50 Stars.")
             return
         try:
-            pricing = await asyncio.to_thread(ps_pricing)
-            price = ps_sell(float(pricing.get("star_price", 0)) * quantity, "stars")
+            usd_quote = await asyncio.to_thread(
+                ps_quote, context.user_data["ps_username"], "stars", quantity, None
+            )
+            price = ps_quote_to_uzs(usd_quote, "stars")
             if price <= 0:
-                raise RuntimeError
+                raise RuntimeError("Narx noto'g'ri")
             context.user_data["ps_quantity"] = quantity
+            context.user_data["ps_quote_usd"] = str(usd_quote)
             context.user_data["ps_price"] = price
+            context.user_data["ps_idempotency_key"] = "stars_" + str(uuid.uuid4())
             context.user_data["state"] = None
             await update.message.reply_text(
                 f"⭐ Stars\n\n"
@@ -4526,13 +4590,17 @@ async def text_handler(update, context):
             token = r.get("verification_token")
             if not token:
                 raise RuntimeError("Verification token qaytmadi")
-            pricing = await asyncio.to_thread(ps_pricing)
-            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)), "premium")
+            context.user_data["ps_username"] = r.get("username") or name
+            usd_quote = await asyncio.to_thread(
+                ps_quote, context.user_data["ps_username"], "premium", None, months
+            )
+            price = ps_quote_to_uzs(usd_quote, "premium")
             if price <= 0:
-                raise RuntimeError
-            context.user_data["ps_username"] = name
+                raise RuntimeError("Narx noto'g'ri")
             context.user_data["ps_token"] = r.get("verification_token")
+            context.user_data["ps_quote_usd"] = str(usd_quote)
             context.user_data["ps_price"] = price
+            context.user_data["ps_idempotency_key"] = "premium_" + str(uuid.uuid4())
             context.user_data["state"] = None
             await update.message.reply_text(
                 f"💎 Premium\n\n"
@@ -4836,7 +4904,7 @@ async def text_handler(update, context):
 
         if not BAY2GAME_API_KEY:
             await update.message.reply_text(
-                "❌ BAY2GAME_API_KEY sozlanmagan. Render Environment ga Bay2Game API key kiriting."
+                "❌ Xizmat vaqtincha sozlanmagan. Iltimos, keyinroq qayta urinib ko'ring."
             )
             context.user_data["state"] = None
             return
@@ -4854,7 +4922,7 @@ async def text_handler(update, context):
 
         if not isinstance(data, dict):
             await update.message.reply_text(
-                "❌ Bay2Game javobi noto'g'ri formatda qaytdi."
+                "❌ Tekshiruv vaqtida xatolik yuz berdi. Iltimos, keyinroq qayta urinib ko'ring."
             )
             context.user_data["state"] = None
             return
@@ -4865,6 +4933,19 @@ async def text_handler(update, context):
                 f"❌ ID tekshirilmadi.\n\n{error}"
             )
             context.user_data["state"] = None
+            return
+
+        # Agar API haqiqiy nickname tekshiruvini qo'llamasa, IDni nickname sifatida
+        # ko'rsatmaymiz va foydalanuvchiga tekshiruv mavjud emasligini ochiq aytamiz.
+        if data.get("validation_supported") is False:
+            context.user_data.pop("player_name", None)
+            context.user_data["state"] = None
+            await update.message.reply_text(
+                "⚠️ ID formati qabul qilindi, lekin hisob egasining nickname'ini "
+                "oldindan tekshirish hozircha mavjud emas.\n"
+                "Buyurtmani tasdiqlashdan oldin ID to'g'riligini o'zingiz tekshiring."
+            )
+            await confirm_order(update.message, context)
             return
 
         valid = data.get("valid")
@@ -4887,15 +4968,14 @@ async def text_handler(update, context):
             or data.get("nickname")
             or data.get("name")
             or data.get("username")
-            or player_id
+            or ""
         ).strip()
 
         context.user_data["player_name"] = player_name
         context.user_data["state"] = None
 
         await update.message.reply_text(
-            "✅ ID qabul qilindi.\n"
-            "ℹ️ Bay2Game IDni oldindan tekshirmaydi; tekshiruv buyurtma yuborilganda amalga oshadi.\n\n"
+            "✅ ID qabul qilindi.\n\n"
             f"🆔 ID: <code>{html.escape(player_id)}</code>",
             parse_mode="HTML"
         )
@@ -7443,7 +7523,11 @@ async def text_router(update, context):
     if not await child_platform_access(update, context):
         return
 
-    if update.effective_user.id == bot_admin_id(context):
+    user = update.effective_user
+    if user is None:
+        return
+
+    if user.id == bot_admin_id(context):
 
         handled = await admin_text_handler(
             update,
