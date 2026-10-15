@@ -1,4 +1,127 @@
 import sqlite3
+import re
+import os
+
+# PostgreSQL (Supabase) uchun moslash qatlami. Child botlar alohida SQLite faylida qoladi.
+try:
+    import psycopg2
+    from psycopg2.extras import DictCursor
+except ImportError:
+    psycopg2 = None
+    DictCursor = None
+
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+
+class PGCursor:
+    def __init__(self, cur, last_id=None):
+        self._cur = cur
+        self.lastrowid = last_id
+    def fetchone(self): return self._cur.fetchone()
+    def fetchall(self): return self._cur.fetchall()
+    def __iter__(self): return iter(self._cur)
+    @property
+    def rowcount(self): return self._cur.rowcount
+
+class PGConnection:
+    def __init__(self, url):
+        if not psycopg2:
+            raise RuntimeError("Render Requirements ga psycopg2-binary qo'shing")
+        self._c = psycopg2.connect(url, cursor_factory=DictCursor, connect_timeout=20)
+        self._last_id = None
+    @property
+    def row_factory(self): return None
+    @row_factory.setter
+    def row_factory(self, value): pass
+    def _sql(self, sql):
+        q = sql.strip()
+        if q.upper() == "SELECT LAST_INSERT_ROWID()":
+            return "SELECT %s AS last_insert_rowid", ("last_insert",)
+        if q.upper() == "BEGIN IMMEDIATE":
+            return "BEGIN", False
+        if q.upper().startswith("PRAGMA JOURNAL_MODE") or q.upper().startswith("PRAGMA FOREIGN_KEYS"):
+            return "SELECT 1", False
+        m = re.match(r"PRAGMA\s+table_info\(([^)]+)\)", q, re.I)
+        if m:
+            table=m.group(1).strip('"` ')
+            return ("SELECT ordinal_position AS cid, column_name AS name, data_type AS type, "
+                    "CASE WHEN is_nullable='NO' THEN 1 ELSE 0 END AS notnull, "
+                    "column_default AS dflt_value, 0 AS pk FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=%s ORDER BY ordinal_position", ("table_info", table))
+        q = re.sub(r"INSERT\s+OR\s+IGNORE\s+INTO", "INSERT INTO", q, flags=re.I)
+        ignore = bool(re.search(r"INSERT\s+OR\s+IGNORE", sql, re.I))
+        replace = bool(re.search(r"INSERT\s+OR\s+REPLACE", sql, re.I))
+        q = re.sub(r"INSERT\s+OR\s+REPLACE\s+INTO", "INSERT INTO", q, flags=re.I)
+        if re.match(r"(CREATE|ALTER)\s+", q, re.I):
+            q = pg_schema(q)
+        q = q.replace("?", "%s")
+        if ignore and "ON CONFLICT" not in q.upper():
+            q += " ON CONFLICT DO NOTHING"
+        elif replace and "ON CONFLICT" not in q.upper():
+            mcols = re.search(r'INSERT\s+INTO\s+([\w\"]+)\s*\(([^)]+)\)', q, re.I)
+            if mcols:
+                cols=[x.strip().strip('"') for x in mcols.group(2).split(',')]
+                # For replace semantics, update every supplied column except common key columns.
+                keys={'id','user_id','game_id','paket_id','key','code','token','bot_id','country_code','invited_user_id','payment_id'}
+                upd=[x for x in cols if x.lower() not in keys]
+                if upd:
+                    q += " ON CONFLICT DO UPDATE SET " + ",".join(f'"{x}"=EXCLUDED."{x}"' for x in upd)
+                else:
+                    q += " ON CONFLICT DO NOTHING"
+        return q, False
+    def execute(self, sql, params=()):
+        query, metadata = self._sql(sql)
+        cur=self._c.cursor()
+        if isinstance(metadata, tuple) and metadata and metadata[0] == "last_insert":
+            cur.execute(query, (self._last_id,))
+            return PGCursor(cur)
+        if isinstance(metadata, tuple) and metadata and metadata[0] == "table_info":
+            cur.execute(query, (metadata[1],))
+            return PGCursor(cur)
+        # sqlite lastrowid replacement: ask PostgreSQL to return generated id.
+        is_insert = bool(re.match(r'\s*INSERT\s+INTO\s+([\w\"]+)', query, re.I))
+        table_match = re.match(r'\s*INSERT\s+INTO\s+([\w\"]+)', query, re.I)
+        has_returning = " RETURNING " in query.upper()
+        if is_insert and table_match and not has_returning and not re.search(r"ON CONFLICT DO NOTHING\s*$", query, re.I):
+            table=table_match.group(1).strip('"')
+            # Tables with generated integer ids only; other inserts need no lastrowid.
+            if table.lower() in {'payments','orders','withdrawals','balance_history','omonats','external_orders','web_auth_codes','web_orders'}:
+                query += " RETURNING id"
+        cur.execute(query, params or ())
+        last_id=None
+        if " RETURNING id" in query.upper():
+            row=cur.fetchone()
+            if row:
+                last_id=row['id']
+        if last_id is not None:
+            self._last_id = last_id
+        return PGCursor(cur, last_id)
+    def rollback(self): self._c.rollback()
+    def executescript(self, script):
+        # init_db schema statements are simple CREATE TABLE/INDEX statements.
+        cur=self._c.cursor()
+        for stmt in script.split(';'):
+            stmt=stmt.strip()
+            if stmt: cur.execute(pg_schema(stmt))
+        return PGCursor(cur)
+    def commit(self): self._c.commit()
+    def close(self): self._c.close()
+
+
+def pg_schema(sql):
+    sql=re.sub(r"INTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT", "BIGSERIAL PRIMARY KEY", sql, flags=re.I)
+    sql=re.sub(r"\bREAL\b", "DOUBLE PRECISION", sql, flags=re.I)
+    sql=re.sub(r"\bINTEGER\b", "BIGINT", sql, flags=re.I)
+    return sql
+
+def db_connect(path=None, timeout=30):
+    # Asosiy DB Supabase PostgreSQL; child bot DBlari avvalgidek SQLite.
+    if path == MAIN_DB or path is None:
+        if not DATABASE_URL:
+            raise RuntimeError("Render Environment'da DATABASE_URL yo'q")
+        return PGConnection(DATABASE_URL)
+    c=sqlite3.connect(path, timeout=timeout)
+    c.row_factory=sqlite3.Row
+    return c
 import logging
 import uuid
 import json
@@ -91,7 +214,11 @@ DEFAULT_MARKUP = Decimal("0")
 # Balans to'ldirish kartasi
 PAYMENT_CARD = os.getenv("PAYMENT_CARD", "").strip()
 
-# Telegram Stars/Premium ham Bay2Game katalogi orqali ishlaydi.
+# ===================== QO'SHIMCHA PROVIDERLAR =====================
+# PayStars: Telegram Stars / Premium
+PAYSTARS_API_KEY = os.getenv("PAYSTARS_API_KEY", "").strip()
+PAYSTARS_API = os.getenv("PAYSTARS_API", "https://paystars.uz/api/v1").rstrip("/")
+PAYSTARS_MARKUP_PERCENT = Decimal("4.5")  # Qattiq 4.5% ustama; Render ENV ta'sir qilmaydi
 
 # SIM ustamasi sozlamasi
 SIM_MARKUP_PERCENT = Decimal(os.getenv("SIM_MARKUP_PERCENT", "35"))
@@ -116,7 +243,7 @@ def set_active_db_for_bot(bot_id):
     if int(bot_id or 0) == int(MAIN_BOT_ID or 0):
         CURRENT_DB.set(MAIN_DB)
         return MAIN_DB
-    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c = db_connect(MAIN_DB, timeout=30)
     c.row_factory = sqlite3.Row
     row = c.execute("SELECT db_path FROM child_bots WHERE bot_id=?", (int(bot_id),)).fetchone()
     c.close()
@@ -126,10 +253,8 @@ def set_active_db_for_bot(bot_id):
 
 
 def main_conn():
-    c = sqlite3.connect(MAIN_DB, timeout=30)
+    c = db_connect(MAIN_DB, timeout=30)
     c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("PRAGMA foreign_keys=ON")
     return c
 
 # Render Web Service porti
@@ -694,20 +819,9 @@ def start_health_server():
 
 def conn():
 
-    c = sqlite3.connect(
-        active_db(),
-        timeout=30
-    )
+    c = db_connect(active_db(), timeout=30)
 
     c.row_factory = sqlite3.Row
-
-    c.execute(
-        "PRAGMA journal_mode=WAL"
-    )
-
-    c.execute(
-        "PRAGMA foreign_keys=ON"
-    )
 
     return c
 
@@ -867,7 +981,10 @@ def init_db():
     )
     set_default("donat_markup_percent", DEFAULT_MARKUP)
     set_default("bay2game_usd_uzs", os.getenv("BAY2GAME_USD_UZS", "13000"))
+    set_default("stars_markup_percent", PAYSTARS_MARKUP_PERCENT)
+    set_default("premium_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
+    set_default("paystars_markup_percent", PAYSTARS_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
 
     if active_db() == MAIN_DB:
@@ -1392,6 +1509,123 @@ async def admin_bot_detail(update, context, bot_id):
     await q.message.reply_text(text,parse_mode="HTML",reply_markup=InlineKeyboardMarkup(kb))
 
 
+# ============================================================
+# PAYSTARS API
+# ============================================================
+def ps_headers(idempotency_key=None):
+    h = {
+        "X-API-Key": PAYSTARS_API_KEY,
+        "Content-Type": "application/json",
+    }
+    if idempotency_key:
+        h["Idempotency-Key"] = idempotency_key
+    return h
+
+
+def ps_get(path):
+    r = requests.get(
+        PAYSTARS_API + path,
+        headers=ps_headers(),
+        timeout=25
+    )
+    try:
+        data = r.json()
+    except Exception:
+        data = {"detail": r.text[:500]}
+    if not r.ok:
+        raise RuntimeError(f"PayStars HTTP {r.status_code}")
+    return data
+
+
+def ps_post(path, payload, key=None):
+    if not PAYSTARS_API_KEY:
+        raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+
+    r = requests.post(
+        PAYSTARS_API + path,
+        headers=ps_headers(key),
+        json=payload,
+        timeout=30
+    )
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"detail": r.text[:500]}
+
+    if not r.ok:
+        # API javobidagi foydali xabarni yo'qotmaslik uchun
+        # status + xavfsiz detail qaytaramiz. API key hech qachon chiqmaydi.
+        detail = data.get("detail", data) if isinstance(data, dict) else data
+        if isinstance(detail, dict):
+            msg = detail.get("message") or detail.get("error") or detail.get("code") or str(detail)
+        else:
+            msg = str(detail)
+        raise RuntimeError(f"PayStars HTTP {r.status_code}: {msg[:300]}")
+
+    if not isinstance(data, dict):
+        raise RuntimeError("PayStars noto'g'ri JSON javob qaytardi")
+    return data
+
+
+def ps_normalize_username(value):
+    name = str(value or "").strip().lstrip("@").strip()
+    if not name or " " in name or len(name) > 64:
+        raise ValueError("Username noto'g'ri")
+    return name
+
+
+def ps_account():
+    return ps_get("/account")
+
+
+def ps_check_user(username, kind):
+    name = ps_normalize_username(username)
+    if kind not in ("stars", "premium"):
+        raise ValueError("Username tekshirish turi noto'g'ri")
+    return ps_post(
+        "/check-username",
+        {"username": name, "kind": kind}
+    )
+
+
+def ps_buy_stars(username, quantity, token):
+    return ps_post(
+        "/stars/buy",
+        {
+            "username": username,
+            "quantity": quantity,
+            "verification_token": token,
+        },
+        "stars_" + str(uuid.uuid4()),
+    )
+
+
+def ps_buy_premium(username, months, token):
+    return ps_post(
+        "/premium/buy",
+        {
+            "username": username,
+            "months": months,
+            "verification_token": token,
+        },
+        "premium_" + str(uuid.uuid4()),
+    )
+
+
+def ps_sell(value, kind="stars"):
+    key = "stars_markup_percent" if kind == "stars" else "premium_markup_percent"
+    try:
+        markup = Decimal(str(get_setting(key, PAYSTARS_MARKUP_PERCENT)))
+    except Exception:
+        markup = PAYSTARS_MARKUP_PERCENT
+    return round(float(value) * (1 + float(markup) / 100), 2)
+
+
+def ps_pricing():
+    return ps_account().get("pricing", {})
+
+
 def save_external_order(
     user_id,
     provider,
@@ -1448,6 +1682,161 @@ def save_external_order(
         c.commit()
     finally:
         c.close()
+
+
+# ============================================================
+# PAYSTARS UI / FLOW
+# ============================================================
+def paystars_kb():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⭐ Telegram Stars", callback_data="ps_stars"),
+        ],
+        [
+            InlineKeyboardButton("💎 Telegram Premium", callback_data="ps_premium"),
+        ],
+        [
+            InlineKeyboardButton("🔙 Orqaga", callback_data="back_home"),
+        ],
+    ])
+
+
+async def paystars_menu(update, context):
+    q = update.callback_query
+    try:
+        p = await asyncio.to_thread(ps_pricing)
+        star = ps_sell(p.get("star_price", 0), "stars")
+        p3 = ps_sell(p.get("premium_3_price", 0), "premium")
+        p6 = ps_sell(p.get("premium_6_price", 0), "premium")
+        p12 = ps_sell(p.get("premium_12_price", 0), "premium")
+        text = (
+            "⭐ <b>Telegram xizmatlari</b>\n\n"
+            f"⭐ 1 Stars: {star:,.0f} so'm\n"
+            "⭐ Minimal: 50 Stars\n\n"
+            f"💎 Premium 3 oy: {p3:,.0f} so'm\n"
+            f"💎 Premium 6 oy: {p6:,.0f} so'm\n"
+            f"💎 Premium 12 oy: {p12:,.0f} so'm"
+        )
+    except Exception:
+        text = "⭐ Telegram Stars va 💎 Telegram Premium"
+    await q.message.reply_text(text, parse_mode="HTML", reply_markup=paystars_kb())
+
+
+async def ps_stars_start(update, context):
+    q = update.callback_query
+    context.user_data.clear()
+    context.user_data["state"] = "ps_stars_username"
+    await q.message.reply_text(
+        "⭐ Stars\n\n@username yuboring:"
+    )
+
+
+async def ps_premium_start(update, context):
+    q = update.callback_query
+    context.user_data.clear()
+    context.user_data["state"] = "ps_premium_month"
+    await q.message.reply_text(
+        "💎 Premium muddatini tanlang:",
+        reply_markup=InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("3 oy", callback_data="ps_pm_3"),
+                InlineKeyboardButton("6 oy", callback_data="ps_pm_6"),
+            ],
+            [InlineKeyboardButton("12 oy", callback_data="ps_pm_12")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")],
+        ])
+    )
+
+
+async def ps_premium_month(update, context):
+    q = update.callback_query
+    months = int(q.data.rsplit("_", 1)[1])
+    context.user_data["state"] = "ps_premium_username"
+    context.user_data["ps_months"] = months
+    await q.message.reply_text("👤 Premium kimga?\n\n@username yuboring:")
+
+
+async def ps_confirm(update, context, kind):
+    q = update.callback_query
+    uid = q.from_user.id
+    if kind == "stars":
+        username = context.user_data.get("ps_username")
+        quantity = int(context.user_data.get("ps_quantity", 0))
+        months = 0
+        token = context.user_data.get("ps_token")
+        price = float(context.user_data.get("ps_price", 0))
+        label = f"⭐ {quantity} Stars"
+    else:
+        username = context.user_data.get("ps_username")
+        quantity = 0
+        months = int(context.user_data.get("ps_months", 0))
+        token = context.user_data.get("ps_token")
+        price = float(context.user_data.get("ps_price", 0))
+        label = f"💎 Premium {months} oy"
+
+    if not username or not token or price <= 0:
+        await q.message.reply_text("❌ Buyurtma ma'lumotlari eskirgan.")
+        context.user_data.clear()
+        return
+
+    if get_balance(uid) < Decimal(str(price)):
+        await q.message.reply_text(
+            f"❌ Balans yetarli emas.\n"
+            f"Kerak: {price:,.0f} so'm\n"
+            f"Balans: {get_balance(uid):,.0f} so'm"
+        )
+        return
+
+    add_balance(uid, -price, "purchase", f"PayStars {label}")
+    try:
+        result = await asyncio.to_thread(
+            ps_buy_stars, username, quantity, token
+        ) if kind == "stars" else await asyncio.to_thread(
+            ps_buy_premium, username, months, token
+        )
+        oid = str(result.get("order_id", ""))
+        status = str(result.get("status", "processing"))
+        if not oid:
+            raise RuntimeError("PayStars order_id qaytarmadi")
+
+        save_external_order(
+            uid, "paystars", kind, oid, username,
+            quantity, months, price, status
+        )
+        await q.message.reply_text(
+            f"✅ <b>Buyurtma qabul qilindi!</b>\n\n"
+            f"🆔 <code>{oid}</code>\n"
+            f"👤 @{username}\n"
+            f"{label}\n"
+            f"💰 {price:,.0f} so'm\n"
+            f"📊 {status}",
+            parse_mode="HTML"
+        )
+        context.user_data.clear()
+    except Exception:
+        add_balance(uid, price, "refund", f"PayStars {label} refund")
+        await notify_bot_owner_technical(context, uid)
+        await q.message.reply_text(
+            "❌ Buyurtmani bajarib bo'lmadi.\n\n"
+            "🛠 Texnik nosozlik. Birozdan keyin qayta urinib ko'ring.\n"
+            "💰 Balansingiz qaytarildi."
+        )
+        context.user_data.clear()
+
+
+async def paystars_balance_admin(update, context):
+    q = update.callback_query
+    if q.from_user.id != bot_admin_id(context):
+        return
+    if not PAYSTARS_API_KEY:
+        return await q.message.reply_text(
+            "❌ PAYSTARS_API_KEY Environment Variable sozlanmagan."
+        )
+    try:
+        data = await asyncio.to_thread(ps_account)
+        await q.message.reply_text(str(data))
+    except Exception:
+        await q.message.reply_text("❌ PayStars balansini olishda xatolik.")
 
 
 # ============================================================
@@ -2365,10 +2754,7 @@ def sync_catalog():
         fields = category.get("game_fields") or category.get("gameFields") or category.get("fields") or category.get("required_fields") or category.get("input_fields") or []
         names = _field_names(fields)
         requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
-        if any(k in name.lower() for k in ("telegram", "stars", "premium")):
-            id_label = "Telegram username"
-        else:
-            id_label = "User ID" if "userid" in names else "Player ID"
+        id_label = "User ID" if "userid" in names else "Player ID"
         try:
             c = conn()
             c.execute(
@@ -2745,7 +3131,7 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
-        [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="bay2game_telegram")],
+        [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="paystars")],
         # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
         # xarid oqimi menyuda ko'rsatilmaydi.
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
@@ -2823,6 +3209,7 @@ def admin_kb(context=None):
         rows.insert(6, [InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")])
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
         rows.append([InlineKeyboardButton("🔐 Bay2Game balansi", callback_data="adm_playpay_balance")])
+        rows.append([InlineKeyboardButton("⭐ PayStars balansi", callback_data="adm_paystars_balance")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3243,40 +3630,6 @@ async def games(update, context):
     )
 
 
-async def bay2game_telegram_menu(update, context):
-    """Telegram Stars/Premium xizmatlarini Bay2Game katalogidan chiqaradi."""
-    q = update.callback_query
-    try:
-        await q.answer()
-    except Exception:
-        pass
-    c = conn()
-    rows = c.execute(
-        "SELECT game_id, name FROM games WHERE active=1 ORDER BY name"
-    ).fetchall()
-    c.close()
-    matches = [r for r in rows if any(k in str(r["name"]).lower() for k in ("telegram", "stars", "premium"))]
-    if not matches:
-        # Katalogni yangilab bir marta qayta qidiramiz.
-        try:
-            await asyncio.to_thread(sync_catalog)
-        except Exception:
-            log.exception("Bay2Game Telegram katalogini yangilash xatosi")
-        c = conn()
-        rows = c.execute("SELECT game_id, name FROM games WHERE active=1 ORDER BY name").fetchall()
-        c.close()
-        matches = [r for r in rows if any(k in str(r["name"]).lower() for k in ("telegram", "stars", "premium"))]
-    if not matches:
-        await q.message.reply_text(
-            "❌ Bay2Game katalogida Telegram Stars yoki Premium mahsuloti topilmadi.\n\n"
-            "Bay2Game panelida bu xizmatlar mavjudligini va API katalogiga chiqarilganini tekshiring.",
-            reply_markup=main_menu()
-        )
-        return
-    kb = [[InlineKeyboardButton("⭐/💎 " + str(r["name"]), callback_data=f"g:{r['game_id']}")] for r in matches[:100]]
-    await q.message.reply_text("⭐ Telegram Stars / 💎 Premium\n\nXizmatni tanlang:", reply_markup=InlineKeyboardMarkup(kb))
-
-
 # ============================================================
 # GAME PACKAGES
 # BU YERDA API'DAN OLINMAYDI
@@ -3479,8 +3832,6 @@ async def offer(update, context):
             if g
             else "Player ID"
         )
-        if g and any(k in str(g["name"]).lower() for k in ("telegram", "stars", "premium")):
-            id_label = "Telegram username"
 
         requires_server = (
             bool(g["requires_server"])
@@ -4217,6 +4568,130 @@ async def text_handler(update, context):
                 [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]
             ])
         )
+        return
+
+    # ========================================================
+    # PAYSTARS: STARS USERNAME
+    # ========================================================
+    if state == "ps_stars_username":
+        name = text.lstrip("@")
+        if not name or " " in name or len(name) > 64:
+            await update.message.reply_text("❌ Username noto'g'ri. Masalan: @username")
+            return
+        try:
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+            r = await asyncio.to_thread(ps_check_user, name, "stars")
+            if not r.get("valid"):
+                reason = r.get("detail") or r.get("message") or "Bu username Stars uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
+            context.user_data["ps_username"] = r.get("username") or name
+            context.user_data["ps_token"] = token
+            context.user_data["state"] = "ps_stars_quantity"
+            nickname = r.get("nickname")
+            extra = f"\n👤 {nickname}" if nickname else ""
+            await update.message.reply_text(f"✅ Username tasdiqlandi: @{context.user_data['ps_username']}{extra}\n\n🔢 Nechta Stars?\n\nMinimal: 50")
+        except Exception as e:
+            log.warning("PayStars Stars username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Stars uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
+            await update.message.reply_text(user_msg)
+        return
+
+    if state == "ps_stars_quantity":
+        try:
+            quantity = int(text.replace(" ", ""))
+        except Exception:
+            await update.message.reply_text("❌ Faqat son yuboring.")
+            return
+        if quantity < 50:
+            await update.message.reply_text("❌ Minimal 50 Stars.")
+            return
+        try:
+            pricing = await asyncio.to_thread(ps_pricing)
+            price = ps_sell(float(pricing.get("star_price", 0)) * quantity, "stars")
+            if price <= 0:
+                raise RuntimeError
+            context.user_data["ps_quantity"] = quantity
+            context.user_data["ps_price"] = price
+            context.user_data["state"] = None
+            await update.message.reply_text(
+                f"⭐ Stars\n\n"
+                f"👤 @{context.user_data['ps_username']}\n"
+                f"⭐ {quantity}\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                "Tasdiqlaysizmi?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_stars"),
+                    InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
+                ]])
+            )
+        except Exception:
+            await update.message.reply_text("❌ Stars narxini olishda xatolik.")
+        return
+
+    # ========================================================
+    # PAYSTARS: PREMIUM USERNAME
+    # ========================================================
+    if state == "ps_premium_username":
+        name = text.lstrip("@")
+        months = int(context.user_data.get("ps_months", 0))
+        if not name or " " in name or months not in (3, 6, 12):
+            await update.message.reply_text("❌ Username noto'g'ri.")
+            return
+        try:
+            if not PAYSTARS_API_KEY:
+                raise RuntimeError("PAYSTARS_API_KEY sozlanmagan")
+            r = await asyncio.to_thread(ps_check_user, name, "premium")
+            if not r.get("valid"):
+                reason = r.get("detail") or r.get("message") or "Bu username Premium uchun yaroqsiz."
+                raise RuntimeError(str(reason)[:250])
+            token = r.get("verification_token")
+            if not token:
+                raise RuntimeError("Verification token qaytmadi")
+            pricing = await asyncio.to_thread(ps_pricing)
+            price = ps_sell(float(pricing.get(f"premium_{months}_price", 0)), "premium")
+            if price <= 0:
+                raise RuntimeError
+            context.user_data["ps_username"] = name
+            context.user_data["ps_token"] = r.get("verification_token")
+            context.user_data["ps_price"] = price
+            context.user_data["state"] = None
+            await update.message.reply_text(
+                f"💎 Premium\n\n"
+                f"👤 @{name}\n"
+                f"💎 {months} oy\n"
+                f"💰 {price:,.0f} so'm\n"
+                f"💳 Balans: {float(get_balance(u.id)):,.0f} so'm\n\n"
+                "Tasdiqlaysizmi?",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Tasdiqlash", callback_data="ps_confirm_premium"),
+                    InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel"),
+                ]])
+            )
+        except Exception as e:
+            log.warning("PayStars Premium username check failed: %s", e)
+            msg = str(e)
+            if "401" in msg or "403" in msg or "API_KEY" in msg:
+                user_msg = "❌ Xizmat hozircha ishlamayapti.\n\n🛠 Texnik nosozlik."
+            elif "422" in msg:
+                user_msg = "❌ Username topilmadi yoki Premium uchun mavjud emas."
+            elif "429" in msg:
+                user_msg = "❌ Juda ko'p tekshiruv. Birozdan keyin qayta urinib ko'ring."
+            else:
+                user_msg = "❌ Username tekshirishda texnik nosozlik yuz berdi.\n\n🛠 Keyinroq qayta urinib ko'ring."
+            await update.message.reply_text(user_msg)
         return
 
     # ========================================================
@@ -5616,8 +6091,8 @@ async def admin_markup_start(update, context, kind):
     labels = {
         "donat": ("🎮 Donat", "donat_markup_percent", DEFAULT_MARKUP),
         "sim": ("📱 SIM", "sim_markup_percent", SIM_MARKUP_PERCENT),
-        "stars": ("⭐ Stars", "donat_markup_percent", DEFAULT_MARKUP),
-        "premium": ("💎 Premium", "donat_markup_percent", DEFAULT_MARKUP),
+        "stars": ("⭐ Stars", "stars_markup_percent", PAYSTARS_MARKUP_PERCENT),
+        "premium": ("💎 Premium", "premium_markup_percent", PAYSTARS_MARKUP_PERCENT),
     }
     label, key, default = labels[kind]
     try:
@@ -5635,6 +6110,9 @@ async def admin_markup_start(update, context, kind):
         "0 = ustamasiz"
     )
 
+
+async def admin_paystars_price_start(update, context):
+    await admin_markup_start(update, context, "stars")
 
 # ============================================================
 # ADMIN PROMO / CARD / POST
@@ -6556,7 +7034,7 @@ async def admin_callback(update, context):
 
     d = q.data
 
-    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "a_sync"}
+    platform_only_callbacks = {"adm_bay2game_rate", "adm_playpay_balance", "adm_paystars_balance", "a_sync"}
     if d in platform_only_callbacks and (is_child_bot(context) or q.from_user.id != ADMIN_ID):
         await q.answer("Xatolik", show_alert=True)
         return
@@ -6684,6 +7162,8 @@ async def admin_callback(update, context):
             context
         )
 
+    elif d == "adm_paystars_price":
+        await admin_paystars_price_start(update, context)
 
     elif d == "adm_markup_donat":
         await admin_markup_start(update, context, "donat")
@@ -6863,9 +7343,21 @@ async def callback_router(update, context):
     if d.startswith("omonat_close_"):
         return await omonat_close_prompt(update, context, int(d.rsplit("_", 1)[1]))
 
-    # Telegram Stars/Premium: Bay2Game katalogidagi xizmatlar
-    if d == "bay2game_telegram":
-        return await bay2game_telegram_menu(update, context)
+    # Qo'shimcha providerlar
+    if d == "paystars":
+        return await paystars_menu(update, context)
+    if d == "ps_stars":
+        return await ps_stars_start(update, context)
+    if d == "ps_premium":
+        return await ps_premium_start(update, context)
+    if d in ("ps_pm_3", "ps_pm_6", "ps_pm_12"):
+        return await ps_premium_month(update, context)
+    if d == "ps_confirm_stars":
+        return await ps_confirm(update, context, "stars")
+    if d == "ps_confirm_premium":
+        return await ps_confirm(update, context, "premium")
+    if d == "adm_paystars_balance":
+        return await paystars_balance_admin(update, context)
     if d == "bot_add":
         return await add_bot_start(update, context)
     if d == "bot_list":
