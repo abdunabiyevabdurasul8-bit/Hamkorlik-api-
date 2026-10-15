@@ -77,9 +77,37 @@ class PGConnection:
         if isinstance(metadata, tuple) and metadata and metadata[0] == "table_info":
             cur.execute(query, (metadata[1],))
             return PGCursor(cur)
+        # SQLite INSERT OR REPLACE uchun PostgreSQL'da PK/unique target shart.
+        # Avval eski noto'g'ri ON CONFLICT DO UPDATE qismini topib, jadval PK sini aniqlaymiz.
+        replace_match = re.search(r"\s+ON\s+CONFLICT\s+DO\s+UPDATE\s+SET\s+(.+)$", query, re.I | re.S)
+        if replace_match:
+            update_clause = replace_match.group(1).strip()
+            base_query = query[:replace_match.start()].rstrip()
+            table_match_tmp = re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', base_query, re.I)
+            if table_match_tmp:
+                table_name = table_match_tmp.group(1).strip('"').split('.')[-1]
+                pk_cur = self._c.cursor()
+                pk_cur.execute("""
+                    SELECT a.attname
+                    FROM pg_index i
+                    JOIN pg_class t ON t.oid = i.indrelid
+                    JOIN pg_namespace n ON n.oid = t.relnamespace
+                    JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+                    WHERE i.indisprimary AND n.nspname = 'public' AND t.relname = %s
+                    ORDER BY array_position(i.indkey, a.attnum)
+                """, (table_name,))
+                pk_cols = [row[0] for row in pk_cur.fetchall()]
+                pk_cur.close()
+                if pk_cols:
+                    target = ", ".join('"' + col.replace('"', '""') + '"' for col in pk_cols)
+                    query = base_query + " ON CONFLICT (" + target + ") DO UPDATE SET " + update_clause
+                else:
+                    query = base_query + " ON CONFLICT DO NOTHING"
+            else:
+                query = base_query + " ON CONFLICT DO NOTHING"
         # sqlite lastrowid replacement: ask PostgreSQL to return generated id.
-        is_insert = bool(re.match(r'\s*INSERT\s+INTO\s+([\w\"]+)', query, re.I))
-        table_match = re.match(r'\s*INSERT\s+INTO\s+([\w\"]+)', query, re.I)
+        is_insert = bool(re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', query, re.I))
+        table_match = re.match(r'\s*INSERT\s+INTO\s+([\w"]+)', query, re.I)
         has_returning = " RETURNING " in query.upper()
         if is_insert and table_match and not has_returning and not re.search(r"ON CONFLICT DO NOTHING\s*$", query, re.I):
             table=table_match.group(1).strip('"')
