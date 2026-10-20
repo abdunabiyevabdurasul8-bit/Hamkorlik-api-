@@ -1402,19 +1402,12 @@ def copy_catalog_to_child(db_path):
     src.close()
     c = sqlite3.connect(db_path, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
-    # Child SQLite DBga barcha yozuvlarni batch bilan yozish ancha tez.
-    c.executemany(
-        "INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at) VALUES(?,?,?,?,?,?,?)",
-        [tuple(r[x] for x in ("game_id","name","id_label","requires_server","amount_based","active","updated_at")) for r in games_rows],
-    )
-    c.executemany(
-        "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
-        [tuple(r[x] for x in ("game_id","paket_id","game_name","package_name","price_usd","api_price_uzs","sale_price","active","updated_at")) for r in prod_rows],
-    )
-    c.executemany(
-        "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
-        [(r["key"], r["value"]) for r in settings_rows],
-    )
+    for r in games_rows:
+        c.execute("INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at) VALUES(?,?,?,?,?,?,?)", tuple(r[x] for x in ("game_id","name","id_label","requires_server","amount_based","active","updated_at")))
+    for r in prod_rows:
+        c.execute("INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", tuple(r[x] for x in ("game_id","paket_id","game_name","package_name","price_usd","api_price_uzs","sale_price","active","updated_at")))
+    for r in settings_rows:
+        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (r["key"], r["value"]))
     c.commit(); c.close()
 
 
@@ -1588,38 +1581,12 @@ async def admin_bot_detail(update, context, bot_id):
 # ============================================================
 # TELEGRAM STARS / PREMIUM — BAY2GAME ONLY
 # ============================================================
-def is_telegram_stars_premium_game(name):
-    """Faqat Telegram Stars va Telegram Premium kataloglarini qoldiradi.
-
-    'Star Resonance', 'Starmaker', 'Mongil Star Dive' kabi o'yinlar
-    nomida star so'zi borligi uchungina bu bo'limga tushib qolmasin.
-    """
-    import re
-    value = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
-    if not value:
-        return False
-
-    words = set(value.split())
-    # Eng ishonchli nomlar: Telegram/TG bilan birga Stars yoki Premium.
-    has_telegram = "telegram" in words or "tg" in words
-    has_stars = "star" in words or "stars" in words
-    has_premium = "premium" in words
-    if has_telegram and (has_stars or has_premium):
-        return True
-
-    # Ba'zi kataloglar xizmat nomini shunchaki 'Stars' yoki 'Premium' deb beradi.
-    # Bunda o'yin nomlariga o'xshash qo'shimcha so'zlar bo'lmasligi shart.
-    if len(words) <= 2 and words in ({"star"}, {"stars"}, {"premium"}, {"telegram", "star"}, {"telegram", "stars"}, {"telegram", "premium"}, {"tg", "star"}, {"tg", "stars"}, {"tg", "premium"}):
-        return True
-    return False
-
-
 def bay2game_telegram_games():
     c = conn()
     try:
         rows = c.execute("SELECT game_id,name FROM games WHERE active=1 ORDER BY name").fetchall()
         return [(int(row["game_id"]), str(row["name"] or "")) for row in rows
-                if is_telegram_stars_premium_game(row["name"])]
+                if any(term in str(row["name"] or "").lower() for term in ("star", "premium"))]
     finally:
         c.close()
 
@@ -2684,47 +2651,29 @@ def sync_catalog():
         data = get_packages_api(gid)
         if not data:
             continue
-        # Paketlarni xotirada yig'amiz; PGConnection executemany qo'llamagani uchun
-        # bitta ulanishda execute takrorlanadi va faqat oxirida commit qilinadi.
-        product_rows = []
-        sync_now = datetime.now().isoformat()
-        try:
-            markup = Decimal(str(get_setting("donat_markup_percent", DEFAULT_MARKUP)))
-        except Exception:
-            markup = DEFAULT_MARKUP
-        usd_uzs = get_bay2game_usd_uzs()
-
         for product in data.get("packages", []):
             try:
                 product_code = str(product.get("product_code") or "").strip()
                 if not product_code:
                     continue
                 paket_id = bay2game_internal_id(product_code)
-                price_data = product.get("price", {}) or {}
-                usd = Decimal(str(product.get("sell_price", price_data.get("usd", 0)) or 0))
-                api_uzs = usd * usd_uzs
-                sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
+                api_uzs = usd * get_bay2game_usd_uzs()
+                sale_price = calc_sale_price(api_uzs)
                 product_status = str(product.get("status", "active")).lower()
                 active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
-                product_rows.append((
-                    gid, paket_id, name,
-                    str(product.get("name") or product.get("product_name") or product_code),
-                    float(usd), float(api_uzs), float(sale_price), active,
-                    sync_now, product_code
-                ))
-            except Exception:
-                log.exception("Bay2Game product tayyorlash xatosi game=%s", game_code)
-
-        if product_rows:
-            c = conn()
-            try:
-                insert_sql = "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)"
-                for product_row in product_rows:
-                    c.execute(insert_sql, product_row)
+                c = conn()
+                c.execute(
+                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (gid, paket_id, name, str(product.get("name") or product.get("product_name") or product_code), float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
+                )
                 c.commit()
-                product_count += len(product_rows)
-            finally:
                 c.close()
+                product_count += 1
+            except Exception:
+                log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
+                try: c.close()
+                except Exception: pass
 
     if game_count == 0:
         return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
@@ -7146,39 +7095,21 @@ async def admin_callback(update, context):
     # ========================================================
 
     elif d == "a_sync":
-        # Katalogni callback ichida kutib turmaymiz: Bay2Game ko'p so'rov talab qilishi
-        # mumkin. Yangilash fon vazifasida ishlaydi va bot boshqa xabarlarni qabul qiladi.
-        status_message = await q.message.reply_text(
-            "🔄 Bay2Game katalogi fon rejimida yangilanmoqda. Bot ishlashda davom etadi."
-        )
-        context.application.create_task(
-            run_catalog_sync_background(status_message, context),
-            update=update,
-            name="bay2game-catalog-sync",
+
+        await q.message.reply_text(
+            "🔄 Bay2Game katalogi yangilanmoqda..."
         )
 
-
-# ============================================================
-# FONDA KATALOG YANGILASH
-# ============================================================
-
-async def run_catalog_sync_background(status_message, context):
-    try:
-        ok, result = await asyncio.to_thread(sync_catalog)
+        ok, result = await asyncio.to_thread(
+            sync_catalog
+        )
         if ok:
-            await asyncio.to_thread(sync_all_child_catalogs)
-        await status_message.reply_text(
+            sync_all_child_catalogs()
+
+        await q.message.reply_text(
             f"{'✅' if ok else '❌'} {result}",
-            reply_markup=admin_kb(context),
+            reply_markup=admin_kb(context)
         )
-    except Exception as exc:
-        log.exception("Bay2Game katalogini fon rejimida yangilashda xato")
-        try:
-            await status_message.reply_text(
-                "❌ Katalog yangilanmadi. Render Logs ichidagi xatoni tekshiring."
-            )
-        except Exception:
-            pass
 
 
 # ============================================================
