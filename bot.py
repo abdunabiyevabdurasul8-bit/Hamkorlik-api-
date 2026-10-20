@@ -2609,6 +2609,10 @@ def sync_catalog():
             ):
                 break
 
+    # Avval o'yinlarni DBga yozamiz, keyin mahsulot API so'rovlarini parallel bajaramiz.
+    # API sekin javob bersa ham har bir o'yin navbatini kutib turish shart emas.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    game_jobs = []
     for category in categories:
         if not isinstance(category, dict):
             continue
@@ -2621,8 +2625,6 @@ def sync_catalog():
             category.get("name") or category.get("game_name") or category.get("gameName") or
             category.get("category_name") or category.get("title") or category.get("slug") or game_code
         ).strip()
-        # API qaytargan o'yinlarni to'liq ko'rsatamiz; nomi PUBG Delay bo'lsa ham yashirmaymiz.
-        # Ayrim provayderlar regionni nomda emas, alohida maydonda qaytaradi.
         region = str(category.get("region") or category.get("server") or category.get("version") or "").strip()
         if "pubg" in name.lower() and region and region.lower() in ("global", "global version", "international") and "global" not in name.lower():
             name = f"{name} Global"
@@ -2633,6 +2635,7 @@ def sync_catalog():
         names = _field_names(fields)
         requires_server = "serverid" in names or "zoneid" in names or "gamezoneid" in names
         id_label = "User ID" if "userid" in names else "Player ID"
+        c = None
         try:
             c = conn()
             c.execute(
@@ -2640,18 +2643,36 @@ def sync_catalog():
                 (gid, name, id_label, 1 if requires_server else 0, 0, 1, datetime.now().isoformat(), game_code, json.dumps(fields, ensure_ascii=False)),
             )
             c.commit()
-            c.close()
             game_count += 1
+            game_jobs.append((gid, name, game_code))
         except Exception:
             log.exception("Bay2Game game saqlash xatosi: %s", game_code)
-            try: c.close()
-            except Exception: pass
-            continue
+        finally:
+            if c:
+                try: c.close()
+                except Exception: pass
 
-        data = get_packages_api(gid)
+    # Bitta API so'rovi bir necha soniya olishi mumkin. 5 ta parallel ish
+    # navbatni sezilarli qisqartiradi, ammo API limitini haddan oshirmaydi.
+    package_results = {}
+    max_workers = min(5, max(1, len(game_jobs)))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="catalog-api") as pool:
+        futures = {pool.submit(get_packages_api, gid): (gid, name, code) for gid, name, code in game_jobs}
+        for future in as_completed(futures):
+            gid, name, game_code = futures[future]
+            try:
+                package_results[gid] = future.result()
+            except Exception:
+                log.exception("Bay2Game paketlarini parallel olish xatosi: %s", game_code)
+                package_results[gid] = None
+
+    # DB yozishlar ketma-ket bajariladi; parallel SQLite yozishlar to'qnashuvini oldini oladi.
+    for gid, name, game_code in game_jobs:
+        data = package_results.get(gid)
         if not data:
             continue
         for product in data.get("packages", []):
+            c = None
             try:
                 product_code = str(product.get("product_code") or "").strip()
                 if not product_code:
@@ -2668,12 +2689,13 @@ def sync_catalog():
                     (gid, paket_id, name, str(product.get("name") or product.get("product_name") or product_code), float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
                 )
                 c.commit()
-                c.close()
                 product_count += 1
             except Exception:
                 log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
-                try: c.close()
-                except Exception: pass
+            finally:
+                if c:
+                    try: c.close()
+                    except Exception: pass
 
     if game_count == 0:
         return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
