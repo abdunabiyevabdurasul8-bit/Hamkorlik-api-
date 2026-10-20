@@ -2684,8 +2684,8 @@ def sync_catalog():
         data = get_packages_api(gid)
         if not data:
             continue
-        # Har bir paket uchun alohida DB ulanish/commit qilmaymiz:
-        # paketlarni xotirada yig'ib, bitta executemany + commit bilan saqlaymiz.
+        # Paketlarni xotirada yig'amiz; PGConnection executemany qo'llamagani uchun
+        # bitta ulanishda execute takrorlanadi va faqat oxirida commit qilinadi.
         product_rows = []
         sync_now = datetime.now().isoformat()
         try:
@@ -2718,10 +2718,9 @@ def sync_catalog():
         if product_rows:
             c = conn()
             try:
-                c.executemany(
-                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    product_rows,
-                )
+                insert_sql = "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)"
+                for product_row in product_rows:
+                    c.execute(insert_sql, product_row)
                 c.commit()
                 product_count += len(product_rows)
             finally:
