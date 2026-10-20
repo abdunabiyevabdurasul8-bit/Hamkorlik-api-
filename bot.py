@@ -1965,7 +1965,7 @@ def bay2game_request(path, params=None):
         response = requests.get(
             f"{BAY2GAME_BASE}/{path.lstrip('/')}",
             params=params,
-            timeout=35,
+            timeout=(5, 15),
         )
         try:
             data = response.json()
@@ -2552,6 +2552,8 @@ def ensure_mobile_legends():
 
 def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
+    import time
+    sync_started = time.monotonic()
     categories = get_games_api()
     if not categories:
         return False, "Bay2Game katalogi olinmadi. API key va API balansini tekshiring."
@@ -2655,7 +2657,7 @@ def sync_catalog():
     # Bitta API so'rovi bir necha soniya olishi mumkin. 5 ta parallel ish
     # navbatni sezilarli qisqartiradi, ammo API limitini haddan oshirmaydi.
     package_results = {}
-    max_workers = min(5, max(1, len(game_jobs)))
+    max_workers = min(10, max(1, len(game_jobs)))
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="catalog-api") as pool:
         futures = {pool.submit(get_packages_api, gid): (gid, name, code) for gid, name, code in game_jobs}
         for future in as_completed(futures):
@@ -2666,40 +2668,60 @@ def sync_catalog():
                 log.exception("Bay2Game paketlarini parallel olish xatosi: %s", game_code)
                 package_results[gid] = None
 
-    # DB yozishlar ketma-ket bajariladi; parallel SQLite yozishlar to'qnashuvini oldini oladi.
+    # API natijalari avval xotirada tayyorlanadi, DBga esa bitta batch qilib yoziladi.
+    # Har bir mahsulot uchun alohida connection/commit qilish katta katalogni sekinlashtirardi.
+    product_rows = []
+    now = datetime.now().isoformat()
+    usd_rate = get_bay2game_usd_uzs()
     for gid, name, game_code in game_jobs:
         data = package_results.get(gid)
         if not data:
             continue
         for product in data.get("packages", []):
-            c = None
             try:
                 product_code = str(product.get("product_code") or "").strip()
                 if not product_code:
                     continue
                 paket_id = bay2game_internal_id(product_code)
                 usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
-                api_uzs = usd * get_bay2game_usd_uzs()
+                api_uzs = usd * usd_rate
                 sale_price = calc_sale_price(api_uzs)
                 product_status = str(product.get("status", "active")).lower()
                 active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
-                c = conn()
-                c.execute(
-                    "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (gid, paket_id, name, str(product.get("name") or product.get("product_name") or product_code), float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
-                )
-                c.commit()
-                product_count += 1
+                product_rows.append((
+                    gid, paket_id, name,
+                    str(product.get("name") or product.get("product_name") or product_code),
+                    float(usd), float(api_uzs), float(sale_price), active, now, product_code
+                ))
             except Exception:
-                log.exception("Bay2Game product saqlash xatosi game=%s", game_code)
-            finally:
-                if c:
-                    try: c.close()
-                    except Exception: pass
+                log.exception("Bay2Game product tayyorlash xatosi game=%s", game_code)
+
+    if product_rows:
+        c = None
+        try:
+            c = conn()
+            c.executemany(
+                "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                product_rows,
+            )
+            c.commit()
+            product_count = len(product_rows)
+        except Exception:
+            if c:
+                try: c.rollback()
+                except Exception: pass
+            log.exception("Bay2Game katalogini batch saqlash xatosi")
+            return False, "Katalog DBga saqlanmadi. Loglarni tekshiring."
+        finally:
+            if c:
+                try: c.close()
+                except Exception: pass
 
     if game_count == 0:
         return False, "Bay2Game katalogida saqlash mumkin bo'lgan o'yin topilmadi."
-    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
+    elapsed = time.monotonic() - sync_started
+    log.info("CATALOG SYNC DONE | games=%s products=%s elapsed=%.2fs workers=%s", game_count, product_count, elapsed, min(10, max(1, len(game_jobs))))
+    return True, f"✅ Bay2Game: {game_count} ta o'yin, {product_count} ta paket yangilandi. {elapsed:.1f} soniyada. Kurs: 1 USD = {get_bay2game_usd_uzs():,.0f} so'm."
 
 
 def add_one_calendar_month(value):
