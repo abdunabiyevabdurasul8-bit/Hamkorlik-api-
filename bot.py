@@ -1588,12 +1588,38 @@ async def admin_bot_detail(update, context, bot_id):
 # ============================================================
 # TELEGRAM STARS / PREMIUM — BAY2GAME ONLY
 # ============================================================
+def is_telegram_stars_premium_game(name):
+    """Faqat Telegram Stars va Telegram Premium kataloglarini qoldiradi.
+
+    'Star Resonance', 'Starmaker', 'Mongil Star Dive' kabi o'yinlar
+    nomida star so'zi borligi uchungina bu bo'limga tushib qolmasin.
+    """
+    import re
+    value = re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).strip()
+    if not value:
+        return False
+
+    words = set(value.split())
+    # Eng ishonchli nomlar: Telegram/TG bilan birga Stars yoki Premium.
+    has_telegram = "telegram" in words or "tg" in words
+    has_stars = "star" in words or "stars" in words
+    has_premium = "premium" in words
+    if has_telegram and (has_stars or has_premium):
+        return True
+
+    # Ba'zi kataloglar xizmat nomini shunchaki 'Stars' yoki 'Premium' deb beradi.
+    # Bunda o'yin nomlariga o'xshash qo'shimcha so'zlar bo'lmasligi shart.
+    if len(words) <= 2 and words in ({"star"}, {"stars"}, {"premium"}, {"telegram", "star"}, {"telegram", "stars"}, {"telegram", "premium"}, {"tg", "star"}, {"tg", "stars"}, {"tg", "premium"}):
+        return True
+    return False
+
+
 def bay2game_telegram_games():
     c = conn()
     try:
         rows = c.execute("SELECT game_id,name FROM games WHERE active=1 ORDER BY name").fetchall()
         return [(int(row["game_id"]), str(row["name"] or "")) for row in rows
-                if any(term in str(row["name"] or "").lower() for term in ("star", "premium"))]
+                if is_telegram_stars_premium_game(row["name"])]
     finally:
         c.close()
 
