@@ -1611,11 +1611,33 @@ def bay2game_telegram_keyboard():
     return InlineKeyboardMarkup(rows)
 
 
+async def _b2tg_edit_or_replace(q, text, reply_markup=None, parse_mode="HTML"):
+    """Avval eski bot xabarini tahrirlaydi; imkonsiz bo'lsa o'chirib yangisini yuboradi."""
+    try:
+        await q.message.edit_text(
+            text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+        return
+    except Exception:
+        pass
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.message.chat.send_message(
+        text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
+
+
 async def bay2game_telegram_menu(update, context):
     q = update.callback_query
-    await q.message.reply_text(
-        "⭐ <b>Stars / 💎 Premium</b>\\n\\nKerakli xizmatni tanlang:",
-        parse_mode="HTML",
+    await _b2tg_edit_or_replace(
+        q,
+        "⭐ <b>Stars / 💎 Premium</b>\n\nKerakli xizmatni tanlang:",
         reply_markup=bay2game_telegram_keyboard(),
     )
 
@@ -1665,6 +1687,25 @@ async def bay2game_telegram_type(update, context, service_type, page=0):
         seen.add(key)
         matched.append(row)
 
+    # Paketlarni nom/id bo'yicha emas, haqiqiy miqdor yoki muddat bo'yicha tartiblaymiz.
+    def _b2tg_package_order(row):
+        code = str(row["provider_product_code"] or "").strip().upper()
+        name = str(row["package_name"] or "").strip().upper()
+        if service_type == "stars":
+            # TELEGRAM_50_STARS -> 50; nomidan ham zaxira tarzida sonni olamiz.
+            match = re.search(r"TELEGRAM_(\d+)_STARS", code)
+            if not match:
+                match = re.search(r"(\d+)\s*(?:STARS|STAR)", name)
+            amount = int(match.group(1)) if match else 10**12
+            return (amount, name, int(row["paket_id"]))
+        # TELEGRAM_Premium_12_Months -> 12; turli nomlanishlarni ham qabul qiladi.
+        match = re.search(r"TELEGRAM_PREMIUM_(\d+)_MONTHS?", code)
+        if not match:
+            match = re.search(r"(\d+)\s*(?:MONTHS?|MOY|OY)", name)
+        months = int(match.group(1)) if match else 10**12
+        return (months, name, int(row["paket_id"]))
+
+    matched.sort(key=_b2tg_package_order)
     label = "Telegram Stars" if service_type == "stars" else "Telegram Premium"
     if not matched:
         await q.message.reply_text(
@@ -1712,9 +1753,11 @@ async def bay2game_telegram_type(update, context, service_type, page=0):
     if nav:
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔙 Xizmatlarga qaytish", callback_data="telegram_services")])
-    await q.message.reply_text(
+    await _b2tg_edit_or_replace(
+        q,
         f"📦 {label} paketlari (sahifa {page+1}/{total_pages}):",
         reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=None,
     )
 
 
