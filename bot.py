@@ -1620,8 +1620,8 @@ async def bay2game_telegram_menu(update, context):
     )
 
 
-async def bay2game_telegram_type(update, context, service_type):
-    """Tanlangan Telegram xizmatiga tegishli Bay2Game paketlarini chiqaradi."""
+async def bay2game_telegram_type(update, context, service_type, page=0):
+    """Tanlangan Telegram xizmatining paketlarini sahifalab chiqaradi."""
     q = update.callback_query
     service_type = str(service_type or "").lower()
     if service_type not in ("stars", "premium"):
@@ -1664,35 +1664,52 @@ async def bay2game_telegram_type(update, context, service_type):
     label = "Telegram Stars" if service_type == "stars" else "Telegram Premium"
     if not matched:
         await q.message.reply_text(
-            f"📦 {label} paketlari katalogda topilmadi.\\n\\n"
+            f"📦 {label} paketlari katalogda topilmadi.\n\n"
             "Katalogni yangilashni administrator tekshirishi kerak."
         )
         return
 
+    # Har bir sahifada ko'pi bilan 8 ta mahsulot: Telegram markup limitidan oshmasin.
+    page_size = 8
+    total_pages = (len(matched) + page_size - 1) // page_size
+    try:
+        page = max(0, min(int(page), total_pages - 1))
+    except (TypeError, ValueError):
+        page = 0
+    page_rows = matched[page * page_size:(page + 1) * page_size]
     buttons = []
-    for row in matched:
+    for row in page_rows:
         try:
             price = float(row["sale_price"] or 0)
         except (TypeError, ValueError):
             price = 0
-        package_name = str(row["package_name"] or "Paket")
+        package_name = str(row["package_name"] or "Paket").strip()
+        # Tugma matni qisqa bo'lsin, uzun katalog nomlari markupni haddan tashqari kattalashtirmasin.
+        if len(package_name) > 48:
+            package_name = package_name[:45] + "..."
         game_id = int(row["game_id"])
         paket_id = int(row["paket_id"])
         if price > 0:
+            button_text = f"{package_name} — {price:,.0f} so'm"
             buttons.append([InlineKeyboardButton(
-                f"{package_name} — {price:,.0f} so'm",
-                callback_data=f"b2tg_pkg_{game_id}_{paket_id}",
+                button_text[:64], callback_data=f"b2tg_pkg_{game_id}_{paket_id}"
             )])
         else:
             buttons.append([InlineKeyboardButton(
-                f"{package_name} — Narx yuklanmagan",
+                f"{package_name[:40]} — Narx yuklanmagan",
                 callback_data="b2tg_noprice",
             )])
 
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ Oldingi", callback_data=f"b2tg_page_{service_type}_{page-1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton("Keyingi ➡️", callback_data=f"b2tg_page_{service_type}_{page+1}"))
+    if nav:
+        buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔙 Xizmatlarga qaytish", callback_data="telegram_services")])
     await q.message.reply_text(
-        f"📦 <b>{label}</b> paketlari:",
-        parse_mode="HTML",
+        f"📦 {label} paketlari (sahifa {page+1}/{total_pages}):",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -7258,6 +7275,10 @@ async def callback_router(update, context):
         return await bay2game_telegram_type(update, context, "stars")
     if d == "b2tg_type_premium":
         return await bay2game_telegram_type(update, context, "premium")
+    if d.startswith("b2tg_page_"):
+        parts = d.split("_")
+        if len(parts) == 4 and parts[2] in ("stars", "premium"):
+            return await bay2game_telegram_type(update, context, parts[2], int(parts[3]))
     if d == "b2tg_noprice":
         return await bay2game_telegram_no_price(update, context)
     if d.startswith("b2tg_game_"):
