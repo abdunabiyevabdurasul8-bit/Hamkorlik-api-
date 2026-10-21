@@ -1513,6 +1513,7 @@ def build_application(token, child=False):
     app.add_handler(CommandHandler("admin", admin_command))
     app.add_handler(CommandHandler("omonatfoiz", omonat_foiz_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
+    app.add_handler(CallbackQueryHandler(subscription_check_callback, pattern=r"^donuz_sub_check$"))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.PHOTO | filters.ANIMATION | filters.VIDEO, media_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_router))
@@ -3363,12 +3364,65 @@ def admin_kb(context=None):
 
 
 # ============================================================
+# MAJBURIY OBUNA: @donuz01
+# ============================================================
+DONUZ_CHANNEL = "@donuz01"
+
+
+def subscription_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📢 Obuna bo'lish", url="https://t.me/donuz01")],
+        [InlineKeyboardButton("✅ Obunani tekshirish", callback_data="donuz_sub_check")],
+    ])
+
+
+async def user_is_subscribed(bot, user_id):
+    """Kanal a'zoligini tekshiradi. Bot kanal a'zoligini tekshira olishi kerak."""
+    try:
+        member = await bot.get_chat_member(chat_id=DONUZ_CHANNEL, user_id=int(user_id))
+        return str(getattr(member, "status", "")) in ("member", "administrator", "creator", "owner")
+    except Exception:
+        log.exception("@donuz01 obunasini tekshirish amalga oshmadi; bot kanalga qo'shilgan/admin ekanini tekshiring")
+        return False
+
+
+async def subscription_check_callback(update, context):
+    q = update.callback_query
+    if not q:
+        return
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if await user_is_subscribed(context.bot, q.from_user.id):
+        await _b2tg_edit_or_replace(q, "✅ Obuna tasdiqlandi! Endi botdan foydalanishingiz mumkin.", reply_markup=main_menu(), parse_mode=None)
+    else:
+        try:
+            await q.edit_message_text(
+                "❗ Botdan foydalanish uchun avval @donuz01 kanaliga obuna bo'ling, so'ng tekshirish tugmasini bosing.",
+                reply_markup=subscription_keyboard()
+            )
+        except Exception:
+            await q.message.reply_text(
+                "❗ Avval @donuz01 kanaliga obuna bo'ling.",
+                reply_markup=subscription_keyboard()
+            )
+
+
+# ============================================================
 # START
 # ============================================================
 
 async def start(update, context):
 
     set_request_db(context)
+    if update.effective_user and not await user_is_subscribed(context.bot, update.effective_user.id):
+        if update.message:
+            await update.message.reply_text(
+                "👋 Botdan foydalanish uchun @donuz01 kanaliga obuna bo'lishingiz kerak.",
+                reply_markup=subscription_keyboard()
+            )
+        return
     if not await child_platform_access(update, context):
         return
     is_main_bot = int(getattr(context.bot, "id", 0) or 0) == int(MAIN_BOT_ID or 0)
@@ -4197,6 +4251,7 @@ async def confirm(update, context):
         return
 
     current = get_balance(uid)
+    balance_before = current
 
     if current < price:
 
@@ -4464,37 +4519,56 @@ async def confirm(update, context):
     )
 
     # ========================================================
-    # ADMIN
+    # ADMIN: batafsil buyurtma hisoboti
     # ========================================================
 
     try:
-
+        order_time = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%Y-%m-%d %H:%M:%S")
+        tg_user = q.from_user
+        display_name = " ".join(x for x in [getattr(tg_user, "first_name", ""), getattr(tg_user, "last_name", "")] if x).strip() or "Noma'lum"
+        tg_username = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "username yo'q"
+        game_name = str(context.user_data.get("game_name") or context.user_data.get("offer_game_name") or context.user_data.get("selected_game_name") or "").strip()
+        if not game_name:
+            try:
+                game_row = conn().execute("SELECT name FROM games WHERE game_id=? LIMIT 1", (int(game_id),)).fetchone()
+                if game_row:
+                    game_name = str(game_row["name"] if hasattr(game_row, "keys") else game_row[0])
+            except Exception:
+                log.exception("Admin hisobotida o'yin nomini topib bo'lmadi")
+        if not game_name:
+            try:
+                product_row = conn().execute("SELECT game_name FROM products WHERE game_id=? AND paket_id=? LIMIT 1", (int(game_id), int(paket_id))).fetchone()
+                if product_row:
+                    game_name = str(product_row["game_name"] if hasattr(product_row, "keys") else product_row[0])
+            except Exception:
+                pass
+        if not game_name:
+            game_name = f"O'yin (ID: {game_id})"
+        package_name = str(context.user_data.get("offer_name") or "Paket")
+        name_low = (game_name + " " + package_name).lower()
+        package_icon = "💎" if any(x in name_low for x in ("olmos", "diamond", "almaz", "gem")) else ("⭐" if "star" in name_low else ("🎮" if "level up" in name_low else "📦"))
+        balance_after = get_balance(uid)
         await context.bot.send_message(
             bot_admin_id(context),
-            f"🛒 YANGI BUYURTMA #{local_order_id}\n\n"
-            f"👤 User ID: {uid}\n"
-            f"🎮 Game ID: {game_id}\n"
-            f"📦 {context.user_data.get('offer_name','Paket')}\n"
-            f"🆔 {id_label}: {player_id}\n"
-            +
-            (
-                f"🌐 Server ID: {server_id}\n"
-                if requires_server
-                else ""
-            )
-            +
-            f"💰 Sotuv: {price:,.0f} so'm\n"
-            f"🔢 Buyurtma raqami: {playpay_id}\n"
-            f"📊 {order_status}\n"
-            f"💵 API charged: {charged_usd} USD"
+            f"🛒 YANGI BUYURTMA {local_order_id}#\n\n"
+            f"🕒 Vaqt (Toshkent): {order_time}\n"
+            f"👤 Ism: {display_name}\n"
+            f"🔗 Username: {tg_username}\n"
+            f"🆔 Telegram ID: {uid}\n\n"
+            f"🎮 O'yin: {game_name}\n"
+            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
+            + f"{package_icon} Paket: {package_name}\n"
+            f"💰 Sotuv narxi: {price:,.0f} so'm\n"
+            f"💳 Oldingi balans: {balance_before:,.0f} so'm\n"
+            f"💳 Keyingi balans: {balance_after:,.0f} so'm\n"
+            f"🔢 Provayder buyurtma ID: {playpay_id or '-'}\n"
+            f"📊 Holat: {order_status}\n"
+            f"💵 API xarajati: {charged_usd} USD"
         )
 
     except Exception as e:
-
-        log.error(
-            "Admin buyurtma xabari xatosi: %s",
-            e
-        )
+        log.error("Admin buyurtma xabari xatosi: %s", e)
 
     # ========================================================
     # PROMO
@@ -7413,6 +7487,16 @@ async def callback_router(update, context):
     q = update.callback_query
     if not await child_platform_access(update, context):
         return
+    if q and q.from_user.id != int(bot_admin_id(context) or 0) and not await user_is_subscribed(context.bot, q.from_user.id):
+        try:
+            await q.answer("Avval @donuz01 kanaliga obuna bo'ling.", show_alert=True)
+        except Exception:
+            pass
+        try:
+            await q.message.reply_text("❗ Botdan foydalanish uchun @donuz01 kanaliga obuna bo'ling.", reply_markup=subscription_keyboard())
+        except Exception:
+            pass
+        return
 
     try:
         await q.answer()
@@ -7693,6 +7777,10 @@ async def text_router(update, context):
 
     user = update.effective_user
     if user is None:
+        return
+    if user.id != int(bot_admin_id(context) or 0) and not await user_is_subscribed(context.bot, user.id):
+        if update.message:
+            await update.message.reply_text("❗ Botdan foydalanish uchun @donuz01 kanaliga obuna bo'ling.", reply_markup=subscription_keyboard())
         return
 
     if user.id == bot_admin_id(context):
