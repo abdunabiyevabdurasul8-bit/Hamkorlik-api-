@@ -1590,8 +1590,12 @@ def bay2game_telegram_games(kind=None):
         for row in rows:
             name = str(row["name"] or "").strip()
             low = name.lower()
-            is_stars = "star" in low
-            is_premium = "premium" in low
+            # Qat'iy filtrlash: boshqa o'yin nomidagi "Stars" so'zi
+            # (masalan, CATS: Crash Arena Turbo Stars) Telegram Stars emas.
+            # Faqat Telegram xizmatiga tegishli katalog nomlarini ko'rsatamiz.
+            has_telegram = "telegram" in low
+            is_stars = has_telegram and ("stars" in low or "star" in low)
+            is_premium = has_telegram and "premium" in low
             if kind == "stars" and is_stars and not is_premium:
                 result.append((int(row["game_id"]), name))
             elif kind == "premium" and is_premium:
