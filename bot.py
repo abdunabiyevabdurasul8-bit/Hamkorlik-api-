@@ -1402,10 +1402,30 @@ def copy_catalog_to_child(db_path):
     src.close()
     c = sqlite3.connect(db_path, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")
+    # Child SQLite bazasida provider kodlarini ham saqlaymiz; Bay2Game buyurtmasi
+    # ichki sonli ID emas, asl product_code orqali yuborilishi kerak.
+    game_cols = {row[1] for row in c.execute("PRAGMA table_info(games)").fetchall()}
+    product_cols = {row[1] for row in c.execute("PRAGMA table_info(products)").fetchall()}
+    game_fields = ["game_id", "name", "id_label", "requires_server", "amount_based", "active", "updated_at"]
+    for optional in ("provider_game_code", "game_fields_json"):
+        if optional in game_cols:
+            game_fields.append(optional)
+    product_fields = ["game_id", "paket_id", "game_name", "package_name", "price_usd", "api_price_uzs", "sale_price", "active", "updated_at"]
+    if "provider_product_code" in product_cols:
+        product_fields.append("provider_product_code")
+
+    game_sql = (
+        f"INSERT OR REPLACE INTO games({','.join(game_fields)}) "
+        f"VALUES({','.join('?' for _ in game_fields)})"
+    )
+    product_sql = (
+        f"INSERT OR REPLACE INTO products({','.join(product_fields)}) "
+        f"VALUES({','.join('?' for _ in product_fields)})"
+    )
     for r in games_rows:
-        c.execute("INSERT OR REPLACE INTO games(game_id,name,id_label,requires_server,amount_based,active,updated_at) VALUES(?,?,?,?,?,?,?)", tuple(r[x] for x in ("game_id","name","id_label","requires_server","amount_based","active","updated_at")))
+        c.execute(game_sql, tuple(r[x] for x in game_fields))
     for r in prod_rows:
-        c.execute("INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", tuple(r[x] for x in ("game_id","paket_id","game_name","package_name","price_usd","api_price_uzs","sale_price","active","updated_at")))
+        c.execute(product_sql, tuple(r[x] for x in product_fields))
     for r in settings_rows:
         c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (r["key"], r["value"]))
     c.commit(); c.close()
@@ -1580,61 +1600,106 @@ async def admin_bot_detail(update, context, bot_id):
 
 # ============================================================
 # TELEGRAM STARS / PREMIUM — BAY2GAME ONLY
-# Foydalanuvchiga faqat Stars va Premium ko'rsatiladi.
 # ============================================================
-def bay2game_telegram_games(kind=None):
-    c = conn()
-    try:
-        rows = c.execute("SELECT game_id,name FROM games WHERE active=1 ORDER BY name").fetchall()
-        result = []
-        for row in rows:
-            name = str(row["name"] or "").strip()
-            low = name.lower()
-            # Qat'iy filtrlash: boshqa o'yin nomidagi "Stars" so'zi
-            # (masalan, CATS: Crash Arena Turbo Stars) Telegram Stars emas.
-            # Faqat Telegram xizmatiga tegishli katalog nomlarini ko'rsatamiz.
-            has_telegram = "telegram" in low
-            is_stars = has_telegram and ("stars" in low or "star" in low)
-            is_premium = has_telegram and "premium" in low
-            if kind == "stars" and is_stars and not is_premium:
-                result.append((int(row["game_id"]), name))
-            elif kind == "premium" and is_premium:
-                result.append((int(row["game_id"]), name))
-        return result
-    finally:
-        c.close()
-
-
-def bay2game_telegram_keyboard(kind=None):
-    games = bay2game_telegram_games(kind)
-    rows = [[InlineKeyboardButton(name, callback_data=f"b2tg_game_{gid}")] for gid, name in games]
-    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")])
-    return InlineKeyboardMarkup(rows), games
+def bay2game_telegram_keyboard():
+    # Foydalanuvchiga katalogdagi har bir kategoriya emas, faqat ikki xizmat ko'rsatiladi.
+    rows = [
+        [InlineKeyboardButton("⭐ Telegram Stars", callback_data="b2tg_type_stars")],
+        [InlineKeyboardButton("💎 Telegram Premium", callback_data="b2tg_type_premium")],
+        [InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")],
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 async def bay2game_telegram_menu(update, context):
     q = update.callback_query
     await q.message.reply_text(
-        "⭐ Stars va 💎 Premium xizmatini tanlang:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⭐ Telegram Stars", callback_data="b2tg_kind_stars")],
-            [InlineKeyboardButton("💎 Telegram Premium", callback_data="b2tg_kind_premium")],
-            [InlineKeyboardButton("🔙 Asosiy menyu", callback_data="back_home")],
-        ])
+        "⭐ <b>Stars / 💎 Premium</b>\\n\\nKerakli xizmatni tanlang:",
+        parse_mode="HTML",
+        reply_markup=bay2game_telegram_keyboard(),
     )
 
 
-async def bay2game_telegram_kind_menu(update, context, kind):
+async def bay2game_telegram_type(update, context, service_type):
+    """Tanlangan Telegram xizmatiga tegishli Bay2Game paketlarini chiqaradi."""
     q = update.callback_query
-    kb, games = bay2game_telegram_keyboard(kind)
-    title = "⭐ Telegram Stars" if kind == "stars" else "💎 Telegram Premium"
-    if not games:
+    service_type = str(service_type or "").lower()
+    if service_type not in ("stars", "premium"):
+        await q.message.reply_text("❌ Xizmat turi noto'g'ri.")
+        return
+
+    c = conn()
+    try:
+        rows = c.execute(
+            """
+            SELECT g.game_id, g.name AS game_name,
+                   p.paket_id, p.package_name, p.sale_price
+            FROM games g
+            JOIN products p ON p.game_id = g.game_id
+            WHERE g.active = 1 AND p.active = 1
+            ORDER BY g.name, p.paket_id
+            """
+        ).fetchall()
+    finally:
+        c.close()
+
+    matched = []
+    seen = set()
+    for row in rows:
+        game_name = str(row["game_name"] or "").strip()
+        package_name = str(row["package_name"] or "").strip()
+        searchable = (game_name + " " + package_name).lower()
+        has_premium = "premium" in searchable
+        has_stars = "star" in searchable
+        if service_type == "stars" and not (has_stars and not has_premium):
+            continue
+        if service_type == "premium" and not has_premium:
+            continue
+        key = (int(row["game_id"]), int(row["paket_id"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        matched.append(row)
+
+    label = "Telegram Stars" if service_type == "stars" else "Telegram Premium"
+    if not matched:
         await q.message.reply_text(
-            f"{title} paketlari Bay2Game katalogida topilmadi. Admin katalogni yangilab, API'da aynan shu xizmat borligini tekshirsin.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")]])
+            f"📦 {label} paketlari katalogda topilmadi.\\n\\n"
+            "Katalogni yangilashni administrator tekshirishi kerak."
         )
         return
-    await q.message.reply_text(f"{title} — paketni tanlang:", reply_markup=kb)
+
+    buttons = []
+    for row in matched:
+        try:
+            price = float(row["sale_price"] or 0)
+        except (TypeError, ValueError):
+            price = 0
+        package_name = str(row["package_name"] or "Paket")
+        game_id = int(row["game_id"])
+        paket_id = int(row["paket_id"])
+        if price > 0:
+            buttons.append([InlineKeyboardButton(
+                f"{package_name} — {price:,.0f} so'm",
+                callback_data=f"b2tg_pkg_{game_id}_{paket_id}",
+            )])
+        else:
+            buttons.append([InlineKeyboardButton(
+                f"{package_name} — Narx yuklanmagan",
+                callback_data="b2tg_noprice",
+            )])
+
+    buttons.append([InlineKeyboardButton("🔙 Xizmatlarga qaytish", callback_data="telegram_services")])
+    await q.message.reply_text(
+        f"📦 <b>{label}</b> paketlari:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def bay2game_telegram_no_price(update, context):
+    q = update.callback_query
+    await q.message.reply_text("⚠️ Bu paket uchun narx yuklanmagan. Iltimos, boshqa paketni tanlang yoki keyinroq urinib ko'ring.")
 
 
 async def bay2game_telegram_game(update, context, game_id):
@@ -2681,13 +2746,28 @@ def sync_catalog():
                 paket_id = bay2game_internal_id(product_code)
                 usd = Decimal(str(product.get("sell_price", product.get("price", {}).get("usd", 0)) or 0))
                 api_uzs = usd * get_bay2game_usd_uzs()
-                sale_price = calc_sale_price(api_uzs)
+                package_name = str(product.get("name") or product.get("product_name") or product_code)
+                service_words = (str(name) + " " + package_name).lower()
+                if "premium" in service_words:
+                    try:
+                        markup = Decimal(str(get_setting("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)))
+                    except Exception:
+                        markup = TELEGRAM_MARKUP_PERCENT
+                    sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                elif "star" in service_words:
+                    try:
+                        markup = Decimal(str(get_setting("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)))
+                    except Exception:
+                        markup = TELEGRAM_MARKUP_PERCENT
+                    sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                else:
+                    sale_price = calc_sale_price(api_uzs)
                 product_status = str(product.get("status", "active")).lower()
                 active = 0 if product_status in ("inactive", "disabled", "unavailable", "out_of_stock") else 1
                 c = conn()
                 c.execute(
                     "INSERT OR REPLACE INTO products(game_id,paket_id,game_name,package_name,price_usd,api_price_uzs,sale_price,active,updated_at,provider_product_code) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (gid, paket_id, name, str(product.get("name") or product.get("product_name") or product_code), float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
+                    (gid, paket_id, name, package_name, float(usd), float(api_uzs), float(sale_price), active, datetime.now().isoformat(), product_code),
                 )
                 c.commit()
                 c.close()
@@ -3031,8 +3111,7 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
-        [InlineKeyboardButton("⭐ Telegram Stars", callback_data="b2tg_kind_stars")],
-        [InlineKeyboardButton("💎 Telegram Premium", callback_data="b2tg_kind_premium")],
+        [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="telegram_services")],
         # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
         # xarid oqimi menyuda ko'rsatilmaydi.
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
@@ -7172,13 +7251,15 @@ async def callback_router(update, context):
     if d.startswith("omonat_close_"):
         return await omonat_close_prompt(update, context, int(d.rsplit("_", 1)[1]))
 
-    # Qo'shimcha providerlar
+    # Telegram Stars / Premium — faqat ikkita aniq xizmat tanlovi.
     if d == "telegram_services":
         return await bay2game_telegram_menu(update, context)
-    if d == "b2tg_kind_stars":
-        return await bay2game_telegram_kind_menu(update, context, "stars")
-    if d == "b2tg_kind_premium":
-        return await bay2game_telegram_kind_menu(update, context, "premium")
+    if d == "b2tg_type_stars":
+        return await bay2game_telegram_type(update, context, "stars")
+    if d == "b2tg_type_premium":
+        return await bay2game_telegram_type(update, context, "premium")
+    if d == "b2tg_noprice":
+        return await bay2game_telegram_no_price(update, context)
     if d.startswith("b2tg_game_"):
         return await bay2game_telegram_game(update, context, int(d.rsplit("_", 1)[1]))
     if d.startswith("b2tg_pkg_"):
