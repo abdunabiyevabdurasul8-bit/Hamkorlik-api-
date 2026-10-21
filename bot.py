@@ -1633,7 +1633,8 @@ async def bay2game_telegram_type(update, context, service_type, page=0):
         rows = c.execute(
             """
             SELECT g.game_id, g.name AS game_name,
-                   p.paket_id, p.package_name, p.sale_price
+                   p.paket_id, p.package_name, p.sale_price,
+                   p.provider_product_code
             FROM games g
             JOIN products p ON p.game_id = g.game_id
             WHERE g.active = 1 AND p.active = 1
@@ -1648,12 +1649,15 @@ async def bay2game_telegram_type(update, context, service_type, page=0):
     for row in rows:
         game_name = str(row["game_name"] or "").strip()
         package_name = str(row["package_name"] or "").strip()
-        searchable = (game_name + " " + package_name).lower()
-        has_premium = "premium" in searchable
-        has_stars = "star" in searchable
-        if service_type == "stars" and not (has_stars and not has_premium):
+        product_code = str(row["provider_product_code"] or "").strip().upper()
+        # Bay2Game'ning aniq mahsulot kodlari bilan ajratamiz.
+        # Masalan TELEGRAM_50_Stars va TELEGRAM_Premium_12_Months.
+        # Boshqa o'yinlardagi Premium Pass/Gift paketlari shu sabab chiqmaydi.
+        is_stars_code = product_code.startswith("TELEGRAM_") and product_code.endswith("_STARS") and "PREMIUM" not in product_code
+        is_premium_code = product_code.startswith("TELEGRAM_PREMIUM_")
+        if service_type == "stars" and not is_stars_code:
             continue
-        if service_type == "premium" and not has_premium:
+        if service_type == "premium" and not is_premium_code:
             continue
         key = (int(row["game_id"]), int(row["paket_id"]))
         if key in seen:
