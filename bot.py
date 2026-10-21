@@ -1580,39 +1580,57 @@ async def admin_bot_detail(update, context, bot_id):
 
 # ============================================================
 # TELEGRAM STARS / PREMIUM — BAY2GAME ONLY
+# Foydalanuvchiga faqat Stars va Premium ko'rsatiladi.
 # ============================================================
-def bay2game_telegram_games():
+def bay2game_telegram_games(kind=None):
     c = conn()
     try:
         rows = c.execute("SELECT game_id,name FROM games WHERE active=1 ORDER BY name").fetchall()
-        return [(int(row["game_id"]), str(row["name"] or "")) for row in rows
-                if any(term in str(row["name"] or "").lower() for term in ("star", "premium"))]
+        result = []
+        for row in rows:
+            name = str(row["name"] or "").strip()
+            low = name.lower()
+            is_stars = "star" in low
+            is_premium = "premium" in low
+            if kind == "stars" and is_stars and not is_premium:
+                result.append((int(row["game_id"]), name))
+            elif kind == "premium" and is_premium:
+                result.append((int(row["game_id"]), name))
+        return result
     finally:
         c.close()
 
 
-def bay2game_telegram_keyboard():
-    games = bay2game_telegram_games()
+def bay2game_telegram_keyboard(kind=None):
+    games = bay2game_telegram_games(kind)
     rows = [[InlineKeyboardButton(name, callback_data=f"b2tg_game_{gid}")] for gid, name in games]
-    rows.append([InlineKeyboardButton("🔄 Katalogni yangilash", callback_data="a_sync")])
-    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="back_home")])
+    rows.append([InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")])
     return InlineKeyboardMarkup(rows), games
 
 
 async def bay2game_telegram_menu(update, context):
     q = update.callback_query
-    kb, games = bay2game_telegram_keyboard()
+    await q.message.reply_text(
+        "⭐ Stars va 💎 Premium xizmatini tanlang:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⭐ Telegram Stars", callback_data="b2tg_kind_stars")],
+            [InlineKeyboardButton("💎 Telegram Premium", callback_data="b2tg_kind_premium")],
+            [InlineKeyboardButton("🔙 Asosiy menyu", callback_data="back_home")],
+        ])
+    )
+
+
+async def bay2game_telegram_kind_menu(update, context, kind):
+    q = update.callback_query
+    kb, games = bay2game_telegram_keyboard(kind)
+    title = "⭐ Telegram Stars" if kind == "stars" else "💎 Telegram Premium"
     if not games:
         await q.message.reply_text(
-            "⭐ Stars / 💎 Premium paketlari Bay2Game katalogida topilmadi.\n\n"
-            "Admin katalogni yangilab, Bay2Game API ushbu xizmatlarni taqdim etishini tekshirishi kerak.",
-            reply_markup=kb,
+            f"{title} paketlari Bay2Game katalogida topilmadi. Admin katalogni yangilab, API'da aynan shu xizmat borligini tekshirsin.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Orqaga", callback_data="telegram_services")]])
         )
         return
-    await q.message.reply_text(
-        "⭐ <b>Stars / 💎 Premium</b>\n\nBay2Game katalogidan xizmatni tanlang:",
-        parse_mode="HTML", reply_markup=kb
-    )
+    await q.message.reply_text(f"{title} — paketni tanlang:", reply_markup=kb)
 
 
 async def bay2game_telegram_game(update, context, game_id):
@@ -1626,13 +1644,7 @@ async def bay2game_telegram_game(update, context, game_id):
         ).fetchall()
     finally:
         c.close()
-    # Stars/Premium uchun boshqa katalog yoki provider ishlatilmasin:
-    # faqat Bay2Game katalogida nomi Stars yoki Premium bo'lgan xizmatlarga ruxsat.
-    game_name_check = str(game["name"] or "").lower() if game else ""
-    if not game or not any(term in game_name_check for term in ("star", "premium")):
-        await q.message.reply_text("❌ Bu Stars/Premium xizmati Bay2Game katalogida topilmadi.")
-        return
-    if not products:
+    if not game or not products:
         await q.message.reply_text("❌ Bay2Game katalogida paket topilmadi. Admin katalogni yangilasin.")
         return
     context.user_data.clear()
@@ -1665,11 +1677,8 @@ async def bay2game_telegram_package(update, context, game_id, paket_id):
         ).fetchone()
     finally:
         c.close()
-    game_name_check = str(row["game_name"] or "").lower() if row else ""
-    if (not row
-            or not any(term in game_name_check for term in ("star", "premium"))
-            or float(row["sale_price"] or 0) <= 0):
-        await q.message.reply_text("❌ Stars/Premium paketi Bay2Game katalogida topilmadi yoki narxi noto'g'ri.")
+    if not row or float(row["sale_price"] or 0) <= 0:
+        await q.message.reply_text("❌ Paket yoki narx topilmadi. Katalogni yangilang.")
         return
     context.user_data["b2tg_game_id"] = game_id
     context.user_data["b2tg_paket_id"] = paket_id
@@ -1692,11 +1701,6 @@ async def bay2game_telegram_confirm(update, context):
     price = float(context.user_data.get("b2tg_price", 0) or 0)
     game_name = str(context.user_data.get("b2tg_game_name", "Telegram service"))
     product_name = str(context.user_data.get("b2tg_product_name", "Package"))
-    # Tasdiqlash vaqtida ham tekshiramiz: Stars/Premium faqat Bay2Game orqali.
-    if not any(term in game_name.lower() for term in ("star", "premium")):
-        context.user_data.clear()
-        await q.message.reply_text("❌ Stars/Premium buyurtmasi faqat Bay2Game katalogi orqali amalga oshiriladi.")
-        return
     if not game_id or not paket_id or not username or price <= 0:
         context.user_data.clear()
         await q.message.reply_text("❌ Buyurtma ma'lumotlari eskirgan. Qaytadan urinib ko'ring.")
@@ -3023,7 +3027,8 @@ def main_menu():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🎮 O'yinlar", callback_data="games")],
         [InlineKeyboardButton("🚗 Grand Mobile", callback_data="grand_mobile")],
-        [InlineKeyboardButton("⭐ Stars / 💎 Premium", callback_data="telegram_services")],
+        [InlineKeyboardButton("⭐ Telegram Stars", callback_data="b2tg_kind_stars")],
+        [InlineKeyboardButton("💎 Telegram Premium", callback_data="b2tg_kind_premium")],
         # Virtual raqam orqali SMS tasdiqlashni chetlab o'tishga yordam beradigan
         # xarid oqimi menyuda ko'rsatilmaydi.
         [InlineKeyboardButton("⚙️ Botlar sozlamalari", callback_data="bot_list")],
@@ -7166,6 +7171,10 @@ async def callback_router(update, context):
     # Qo'shimcha providerlar
     if d == "telegram_services":
         return await bay2game_telegram_menu(update, context)
+    if d == "b2tg_kind_stars":
+        return await bay2game_telegram_kind_menu(update, context, "stars")
+    if d == "b2tg_kind_premium":
+        return await bay2game_telegram_kind_menu(update, context, "premium")
     if d.startswith("b2tg_game_"):
         return await bay2game_telegram_game(update, context, int(d.rsplit("_", 1)[1]))
     if d.startswith("b2tg_pkg_"):
