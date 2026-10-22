@@ -1035,6 +1035,7 @@ def init_db():
     set_default("donat_markup_percent", DEFAULT_MARKUP)
     set_default("bay2game_usd_uzs", os.getenv("BAY2GAME_USD_UZS", "13000"))
     set_default("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)
+    set_default("stars_unit_price_uzs", "0")
     set_default("premium_markup_percent", TELEGRAM_MARKUP_PERCENT)
     set_default("sim_markup_percent", SIM_MARKUP_PERCENT)
     set_default("referral_bonus_uzs", "100")
@@ -2808,6 +2809,18 @@ def ensure_mobile_legends():
 # FAQAT ADMIN 🔄 KATALOG ORQALI ISHLAYDI
 # ============================================================
 
+def telegram_stars_amount(product_code="", package_name=""):
+    """Telegram Stars paketidagi miqdorni aniqlaydi; Premium paketlarini hisoblamaydi."""
+    code = str(product_code or "").strip().upper()
+    name = str(package_name or "").strip().upper()
+    if not (code.startswith("TELEGRAM_") and code.endswith("_STARS") and "PREMIUM" not in code):
+        return 0
+    match = re.search(r"TELEGRAM_(\d+)_STARS", code)
+    if not match:
+        match = re.search(r"(\d+)\s*(?:STARS|STAR)", name)
+    return int(match.group(1)) if match else 0
+
+
 def sync_catalog():
     """Bay2Game categories va products katalogini yangilaydi."""
     categories = get_games_api()
@@ -2926,11 +2939,16 @@ def sync_catalog():
                         markup = TELEGRAM_MARKUP_PERCENT
                     sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
                 elif "star" in service_words:
-                    try:
-                        markup = Decimal(str(get_setting("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)))
-                    except Exception:
-                        markup = TELEGRAM_MARKUP_PERCENT
-                    sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
+                    unit_price = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+                    stars_amount = telegram_stars_amount(product_code, package_name)
+                    if unit_price > 0 and stars_amount > 0:
+                        sale_price = (unit_price * stars_amount).quantize(Decimal("1"))
+                    else:
+                        try:
+                            markup = Decimal(str(get_setting("stars_markup_percent", TELEGRAM_MARKUP_PERCENT)))
+                        except Exception:
+                            markup = TELEGRAM_MARKUP_PERCENT
+                        sale_price = (api_uzs * (Decimal("1") + markup / Decimal("100"))).quantize(Decimal("1"))
                 else:
                     sale_price = calc_sale_price(api_uzs)
                 product_status = str(product.get("status", "active")).lower()
@@ -3335,7 +3353,7 @@ def admin_kb(context=None):
         ],
         [InlineKeyboardButton("🔗 Referal bonusini sozlash", callback_data="adm_referral_bonus")],
         [
-            InlineKeyboardButton("⭐ Stars ustama", callback_data="adm_markup_stars"),
+            InlineKeyboardButton("⭐ 1 ta Stars narxi", callback_data="adm_markup_stars"),
             InlineKeyboardButton("💎 Premium ustama", callback_data="adm_markup_premium")
         ],
         [
@@ -6414,6 +6432,54 @@ async def admin_text_handler(update, context):
         return True
 
     # ========================================================
+    # TELEGRAM STARS UNIT PRICE
+    # ========================================================
+    if state == "set_stars_unit_price":
+        try:
+            unit_price = Decimal(text.replace(",", "").replace(" ", "").replace("so'm", "").strip())
+        except Exception:
+            await update.message.reply_text("❌ Narx raqam bo'lishi kerak. Masalan: 200")
+            return True
+        if unit_price < 0 or unit_price > Decimal("100000000"):
+            await update.message.reply_text("❌ Narx 0 dan 100 000 000 so'mgacha bo'lishi kerak.")
+            return True
+        set_setting("stars_unit_price_uzs", str(unit_price))
+        c = conn()
+        rows = c.execute(
+            "SELECT game_id,paket_id,package_name,provider_product_code FROM products WHERE active=1"
+        ).fetchall()
+        changed = 0
+        propagated = []
+        for row in rows:
+            amount = telegram_stars_amount(row["provider_product_code"], row["package_name"])
+            if not amount:
+                continue
+            if unit_price > 0:
+                new_price = (unit_price * amount).quantize(Decimal("1"))
+                c.execute(
+                    "UPDATE products SET sale_price=?,updated_at=? WHERE game_id=? AND paket_id=?",
+                    (float(new_price), datetime.now().isoformat(), row["game_id"], row["paket_id"])
+                )
+                propagated.append((row["game_id"], row["paket_id"], new_price))
+                changed += 1
+        c.commit()
+        c.close()
+        for game_id, paket_id, new_price in propagated:
+            propagate_product_price(game_id, paket_id, new_price)
+        context.user_data.clear()
+        if unit_price > 0:
+            reply = (f"✅ 1 ta Stars narxi saqlandi: {unit_price:,.0f} so'm\n"
+                     f"📦 {changed} ta Stars paketi yangilandi.\n"
+                     "Misol: 50 Stars = 50 × belgilangan narx.\n"
+                     "Keyingi katalog yangilanishida ham shu narx ishlatiladi.")
+        else:
+            reply = ("✅ 1 ta Stars narxi o'chirildi.\n"
+                     "Endi Stars paketlari eski foizli ustama bo'yicha hisoblanadi.\n"
+                     "Narxlarni yangilash uchun katalogni qayta sinxronlang.")
+        await update.message.reply_text(reply, reply_markup=admin_kb(context))
+        return True
+
+    # ========================================================
     # ALOHIDA USTAMALAR
     # ========================================================
     if state in ("markup_donat", "markup_sim", "markup_stars", "markup_premium"):
@@ -7342,8 +7408,35 @@ async def admin_callback(update, context):
     elif d == "adm_markup_sim":
         await admin_markup_start(update, context, "sim")
 
+    elif d == "adm_stars_unit_price":
+        if q.from_user.id != bot_admin_id(context):
+            await q.answer("Siz admin emassiz.", show_alert=True)
+            return
+        current = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+        context.user_data.clear()
+        context.user_data["admin_state"] = "set_stars_unit_price"
+        await q.message.reply_text(
+            "⭐ 1 ta Telegram Stars narxi\n\n"
+            f"Hozirgi narx: {current:,.0f} so'm\n\n"
+            "Bitta Stars uchun yangi narxni so'mda yuboring.\n"
+            "Misol: 200\n"
+            "0 yuborsangiz, eski foizli ustama hisobiga qaytadi."
+        )
+
     elif d == "adm_markup_stars":
-        await admin_markup_start(update, context, "stars")
+        if q.from_user.id != bot_admin_id(context):
+            await q.answer("Siz admin emassiz.", show_alert=True)
+            return
+        current = Decimal(str(get_setting("stars_unit_price_uzs", "0") or "0"))
+        context.user_data.clear()
+        context.user_data["admin_state"] = "set_stars_unit_price"
+        await q.message.reply_text(
+            "⭐ 1 ta Telegram Stars narxi\n\n"
+            f"Hozirgi narx: {current:,.0f} so'm\n\n"
+            "Bitta Stars uchun yangi narxni so'mda yuboring.\n"
+            "Misol: 200\n"
+            "0 yuborsangiz, avvalgi foizli hisoblashga qaytadi."
+        )
 
     elif d == "adm_markup_premium":
         await admin_markup_start(update, context, "premium")
