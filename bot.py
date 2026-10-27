@@ -7515,7 +7515,7 @@ async def admin_callback(update, context):
         context.user_data.clear()
         context.user_data["admin_state"] = "bay2game_usd_uzs"
         await q.message.reply_text(
-            "💱 BAY2GAME USD KURSI\n\n"
+            "💱 Donuz USD KURSI\n\n"
             f"Hozirgi kurs: 1 USD = {current_rate:,.2f} so'm\n\n"
             "Yangi kursni so'mda yuboring.\n"
             "Masalan: 13000\n\n"
