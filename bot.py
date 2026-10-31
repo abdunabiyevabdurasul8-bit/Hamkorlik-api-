@@ -1144,13 +1144,15 @@ def ensure_external_schema():
             "quantity": "DOUBLE PRECISION DEFAULT 0",
             "months": "BIGINT DEFAULT 0",
             "provider_order_id": "TEXT DEFAULT ''",
-            "user_message_id": "BIGINT DEFAULT 0",
-            "user_chat_id": "BIGINT DEFAULT 0",
-            "refunded": "BIGINT DEFAULT 0",
         }
         for name, typ in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
+
+        # Eski bazalarda payments.requested_amount ustuni bo'lmasligi mumkin.
+        payment_columns = {r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
+        if "requested_amount" not in payment_columns:
+            c.execute("ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0")
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
@@ -2472,13 +2474,23 @@ def bay2game_create_order(product_code, player_id, server_id=""):
         error_text = str(
             raw.get("error") or raw.get("message") or
             nested.get("error") or nested.get("message") or
-            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
+            f"Buyurtma javobi noaniq (HTTP {status}, status={order_status})."
         )
+        # Tarmoq uzilishi/timeout yoki server xatosi buyurtma qabul qilinmaganini
+        # isbotlamaydi. Shu reference bilan tekshirish uchun processing holatida saqlaymiz.
+        uncertain = (status == 0 or status in (408, 425, 429) or status >= 500)
+        if uncertain:
+            log.warning("Bay2Game javobi noaniq; refund qilinmaydi: HTTP=%s ref=%s", status, reference)
+            return status, {
+                "ok": True, "uncertain": True, "order_id": reference,
+                "reference": reference, "status": "processing", "error": error_text,
+                "price": {"amount": 0}, "charged": {"amount": 0}, "raw": raw,
+            }
         log.error(
             "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
             status, order_status, error_text[:500], list(raw.keys())
         )
-        return status, {"ok": False, "error": error_text, "raw": raw}
+        return status, {"ok": False, "error": error_text, "reference": reference, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -3380,6 +3392,7 @@ def admin_kb(context=None):
     if show_platform_controls:
         rows.insert(6, [InlineKeyboardButton("💱 Bay2Game USD kursi", callback_data="adm_bay2game_rate")])
         rows.append([InlineKeyboardButton("🔄 Katalog", callback_data="a_sync")])
+        rows.append([InlineKeyboardButton("🔐 Bay2Game balansi", callback_data="adm_playpay_balance")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -4392,53 +4405,48 @@ async def confirm(update, context):
 
     if not data.get("ok"):
 
-        err_text = str(data.get("error") or data.get("message") or "").lower()
-        # Faqat aniq rad javobi bo'lsa darhol refund. Timeout/5xx/noaniq javob
-        # buyurtma provayderda yaratilgan bo'lishi mumkin, shuning uchun pulni ushlab turamiz.
-        definite_reject = int(status or 0) in (400, 401, 403, 404, 422) and any(
-            token in err_text for token in (
-                "invalid", "not found", "rejected", "insufficient", "unauthorized",
-                "forbidden", "player id", "userid", "user id", "product code"
-            )
+        add_balance(
+            uid,
+            price,
+            "order_refund",
+            "Bay2Game API xatosi: "
+            f"{data.get('error','unknown')}"
         )
 
-        if definite_reject:
-            add_balance(
-                uid, price, "order_refund",
-                "Aniq rad etilgan Bay2Game buyurtmasi: " + (err_text or str(status))
-            )
-            await q.message.reply_text(
-                "❌ Buyurtma qabul qilinmadi.\n\n"
-                f"💰 {price:,.0f} so'm balansingizga qaytarildi.",
-                reply_markup=main_menu()
-            )
-        else:
-            # Noaniq javob: refundni ikki marta yoki buyurtma bajarilgan paytda bermaslik.
-            c = conn()
-            cur = c.execute(
-                """INSERT INTO orders
-                (user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
-                 cost_usd,charged_usd,sale_price,status,created_at,updated_at,provider,service_type)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (uid, "", int(game_id), int(paket_id), context.user_data.get("offer_name", "Paket"),
-                 player_id, json.dumps({"player_id": player_id, "server_id": server_id}, ensure_ascii=False),
-                 0, 0, float(price), "review", datetime.now().isoformat(), datetime.now().isoformat(),
-                 "bay2game", "game_topup")
-            )
-            local_order_id = cur.lastrowid
-            c.commit(); c.close()
-            await q.message.reply_text(
-                f"⏳ Buyurtma holati tekshirilmoqda.\n\n📦 {context.user_data.get('offer_name','Paket')}\n"
-                f"🆔 ID: {player_id}\n🔢 Buyurtma: {local_order_id}#\n"
-                "Pul hozircha balansdan ushlab turildi. Natija aniqlangach xabar beramiz.",
-                reply_markup=main_menu()
-            )
+        # Foydalanuvchiga provider/API yoki sayt nomi ko'rsatilmaydi.
+        await q.message.reply_text(
+            "❌ Xatolik\n\n"
+            f"💰 Pul balansingizga qaytarildi: {price:,.0f} so'm",
+            reply_markup=main_menu()
+        )
 
+        try:
+            tg_user = q.from_user
+            uname = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "username yo'q"
+            await context.bot.send_message(
+                chat_id=bot_admin_id(context),
+                text=(
+                    "⚠️ BUYURTMA XATOSI / PUL QAYTARILDI\n\n"
+                    f"👤 Foydalanuvchi: {tg_user.full_name} ({uname})\n"
+                    f"🆔 Telegram ID: {uid}\n"
+                    f"🎮 O'yin ID: {game_id} | Paket ID: {paket_id}\n"
+                    f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
+                    f"🆔 Player ID: {player_id}\n"
+                    f"🌐 Server ID: {server_id or '-'}\n"
+                    f"💰 Summa: {price:,.0f} so'm\n"
+                    f"📊 HTTP: {status}\n"
+                    f"🔎 Xato: {str(data.get('error') or data.get('message') or "Noma'lum")[:500]}\n"
+                    "💳 Holat: pul balansga qaytarildi"
+                )
+            )
+        except Exception:
+            log.exception("Admin buyurtma xabari yuborilmadi")
         await notify_bot_owner_technical(
-            context, uid,
-            details=(data.get("error") or data.get("message") or f"HTTP status: {status}")
+            context,
+            uid,
+            details=data.get("error") or data.get("message") or f"HTTP status: {status}",
         )
-        context.user_data.clear()
+
         return
 
     playpay_id = data.get(
@@ -4553,22 +4561,16 @@ async def confirm(update, context):
             f"🌐 Server ID: {server_id}\n"
         )
 
-    user_status_message = await q.message.reply_text(
-        f"⏳ Buyurtma qabul qilindi\n\n"
+    await q.message.reply_text(
+        f"✅ Buyurtma yuborildi!\n\n"
         f"📦 {context.user_data.get('offer_name','Paket')}\n"
         f"🆔 {id_label}: {player_id}\n"
         f"{user_extra}"
         f"💰 {price:,.0f} so'm\n"
-        f"🔢 Buyurtma raqami: {local_order_id}#\n"
-        f"📊 Holat: {order_status}",
+        f"🔢 Buyurtma raqami: {playpay_id}\n"
+        f"📊 Status: {order_status}",
         reply_markup=main_menu()
     )
-    c = conn()
-    c.execute(
-        "UPDATE orders SET user_message_id=?, user_chat_id=? WHERE id=?",
-        (int(user_status_message.message_id), int(user_status_message.chat_id), int(local_order_id))
-    )
-    c.commit(); c.close()
 
     # ========================================================
     # ADMIN: batafsil buyurtma hisoboti
@@ -7120,99 +7122,99 @@ async def admin_media_handler(
 # ============================================================
 
 async def check_orders(context):
-    """Provider statusini tekshiradi; noaniq xatoda pul qaytarmaydi va xabarni tahrirlaydi."""
+
     set_request_db(context)
     c = conn()
+
     rows = c.execute(
-        """SELECT * FROM orders
-           WHERE lower(status) IN ('processing','pending','in_progress','in progress','created')
-             AND playpay_order_id IS NOT NULL AND playpay_order_id!=''
-           ORDER BY id ASC LIMIT 50"""
+        """
+        SELECT *
+        FROM orders
+        WHERE status IN
+        ('processing','pending')
+          AND playpay_order_id IS NOT NULL
+          AND playpay_order_id!=''
+        ORDER BY id ASC
+        LIMIT 30
+        """
     ).fetchall()
+
     c.close()
 
-    success_states = {"success", "successful", "completed", "complete", "done", "delivered"}
-    failure_states = {"failed", "failure", "rejected", "cancelled", "canceled", "declined", "error"}
-
     for r in rows:
+
         try:
-            status_code, data = await asyncio.to_thread(get_playpay_order, r["playpay_order_id"])
-            # API xatosi yoki vaqtinchalik aloqa muammosi — buyurtma statusini o'zgartirmaymiz.
-            if not isinstance(data, dict) or not data.get("ok"):
-                continue
-            order = data.get("order") if isinstance(data.get("order"), dict) else data
-            raw_status = str(order.get("status") or r["status"] or "processing").strip().lower()
-            if raw_status in success_states:
-                new_status = "success"
-            elif raw_status in failure_states:
-                new_status = "failed"
-            else:
-                new_status = raw_status or "processing"
 
-            old_status = str(r["status"] or "").lower()
-            if new_status == old_status:
-                continue
-
-            # Status va refund flag birga yangilanadi; takroriy tekshiruv refundni takrorlamaydi.
-            c = conn()
-            current = c.execute("SELECT status,refunded FROM orders WHERE id=?", (r["id"],)).fetchone()
-            if not current or str(current["status"] or "").lower() not in ("processing", "pending", "in_progress", "in progress", "created"):
-                c.close(); continue
-            c.execute("UPDATE orders SET status=?,updated_at=? WHERE id=?",
-                      (new_status, datetime.now().isoformat(), r["id"]))
-            should_refund = new_status == "failed" and not int(current["refunded"] or 0)
-            if should_refund:
-                c.execute("UPDATE orders SET refunded=1 WHERE id=?", (r["id"],))
-            c.commit(); c.close()
-
-            if should_refund:
-                add_balance(r["user_id"], Decimal(str(r["sale_price"] or 0)),
-                            "order_refund", f"Buyurtma #{r['id']} yakuniy rad etildi")
-
-            status_text = {
-                "success": "✅ Muvaffaqiyatli bajarildi",
-                "failed": "❌ Buyurtma bajarilmadi. Pul balansingizga qaytarildi",
-            }.get(new_status, f"⏳ Jarayonda: {new_status}")
-            order_text = (
-                f"📦 Buyurtma #{r['id']}#\n\n"
-                f"🎮 {r['product_name'] or 'Donat'}\n"
-                f"🆔 Player ID: {r['player_id'] or '—'}\n"
-                f"💰 Narx: {float(r['sale_price'] or 0):,.0f} so'm\n"
-                f"📊 Holat: {status_text}"
+            status, data = await asyncio.to_thread(
+                get_playpay_order,
+                r["playpay_order_id"]
             )
-            chat_id = r["user_chat_id"] if "user_chat_id" in r.keys() else r["user_id"]
-            message_id = r["user_message_id"] if "user_message_id" in r.keys() else 0
-            edited = False
-            if chat_id and message_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=int(chat_id), message_id=int(message_id), text=order_text,
-                        reply_markup=main_menu()
-                    )
-                    edited = True
-                except Exception:
-                    pass
-            if not edited:
-                try:
-                    await context.bot.send_message(chat_id=int(r["user_id"]), text=order_text,
-                                                   reply_markup=main_menu())
-                except Exception:
-                    log.exception("Foydalanuvchiga status yuborilmadi: order=%s", r["id"])
 
+            if not data.get("ok"):
+
+                continue
+
+            order = data.get(
+                "order",
+                data
+            )
+
+            new_status = order.get(
+                "status",
+                r["status"]
+            )
+
+            if new_status == r["status"]:
+
+                continue
+
+            c = conn()
+
+            c.execute(
+                """
+                UPDATE orders
+                SET status=?,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (
+                    new_status,
+                    datetime.now().isoformat(),
+                    r["id"]
+                )
+            )
+
+            c.commit()
+            c.close()
+
+            await context.bot.send_message(
+                r["user_id"],
+                f"📦 Buyurtma #{r['id']}\n\n"
+                f"📊 Yangi status: {new_status}"
+            )
             try:
                 await context.bot.send_message(
                     chat_id=bot_admin_id(context),
-                    text=(f"📣 BUYURTMA STATUSI YANGILANDI\n\n"
-                          f"🔢 Buyurtma: {r['id']}#\n👤 User ID: {r['user_id']}\n"
-                          f"📦 {r['product_name'] or 'Donat'}\n🆔 Player ID: {r['player_id'] or '—'}\n"
-                          f"💰 Summa: {float(r['sale_price'] or 0):,.0f} so'm\n"
-                          f"📊 Yangi status: {new_status}\n"
-                          f"🕒 {datetime.now(ZoneInfo('Asia/Tashkent')).strftime('%Y-%m-%d %H:%M:%S')}")
+                    text=(
+                        f"🔔 BUYURTMA HOLATI O'ZGARDI #{r['id']}\n\n"
+                        f"👤 Foydalanuvchi ID: {r['user_id']}\n"
+                        f"🎮 O'yin ID: {r['game_id']}\n"
+                        f"📦 Paket: {r['product_name']}\n"
+                        f"🆔 Player ID: {r['player_id']}\n"
+                        f"🔢 Provayder ID: {r['playpay_order_id']}\n"
+                        f"📊 Yangi holat: {new_status}\n"
+                        f"🕒 Vaqt: {datetime.now(ZoneInfo('Asia/Tashkent')).strftime('%Y-%m-%d %H:%M:%S')}"
+                    )
                 )
             except Exception:
-                log.exception("Admin status xabari yuborilmadi: order=%s", r["id"])
-        except Exception:
-            log.exception("Order status tekshirishda xato: order=%s", r["id"])
+                log.exception("Admin status xabari yuborilmadi")
+
+        except Exception as e:
+
+            log.error(
+                "Order status xatosi: %s",
+                e
+            )
 
 
 # ============================================================
@@ -7252,15 +7254,16 @@ async def rating_callback(update, context):
             u.username,
             u.first_name,
             COUNT(o.id) AS orders,
-            COALESCE(SUM(o.sale_price), 0) AS spent
+            COALESCE(
+                SUM(o.sale_price),
+                0
+            ) AS spent
         FROM users u
         LEFT JOIN orders o
           ON u.user_id=o.user_id
          AND o.created_at>=?
-         AND lower(COALESCE(o.status,'')) IN ('success','successful','completed','complete','done','delivered')
         GROUP BY u.user_id
-        HAVING COUNT(o.id) > 0
-        ORDER BY orders DESC, spent DESC
+        ORDER BY spent DESC
         LIMIT 20
         """,
         (
@@ -7283,6 +7286,10 @@ async def rating_callback(update, context):
     n = 1
 
     for r in rows:
+
+        if r["spent"] <= 0:
+
+            continue
 
         text += (
             f"{n}. "
@@ -7515,7 +7522,7 @@ async def admin_callback(update, context):
         context.user_data.clear()
         context.user_data["admin_state"] = "bay2game_usd_uzs"
         await q.message.reply_text(
-            "💱 Donuz USD KURSI\n\n"
+            "💱 BAY2GAME USD KURSI\n\n"
             f"Hozirgi kurs: 1 USD = {current_rate:,.2f} so'm\n\n"
             "Yangi kursni so'mda yuboring.\n"
             "Masalan: 13000\n\n"
