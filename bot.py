@@ -158,6 +158,9 @@ import asyncio
 import threading
 import contextvars
 import hashlib
+import hmac
+import urllib.parse
+import mimetypes
 import base64
 import html
 import re
@@ -207,6 +210,9 @@ except (ValueError, TypeError):
     ADMIN_ID = 0
 
 BAY2GAME_API_KEY = os.getenv("BAY2GAME_API_KEY", "").strip()
+PLAYPAY_API_KEY = os.getenv("PLAYPAY_API_KEY", "").strip()
+PLAYPAY_BASE = os.getenv("PLAYPAY_BASE", "https://playpay.uz/api/v1").rstrip("/")
+ORDER_CHANNEL_ID = os.getenv("ORDER_CHANNEL_ID", "@Donuz_Buyurtmlar").strip() or "@Donuz_Buyurtmlar"
 BAY2GAME_BASE = os.getenv("BAY2GAME_BASE", "https://api.bay2game.xyz/api").rstrip("/")
 # Bay2Game narxlari USD da. Kurs Render ENV orqali beriladi; admin ustamasi bot ichida boshqariladi.
 try:
@@ -300,6 +306,36 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+
+async def notify_order_channel(context, message):
+    """Har bir bot buyurtmasini asosiy bot orqali Donuz kanaliga yuboradi."""
+    try:
+        return await asyncio.to_thread(web_notify_order_channel, message)
+    except Exception as exc:
+        log.error("Buyurtma kanaliga xabar yuborilmadi (%s): %s", ORDER_CHANNEL_ID, type(exc).__name__)
+        return False
+
+
+def web_notify_order_channel(message):
+    """Sayt buyurtmalari uchun kanalga xabar yuborish."""
+    if not BOT_TOKEN:
+        log.error("Buyurtma kanaliga xabar yuborilmadi: BOT_TOKEN yo'q")
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": ORDER_CHANNEL_ID, "text": message},
+            timeout=20,
+        )
+        data = response.json() if response.content else {}
+        if not response.ok or not data.get("ok"):
+            log.error("Kanal xabari Telegram tomonidan rad etildi: %s", data.get("description", response.status_code))
+            return False
+        return True
+    except Exception as exc:
+        log.exception("Sayt buyurtmasini kanalga yuborishda xato: %s", type(exc).__name__)
+        return False
 
 
 
@@ -501,20 +537,21 @@ def web_check_id(payload):
 
 
 def web_create_order(payload, user_id):
-    game_id = int(payload.get("game_id", 0))
-    paket_id = int(payload.get("paket_id", 0))
+    """Sayt buyurtmasi: buyurtma tarixi DBga yozilmaydi, xabar mijoz va kanalga boradi."""
+    try:
+        game_id = int(payload.get("game_id", 0))
+        paket_id = int(payload.get("paket_id", 0))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "O'yin yoki paket noto'g'ri."}
+
     player_id = str(payload.get("player_id", "")).strip()
     server_id = str(payload.get("server_id", "")).strip()
-
     if not player_id:
         return {"ok": False, "error": "ID kiritilmagan."}
 
     c = main_conn()
     p = c.execute(
-        """
-        SELECT * FROM products
-        WHERE game_id=? AND paket_id=? AND active=1
-        """,
+        "SELECT * FROM products WHERE game_id=? AND paket_id=? AND active=1",
         (game_id, paket_id)
     ).fetchone()
     c.close()
@@ -533,181 +570,109 @@ def web_create_order(payload, user_id):
     if price <= 0:
         return {"ok": False, "error": "Narx noto'g'ri."}
 
-    balance = get_balance(user_id)
+    balance = Decimal(str(get_balance(user_id)))
     if balance < price:
-        return {
-            "ok": False,
-            "error": "Balans yetarli emas.",
-            "balance": float(balance),
-            "required": float(price),
-        }
+        return {"ok": False, "error": "Balans yetarli emas.", "balance": float(balance), "required": float(price)}
 
-    # ID qabul qilinadi; Bay2Game tekshiruvni buyurtma vaqtida bajaradi.
     if game_id != GRAND_MOBILE_GAME_ID:
-        check = web_check_id({
-            "game_id": game_id,
-            "player_id": player_id,
-            "server_id": server_id,
-        })
+        check = web_check_id({"game_id": game_id, "player_id": player_id, "server_id": server_id})
         if not check.get("ok"):
-            return {
-                "ok": False,
-                "error": "ID tekshirilmadi.",
-                "details": check,
-            }
+            return {"ok": False, "error": "ID tekshirilmadi.", "details": check}
 
-    web_token = uuid.uuid4().hex + uuid.uuid4().hex
-    now = datetime.now().isoformat()
-    c = main_conn()
-    c.execute(
-        """
-        INSERT INTO web_orders(
-            token,user_id,game_id,paket_id,product_name,player_id,
-            server_id,price,status,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            web_token, int(user_id), game_id, paket_id, product_name,
-            player_id, server_id, float(price), "processing", now, now
-        )
-    )
-    web_order_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
-    c.commit()
-    c.close()
+    # Mablag'ni yechish; order ma'lumotlari alohida jadvalga yozilmaydi.
+    add_balance(user_id, -price, "order_hold", f"Sayt buyurtmasi: {product_name}")
+    now_text = datetime.now(ZoneInfo("Asia/Tashkent")).strftime("%d.%m.%Y %H:%M:%S")
 
-    # Balansni ushlab turamiz.
-    add_balance(
-        user_id, -price, "order_hold",
-        f"Web sayt buyurtma #{web_order_id}: {product_name}"
-    )
-
-    # Grand Mobile manual buyurtma
     if game_id == GRAND_MOBILE_GAME_ID:
-        c = main_conn()
-        cur = c.execute(
-            """
-            INSERT INTO orders(
-                user_id,playpay_order_id,game_id,paket_id,product_name,
-                player_id,fields_json,cost_usd,charged_usd,sale_price,
-                status,created_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                int(user_id), f"WEB-{web_order_id}", game_id, paket_id,
-                product_name, player_id,
-                json.dumps({"player_id": player_id}, ensure_ascii=False),
-                0, 0, float(price), "manual_pending", now, now
-            )
+        notice = (
+            f"🚗 YANGI GRAND MOBILE BUYURTMA\n\n"
+            f"📦 {product_name}\n🆔 ID: {player_id}\n"
+            f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
+            f"🕒 {now_text}\n📊 Holat: Manual tekshiruvda"
         )
-        local_id = cur.lastrowid
-        c.execute(
-            "UPDATE web_orders SET status='manual_pending',updated_at=? WHERE id=?",
-            (datetime.now().isoformat(), web_order_id)
+        sent_channel = web_notify_order_channel(notice)
+        sent_user = _web_send_telegram_message(
+            user_id,
+            "✅ Buyurtmangiz qabul qilindi!\n\n" + notice
         )
-        c.commit()
-        c.close()
+        if not sent_channel or not sent_user:
+            log.error("Grand Mobile web buyurtma xabari to'liq yuborilmadi: channel=%s user=%s", sent_channel, sent_user)
+        return {"ok": True, "status": "manual_pending", "message": "Buyurtma qabul qilindi. Telegram xabaringizni tekshiring."}
 
-        if ADMIN_ID:
-            _web_send_telegram_message(
-                ADMIN_ID,
-                "🆕 WEB GRAND MOBILE BUYURTMA\n\n"
-                f"📦 {product_name}\n"
-                f"🆔 ID: {player_id}\n"
-                f"💰 {price:,.0f} so'm\n"
-                f"👤 Telegram ID: {user_id}\n"
-                f"📋 Buyurtma: #{local_id}"
-            )
-
-        return {
-            "ok": True,
-            "status": "manual_pending",
-            "order_id": local_id,
-            "message": "Buyurtma qabul qilindi. Grand Mobile buyurtmasi manual bajariladi.",
-        }
-
-    # Bay2Game buyurtma
-    body = {
-        "game_id": game_id,
-        "paket_id": paket_id,
-        "player_id": player_id,
-    }
+    body = {"game_id": game_id, "paket_id": paket_id, "player_id": player_id}
     if server_id:
         body["server_id"] = server_id
-
     status, data = api_post("/order", body)
 
     if not isinstance(data, dict) or not data.get("ok"):
-        add_balance(
-            user_id, price, "order_refund",
-            f"Web sayt Bay2Game xatosi: {str(data)[:250]}"
-        )
-        c = main_conn()
-        c.execute(
-            "UPDATE web_orders SET status='failed',updated_at=? WHERE id=?",
-            (datetime.now().isoformat(), web_order_id)
-        )
-        c.commit()
-        c.close()
-        return {
-            "ok": False,
-            "error": "Buyurtmani bajarib bo'lmadi. Pul balansingizga qaytarildi.",
-        }
+        add_balance(user_id, price, "order_refund", f"Sayt buyurtmasi bekor qilindi: {str(data)[:200]}")
+        return {"ok": False, "error": "Buyurtmani bajarib bo'lmadi. Pul balansingizga qaytarildi."}
 
     provider_order_id = str(data.get("order_id", ""))
+    order_status = str(data.get("status", "processing"))
+    notice = (
+        f"🛒 YANGI BUYURTMA\n\n📦 {product_name}\n"
+        f"🆔 O'yinchi ID: {player_id}\n"
+        + (f"🌐 Server ID: {server_id}\n" if server_id else "")
+        + f"💰 Summa: {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
+        f"🕒 {now_text}\n🔢 Provayder ID: {provider_order_id or '-'}\n📊 Holat: {order_status}"
+    )
+    sent_channel = web_notify_order_channel(notice)
+    sent_user = _web_send_telegram_message(user_id, "✅ Buyurtmangiz qabul qilindi!\n\n" + notice)
+    if not sent_channel or not sent_user:
+        log.error("Web buyurtma xabari to'liq yuborilmadi: channel=%s user=%s", sent_channel, sent_user)
+
+    return {"ok": True, "status": order_status, "provider_order_id": provider_order_id,
+            "message": "Buyurtma qabul qilindi. Telegram xabaringizni tekshiring."}
+
+
+def verify_telegram_webapp_init_data(init_data, max_age_seconds=86400):
+    """Telegram Mini App initData HMAC tekshiruvi. Foydalanuvchi ID clientdan ishonilmaydi."""
+    if not BOT_TOKEN or not init_data:
+        return None
+    try:
+        pairs = dict(urllib.parse.parse_qsl(str(init_data), keep_blank_values=True, strict_parsing=False))
+        received_hash = pairs.pop("hash", "")
+        # Telegram Mini App klientlari "signature" maydonini ham yuborishi mumkin.
+        # Bot-token HMAC tekshiruvida hash va signature data-check-stringga kiritilmaydi.
+        pairs.pop("signature", None)
+        if not received_hash:
+            log.warning("Mini App auth rad etildi: initData ichida hash yo'q")
+            return None
+        data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        calculated = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calculated, received_hash):
+            log.warning("Mini App auth rad etildi: HMAC mos kelmadi (BOT_TOKEN yoki initData tekshiring)")
+            return None
+        auth_date = int(pairs.get("auth_date", "0"))
+        now_ts = int(datetime.now().timestamp())
+        if auth_date <= 0 or auth_date > now_ts + 60 or now_ts - auth_date > max_age_seconds:
+            log.warning("Mini App auth rad etildi: auth_date yaroqsiz yoki eskirgan")
+            return None
+        user_obj = json.loads(pairs.get("user", "{}"))
+        uid = int(user_obj.get("id", 0))
+        return {"user_id": uid, "user": user_obj} if uid > 0 else None
+    except Exception:
+        log.exception("Telegram Mini App initData tekshirish xatosi")
+        return None
+
+
+def web_create_mini_session(user_id):
     c = main_conn()
+    user = c.execute("SELECT user_id FROM users WHERE user_id=?", (int(user_id),)).fetchone()
+    if not user:
+        c.close()
+        return None
+    token = uuid.uuid4().hex + uuid.uuid4().hex
+    expires = datetime.now() + timedelta(hours=WEB_SESSION_HOURS)
     c.execute(
-        "UPDATE web_orders SET status=?,playpay_order_id=?,updated_at=? WHERE id=?",
-        (
-            str(data.get("status", "processing")),
-            provider_order_id,
-            datetime.now().isoformat(),
-            web_order_id,
-        )
+        "INSERT INTO web_sessions(token,user_id,expires_at,created_at) VALUES(?,?,?,?)",
+        (token, int(user_id), expires.isoformat(), datetime.now().isoformat()),
     )
-    c.execute(
-        """
-        INSERT INTO orders(
-            user_id,playpay_order_id,game_id,paket_id,product_name,
-            player_id,fields_json,cost_usd,charged_usd,sale_price,
-            status,created_at,updated_at
-        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            int(user_id), provider_order_id, game_id, paket_id,
-            product_name, player_id,
-            json.dumps({"player_id": player_id, "server_id": server_id}, ensure_ascii=False),
-            float((data.get("price") or {}).get("amount", 0) or 0),
-            float((data.get("charged") or {}).get("amount", 0) or 0),
-            float(price), str(data.get("status", "processing")),
-            now, now,
-        )
-    )
-    local_id = c.execute("SELECT last_insert_rowid()").fetchone()[0]
     c.commit()
     c.close()
-
-    order_notice = (
-        f"🆕 WEB BUYURTMA #{local_id}\n\n"
-        f"📦 {product_name}\n🆔 ID: {player_id}\n"
-        f"💰 {price:,.0f} so'm\n👤 Telegram ID: {user_id}\n"
-        f"📊 {data.get('status', 'processing')}"
-    )
-    if ADMIN_ID:
-        _web_send_telegram_message(ADMIN_ID, order_notice)
-    _web_send_telegram_message(
-        user_id,
-        f"✅ Buyurtmangiz qabul qilindi!\n\n📋 Buyurtma: #{local_id}\n"
-        f"📦 {product_name}\n🆔 ID: {player_id}\n💰 {price:,.0f} so'm\n"
-        f"📊 Holat: {data.get('status', 'processing')}"
-    )
-
-    return {
-        "ok": True,
-        "status": str(data.get("status", "processing")),
-        "order_id": local_id,
-        "provider_order_id": provider_order_id,
-        "message": "Buyurtma qabul qilindi.",
-    }
+    return token
 
 
 class WebAPIHandler(BaseHTTPRequestHandler):
@@ -740,6 +705,18 @@ class WebAPIHandler(BaseHTTPRequestHandler):
             return h[7:].strip()
         return ""
 
+    def _serve_file(self, relative_path, content_type):
+        file_path = Path(__file__).resolve().parent / relative_path
+        if not file_path.is_file():
+            return self._reply({"ok": False, "error": "Mini App fayli topilmadi."}, 404)
+        raw = file_path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_HEAD(self):
         from urllib.parse import urlparse
         if urlparse(self.path).path in ("/", "/health"):
@@ -763,12 +740,15 @@ class WebAPIHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         try:
-            if path == "/" or path == "/health":
-                return self._reply({
-                    "ok": True,
-                    "service": "GAME DONAT",
-                    "status": "online",
-                })
+            if path == "/health":
+                return self._reply({"ok": True, "service": "DONUZ MINI APP", "status": "online"})
+
+            if path == "/":
+                return self._serve_file("templates/miniapp.html", "text/html; charset=utf-8")
+            if path == "/static/miniapp.js":
+                return self._serve_file("static/miniapp.js", "application/javascript; charset=utf-8")
+            if path == "/static/miniapp.css":
+                return self._serve_file("static/miniapp.css", "text/css; charset=utf-8")
 
             if path == "/api/catalog":
                 return self._reply({"ok": True, "games": web_catalog()})
@@ -796,6 +776,16 @@ class WebAPIHandler(BaseHTTPRequestHandler):
         payload = self._body()
 
         try:
+            if path == "/api/mini/auth":
+                verified = verify_telegram_webapp_init_data(payload.get("init_data", ""))
+                if not verified:
+                    return self._reply({"ok": False, "error": "Telegram sessiyasi tasdiqlanmadi. Botni qayta oching."}, 401)
+                uid = verified["user_id"]
+                token = web_create_mini_session(uid)
+                if not token:
+                    return self._reply({"ok": False, "error": "Avval Donuz botda /start bosing."}, 403)
+                return self._reply({"ok": True, "token": token, "user_id": uid, "balance": float(get_balance(uid)), "first_name": verified["user"].get("first_name", "")})
+
             if path == "/api/auth/request":
                 try:
                     uid = int(payload.get("telegram_id", 0))
@@ -895,12 +885,22 @@ def init_db():
     CREATE TABLE IF NOT EXISTS payments(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
-        requested_amount REAL,
+        amount REAL DEFAULT 0,
+        requested_amount REAL DEFAULT 0,
         approved_amount REAL DEFAULT 0,
         photo_id TEXT,
         status TEXT DEFAULT 'pending',
         created_at TEXT,
         approved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS uzcard_auto_payments(
+        final_amount INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        requested_amount INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        created_at TEXT NOT NULL,
+        paid_at TEXT DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS games(
@@ -928,6 +928,7 @@ def init_db():
 
     CREATE TABLE IF NOT EXISTS orders(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_id INTEGER NOT NULL DEFAULT 0,
         user_id INTEGER,
         playpay_order_id TEXT,
         game_id INTEGER,
@@ -1025,6 +1026,28 @@ def init_db():
     );
     """)
 
+    # Eski bazalarda payments jadvali turlicha bo'lishi mumkin.
+    # Kerakli ustunlarni qo'shamiz; eski majburiy amount ustunini saqlab qolamiz.
+    payment_columns = {
+        r["name"]
+        for r in c.execute("PRAGMA table_info(payments)").fetchall()
+    }
+    payment_migrations = {
+        # Eski bazalarda amount ustuni NOT NULL bo'lishi mumkin.
+        # Yangi va eski sxemalarni bir xil ishlashi uchun ikkala summa ustuni saqlanadi.
+        "amount": "REAL DEFAULT 0",
+        "requested_amount": "REAL DEFAULT 0",
+        "approved_amount": "REAL DEFAULT 0",
+        "photo_id": "TEXT DEFAULT ''",
+        "status": "TEXT DEFAULT 'pending'",
+        "created_at": "TEXT DEFAULT ''",
+        "approved_at": "TEXT DEFAULT ''",
+    }
+    for column, definition in payment_migrations.items():
+        if column not in payment_columns:
+            c.execute(
+                f"ALTER TABLE payments ADD COLUMN {column} {definition}"
+            )
     c.commit()
     c.close()
 
@@ -1124,6 +1147,7 @@ def ensure_external_schema():
         additions = {
             # Older PostgreSQL databases may have an orders table created by a previous version.
             # Add every column used by current order flows before handlers start.
+            "bot_id": "BIGINT NOT NULL DEFAULT 0",
             "user_id": "BIGINT",
             "playpay_order_id": "TEXT DEFAULT ''",
             "game_id": "BIGINT DEFAULT 0",
@@ -1138,7 +1162,7 @@ def ensure_external_schema():
             "created_at": "TEXT DEFAULT ''",
             "updated_at": "TEXT DEFAULT ''",
             "notified": "TEXT DEFAULT '0'",
-            "provider": "TEXT DEFAULT 'playpay'",
+            "provider": "TEXT DEFAULT 'bay2game'",
             "service_type": "TEXT DEFAULT ''",
             "target": "TEXT DEFAULT ''",
             "quantity": "DOUBLE PRECISION DEFAULT 0",
@@ -1148,11 +1172,6 @@ def ensure_external_schema():
         for name, typ in additions.items():
             if name not in existing:
                 c.execute(f"ALTER TABLE orders ADD COLUMN {name} {typ}")
-
-        # Eski bazalarda payments.requested_amount ustuni bo'lmasligi mumkin.
-        payment_columns = {r["name"] for r in c.execute("PRAGMA table_info(payments)").fetchall()}
-        if "requested_amount" not in payment_columns:
-            c.execute("ALTER TABLE payments ADD COLUMN requested_amount DOUBLE PRECISION DEFAULT 0")
 
         # Bay2Game uses string game_code/product_code; map them to internal numeric IDs.
         for table, cols in {
@@ -1230,13 +1249,22 @@ def ensure_external_schema():
 def token_cipher():
     if Fernet is None:
         raise RuntimeError("cryptography o'rnatilmagan. requirements.txt ga cryptography qo'shing.")
-    raw = os.getenv("BOT_TOKEN_ENCRYPTION_KEY", "").strip()
+    # Eski Render sozlamalarida ENCRYPTION_KEY nomi ishlatilgan.
+    # Yangi nom ham qo'llab-quvvatlanadi; mavjud kalitni almashtirmang.
+    raw = (
+        os.getenv("BOT_TOKEN_ENCRYPTION_KEY", "").strip()
+        or os.getenv("ENCRYPTION_KEY", "").strip()
+    )
     if not raw:
+        # Faqat ilgari ham shu fallback bilan shifrlangan eski o'rnatmalar uchun.
         raw = base64.urlsafe_b64encode(hashlib.sha256(BOT_TOKEN.encode()).digest()).decode()
     try:
         return Fernet(raw.encode())
-    except Exception:
-        raise RuntimeError("BOT_TOKEN_ENCRYPTION_KEY noto'g'ri Fernet key.")
+    except Exception as e:
+        raise RuntimeError(
+            "Fernet kaliti noto'g'ri. Render Environment'da "
+            "ENCRYPTION_KEY yoki BOT_TOKEN_ENCRYPTION_KEY qiymatini tekshiring."
+        ) from e
 
 
 def encrypt_token(token):
@@ -1244,7 +1272,13 @@ def encrypt_token(token):
 
 
 def decrypt_token(value):
-    return token_cipher().decrypt(value.encode()).decode()
+    try:
+        return token_cipher().decrypt(value.encode()).decode()
+    except InvalidToken as e:
+        raise RuntimeError(
+            "Child bot tokenini ochib bo'lmadi: ENCRYPTION_KEY avvalgi kalit bilan "
+            "bir xil emas yoki token_enc buzilgan. Eski kalitni Render'da tiklang."
+        ) from e
 
 
 def child_bot_row(bot_id):
@@ -1508,8 +1542,9 @@ async def manage_child_bots(context):
 
             if bot_id not in CHILD_APPS:
                 await start_child_bot(bot_id)
-        except Exception:
-            log.exception("Child bot start xatosi")
+        except Exception as e:
+            # Bitta noto'g'ri shifrlangan token scheduler'ni to'xtatmasin.
+            log.error("Child bot %s start bo'lmadi: %s", bot_id, e)
 
 
 def build_application(token, child=False):
@@ -1955,6 +1990,13 @@ async def bay2game_telegram_confirm(update, context):
             game_name=game_name, product_name=product_name, price=price,
             started_at=started_at, order_id=order_id, http_status=api_status,
             api_data=api_data, balance_action=f"-{price:,.0f} so'm (xarid)",
+        )
+        await notify_order_channel(
+            context,
+            f"⭐ TELEGRAM BUYURTMA #{order_id}\n\n"
+            f"👤 Telegram ID: {uid}\n📨 Qabul qiluvchi: @{username}\n"
+            f"📦 {game_name} — {product_name}\n💰 {price:,.0f} so'm\n"
+            f"📊 Holat: {final_status}\n🕒 {started_at}"
         )
         context.user_data.clear()
     except Exception as exc:
@@ -2435,22 +2477,71 @@ def get_packages_api(game_id):
 
 
 def playpay_check_id(game_id, player_id, server_id=None, charname=None):
-    """Faqat kiritilgan ID mavjudligini tekshiradi; o'yinchi nickini tasdiqlamaydi.
-
-    Hozirgi buyurtma API adapterida ID->nickname tekshiruv endpointi yo'q.
-    Shuning uchun IDni nickname deb ko'rsatish yoki valid=True deb yolg'on
-    tasdiqlash mumkin emas.
-    """
+    """Faqat o'yinchi ID/nikini tekshiradi. PlayPay katalogi yoki buyurtma API ishlatilmaydi."""
     player_id = str(player_id or "").strip()
     if not player_id:
         return 400, {"ok": False, "valid": False, "error": "Player ID kiritilmagan."}
-    return 200, {
-        "ok": True,
-        "valid": None,
-        "player_name": "",
-        "message": "Nickname tekshiruvi bu API orqali qo'llab-quvvatlanmaydi.",
-        "validation_supported": False,
-    }
+    if not PLAYPAY_API_KEY:
+        return 503, {"ok": False, "valid": False, "error": "ID tekshirish sozlanmagan."}
+
+    try:
+        c = main_conn()
+        local_game = c.execute(
+            "SELECT name, provider_game_code FROM games WHERE game_id=? LIMIT 1",
+            (int(game_id),)
+        ).fetchone()
+        c.close()
+        if not local_game:
+            return 404, {"ok": False, "valid": False, "error": "O'yin katalogda topilmadi."}
+
+        game_name = str(local_game["name"] or "").strip().lower()
+        game_code = str(local_game["provider_game_code"] or "").strip().lower()
+        if not game_code:
+            if "pubg" in game_name:
+                game_code = "pubgm"
+            elif "mobile legends" in game_name or "mlbb" in game_name:
+                game_code = "mlbb"
+            elif "free fire" in game_name:
+                game_code = "freefire"
+            else:
+                return 400, {"ok": False, "valid": False, "error": "Bu o'yin uchun tekshiruv kodi sozlanmagan."}
+
+        payload = {"game": game_code, "user_id": player_id}
+        if server_id:
+            payload["server_id"] = str(server_id).strip()
+        if charname:
+            payload["charname"] = str(charname).strip()
+
+        response = requests.post(
+            f"{PLAYPAY_BASE}/games/checkPlayerId",
+            headers={"X-API-Key": PLAYPAY_API_KEY, "Accept": "application/json", "Content-Type": "application/json"},
+            json=payload,
+            timeout=25,
+        )
+        try:
+            data = response.json()
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        if response.status_code >= 400:
+            return response.status_code, {"ok": False, "valid": False, "error": str(data.get("message") or data.get("error") or "ID tekshirilmadi.")}
+
+        valid_value = data.get("valid")
+        valid = (str(valid_value).strip().lower() == "valid") if isinstance(valid_value, str) else bool(valid_value)
+        return response.status_code, {
+            "ok": True,
+            "valid": valid,
+            "player_name": str(data.get("name") or "").strip(),
+            "game_code": game_code,
+            "player_id": player_id,
+        }
+    except requests.RequestException as exc:
+        log.warning("ID tekshirish tarmoq xatosi: %s", type(exc).__name__)
+        return 0, {"ok": False, "valid": False, "error": "ID tekshirish vaqtida aloqa xatosi."}
+    except Exception:
+        log.exception("ID tekshirish ichki xatosi")
+        return 0, {"ok": False, "valid": False, "error": "ID tekshirishda ichki xatolik."}
 
 
 def bay2game_create_order(product_code, player_id, server_id=""):
@@ -2474,23 +2565,13 @@ def bay2game_create_order(product_code, player_id, server_id=""):
         error_text = str(
             raw.get("error") or raw.get("message") or
             nested.get("error") or nested.get("message") or
-            f"Buyurtma javobi noaniq (HTTP {status}, status={order_status})."
+            f"Buyurtma rad etildi (HTTP {status}, status={order_status})."
         )
-        # Tarmoq uzilishi/timeout yoki server xatosi buyurtma qabul qilinmaganini
-        # isbotlamaydi. Shu reference bilan tekshirish uchun processing holatida saqlaymiz.
-        uncertain = (status == 0 or status in (408, 425, 429) or status >= 500)
-        if uncertain:
-            log.warning("Bay2Game javobi noaniq; refund qilinmaydi: HTTP=%s ref=%s", status, reference)
-            return status, {
-                "ok": True, "uncertain": True, "order_id": reference,
-                "reference": reference, "status": "processing", "error": error_text,
-                "price": {"amount": 0}, "charged": {"amount": 0}, "raw": raw,
-            }
         log.error(
             "Avtomatik buyurtma API tomonidan rad etildi: HTTP=%s status=%s error=%s response_keys=%s",
             status, order_status, error_text[:500], list(raw.keys())
         )
-        return status, {"ok": False, "error": error_text, "reference": reference, "raw": raw}
+        return status, {"ok": False, "error": error_text, "raw": raw}
     provider_reference = str(payload.get("reference") or nested.get("reference") or raw.get("reference") or reference)
     normalized_status = "success" if order_status in ("success", "completed", "complete", "done") else "processing"
     return status, {
@@ -3734,19 +3815,8 @@ async def grand_confirm(update, context):
 
     add_balance(uid, -price, "order_hold", f"Grand Mobile manual: {gc} GC")
 
-    c = conn()
-    cur = c.execute(
-        """INSERT INTO orders
-        (user_id,playpay_order_id,game_id,paket_id,product_name,player_id,fields_json,
-         cost_usd,charged_usd,sale_price,status,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (uid, "MANUAL", GRAND_MOBILE_GAME_ID, gc, f"Grand Mobile {gc} GC",
-         player_id, json.dumps({"grand_gc": gc, "manual": True}, ensure_ascii=False),
-         0, 0, float(price), "manual_pending", datetime.now().isoformat(), datetime.now().isoformat())
-    )
-    order_id = cur.lastrowid
-    c.commit()
-    c.close()
+    # Buyurtma bazaga yozilmaydi: faqat mijoz va buyurtmalar kanaliga yuboriladi.
+    order_id = "MANUAL"
 
     context.user_data.clear()
 
@@ -3772,6 +3842,14 @@ async def grand_confirm(update, context):
         )
     except Exception:
         log.exception("Grand Mobile admin xabari xatosi")
+
+    await notify_order_channel(
+        context,
+        f"🚗 YANGI GRAND MOBILE BUYURTMA #{order_id}\n\n"
+        f"👤 Telegram ID: {uid}\n📦 {gc} GC\n"
+        f"🆔 Grand Mobile ID: {player_id}\n💰 {price:,.0f} so'm\n"
+        "📊 Holat: manual_pending"
+    )
 
 
 # ============================================================
@@ -4420,27 +4498,6 @@ async def confirm(update, context):
             reply_markup=main_menu()
         )
 
-        try:
-            tg_user = q.from_user
-            uname = f"@{tg_user.username}" if getattr(tg_user, "username", None) else "username yo'q"
-            await context.bot.send_message(
-                chat_id=bot_admin_id(context),
-                text=(
-                    "⚠️ BUYURTMA XATOSI / PUL QAYTARILDI\n\n"
-                    f"👤 Foydalanuvchi: {tg_user.full_name} ({uname})\n"
-                    f"🆔 Telegram ID: {uid}\n"
-                    f"🎮 O'yin ID: {game_id} | Paket ID: {paket_id}\n"
-                    f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
-                    f"🆔 Player ID: {player_id}\n"
-                    f"🌐 Server ID: {server_id or '-'}\n"
-                    f"💰 Summa: {price:,.0f} so'm\n"
-                    f"📊 HTTP: {status}\n"
-                    f"🔎 Xato: {str(data.get('error') or data.get('message') or "Noma'lum")[:500]}\n"
-                    "💳 Holat: pul balansga qaytarildi"
-                )
-            )
-        except Exception:
-            log.exception("Admin buyurtma xabari yuborilmadi")
         await notify_bot_owner_technical(
             context,
             uid,
@@ -4495,58 +4552,8 @@ async def confirm(update, context):
         )
     )
 
-    c = conn()
-
-    cur = c.execute(
-        """
-        INSERT INTO orders
-        (
-            user_id,
-            playpay_order_id,
-            game_id,
-            paket_id,
-            product_name,
-            player_id,
-            fields_json,
-            cost_usd,
-            charged_usd,
-            sale_price,
-            status,
-            created_at,
-            updated_at
-        )
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            uid,
-            str(playpay_id),
-            int(game_id),
-            int(paket_id),
-            context.user_data.get(
-                "offer_name",
-                "Paket"
-            ),
-            player_id,
-            json.dumps(
-                {
-                    "player_id": player_id,
-                    "server_id": server_id
-                },
-                ensure_ascii=False
-            ),
-            float(cost_usd),
-            float(charged_usd),
-            float(price),
-            order_status,
-            datetime.now().isoformat(),
-            datetime.now().isoformat()
-        )
-    )
-
-    local_order_id = cur.lastrowid
-
-    c.commit()
-    c.close()
+    # Buyurtma bazaga yozilmaydi. Provayder IDsi xabar uchun ishlatiladi.
+    local_order_id = str(playpay_id or "QABUL QILINDI")
 
     id_label = context.user_data.get(
         "id_label",
@@ -4571,6 +4578,25 @@ async def confirm(update, context):
         f"📊 Status: {order_status}",
         reply_markup=main_menu()
     )
+
+    # Har bir o'yin buyurtmasi kanalga ham yuboriladi.
+    try:
+        _tg_user = q.from_user
+        _game_title = str(context.user_data.get("game_name") or context.user_data.get("offer_game_name") or context.user_data.get("selected_game_name") or f"O'yin {game_id}")
+        _channel_username = f"@{_tg_user.username}" if getattr(_tg_user, "username", None) else "username yo'q"
+        _channel_notice = (
+            f"🛒 YANGI BUYURTMA #{local_order_id}\n\n"
+            f"👤 Mijoz: {getattr(_tg_user, 'full_name', 'User')}\n"
+            f"🔗 Username: {_channel_username}\n🆔 Telegram ID: {uid}\n"
+            f"🎮 Xizmat: {_game_title}\n"
+            f"📦 Paket: {context.user_data.get('offer_name', 'Paket')}\n"
+            f"🆔 O'yinchi ID: {player_id}\n"
+            + (f"🌐 Server ID: {server_id}\n" if requires_server else "")
+            + f"💰 Summa: {price:,.0f} so'm\n🔢 Bay2Game ID: {playpay_id or '-'}\n📊 Holat: {order_status}"
+        )
+        await notify_order_channel(context, _channel_notice)
+    except Exception:
+        log.exception("Buyurtmani kanalga tayyorlashda xato")
 
     # ========================================================
     # ADMIN: batafsil buyurtma hisoboti
@@ -4743,14 +4769,199 @@ async def deposit(update, context):
         "Masalan: 50000",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "❌ Bekor qilish",
-                    callback_data="cancel"
-                )
-            ]
+            [InlineKeyboardButton("⚡ Uzcard avtomatik to'lov", callback_data="uzcard")],
+            [InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel")]
         ])
     )
+
+
+async def uzcard_start(update, context):
+    """Uzcard auto-topup amount prompt."""
+    q = update.callback_query
+    if not q:
+        return
+    if int(getattr(context.bot, "id", 0) or 0) != int(MAIN_BOT_ID or 0):
+        await q.message.reply_text("❌ Avtomatik Uzcard to'lov faqat asosiy Donuz botida ishlaydi.")
+        return
+    context.user_data["state"] = "uzcard_amount"
+    await q.message.reply_text(
+        "💳 <b>Uzcard avtomatik to'lov</b>\n\n"
+        "Balansingizni necha so'mga to'ldirmoqchisiz?\n"
+        "📌 Minimal miqdor: <b>3 000 so'm</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_pay")]])
+    )
+
+
+def _uzcard_post_check(payload):
+    """Run the provider request in a worker thread so the bot event loop stays responsive."""
+    url = os.getenv("UZCARD_CHECK_URL", "https://dcn268.wineclo.com/avtotolov/chek.php").strip()
+    response = requests.post(url, data=payload, timeout=8)
+    response.raise_for_status()
+    return response.json()
+
+
+async def uzcard_wait_payment(update, context, requested_amount):
+    u = update.effective_user
+    ensure_user(u)
+    shop_id = os.getenv("UZCARD_SHOP_ID", "1").strip()
+    shop_key = os.getenv("UZCARD_SHOP_KEY", "").strip()
+    card_number = os.getenv("UZCARD_CARD_NUMBER", "").strip() or str(get_setting("payment_card", PAYMENT_CARD) or "").strip()
+    owner = os.getenv("UZCARD_CARD_OWNER", "Karta egasi").strip()
+    card_digits = re.sub(r"\D", "", card_number)
+    card_last4 = os.getenv("UZCARD_CARD_LAST4", "").strip() or card_digits[-4:]
+
+    if not shop_key or not card_number or len(card_last4) != 4:
+        context.user_data.pop("state", None)
+        await update.message.reply_text(
+            "❌ Avtomatik to'lov sozlanmagan. Admin Render Environment bo'limida "
+            "UZCARD_SHOP_KEY, UZCARD_CARD_NUMBER va kerakli sozlamalarni kiritsin."
+        )
+        return
+
+    # Unique amount is persisted in DB, not kept only in RAM; it survives Render restarts.
+    c = main_conn()
+    final_amount = int(requested_amount)
+    try:
+        for _ in range(1000):
+            try:
+                c.execute(
+                    "INSERT INTO uzcard_auto_payments(final_amount,user_id,requested_amount,status,created_at) VALUES(?,?,?,'pending',?)",
+                    (final_amount, int(u.id), int(requested_amount), datetime.now().isoformat())
+                )
+                c.commit()
+                break
+            except Exception as exc:
+                c.rollback()
+                row = c.execute("SELECT final_amount FROM uzcard_auto_payments WHERE final_amount=?", (final_amount,)).fetchone()
+                if row:
+                    final_amount += 1
+                    continue
+                raise exc
+        else:
+            raise RuntimeError("Noyob to'lov summasi ajratilmadi")
+    finally:
+        c.close()
+
+    context.user_data["state"] = "uzcard_waiting"
+    context.user_data["uzcard_final_amount"] = final_amount
+    context.user_data["uzcard_requested_amount"] = int(requested_amount)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Bekor qilish", callback_data="cancel_pay")]])
+    pay_msg = await update.message.reply_text(
+        "📋 <b>To'lov ma'lumotlari</b>\n\n"
+        f"💵 To'lanadi: <code>{final_amount}</code> so'm\n"
+        f"💳 Karta: <code>{card_number}</code>\n"
+        f"👤 Karta egasi: {owner}\n\n"
+        f"⚠️ Aynan <b>{final_amount:,} so'm</b> o'tkazing.\n"
+        "⏳ To'lov 5 daqiqa davomida tekshiriladi.",
+        parse_mode="HTML", reply_markup=kb
+    )
+    payload = {"amount": str(final_amount), "shop_id": shop_id, "shop_key": shop_key, "card": card_last4}
+    # Poll in the background. The bot can continue handling messages and the cancel button.
+    context.application.create_task(
+        uzcard_poll_payment(
+            context.bot, context.user_data, int(update.effective_chat.id), int(u.id),
+            int(requested_amount), final_amount, payload, pay_msg
+        ),
+        update=update,
+        name=f"uzcard-payment-{final_amount}"
+    )
+
+
+async def uzcard_poll_payment(bot, user_data, chat_id, user_id, requested_amount, final_amount, payload, pay_msg):
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    try:
+        while loop.time() - started < 300:
+            await asyncio.sleep(10)
+            if user_data.get("state") != "uzcard_waiting" or int(user_data.get("uzcard_final_amount") or 0) != final_amount:
+                return
+            try:
+                result = await asyncio.to_thread(_uzcard_post_check, payload)
+                if isinstance(result, dict) and str(result.get("status", "")).lower() == "success":
+                    c = main_conn()
+                    try:
+                        cur = c.execute(
+                            "UPDATE uzcard_auto_payments SET status='success', paid_at=? WHERE final_amount=? AND user_id=? AND status='pending'",
+                            (datetime.now().isoformat(), final_amount, user_id)
+                        )
+                        if cur.rowcount == 1:
+                            c.execute("UPDATE users SET balance=balance+? WHERE user_id=?", (requested_amount, user_id))
+                            c.execute("INSERT INTO balance_history(user_id,amount,type,note,created_at) VALUES(?,?,?,?,?)",
+                                      (user_id, requested_amount, "uzcard_auto", f"Uzcard avtomatik to'lov #{final_amount}", datetime.now().isoformat()))
+                            cols = {str(r["name"]) for r in c.execute("PRAGMA table_info(payments)").fetchall()}
+                            vals = {
+                                "user_id": user_id, "amount": float(requested_amount),
+                                "requested_amount": float(requested_amount), "approved_amount": float(requested_amount),
+                                "photo_id": f"UZCARD_AUTO:{final_amount}", "status": "approved",
+                                "created_at": datetime.now().isoformat(), "approved_at": datetime.now().isoformat(),
+                            }
+                            names = [k for k in vals if k in cols]
+                            c.execute(
+                                f"INSERT INTO payments ({','.join(chr(34)+k+chr(34) for k in names)}) VALUES ({','.join('?' for _ in names)})",
+                                tuple(vals[k] for k in names)
+                            )
+                            c.commit()
+                        else:
+                            c.rollback()
+                            return
+                    except Exception:
+                        c.rollback()
+                        raise
+                    finally:
+                        c.close()
+                    user_data.pop("state", None)
+                    user_data.pop("uzcard_final_amount", None)
+                    user_data.pop("uzcard_requested_amount", None)
+                    try:
+                        await pay_msg.delete()
+                    except Exception:
+                        pass
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=("✅ <b>To'lov muvaffaqiyatli qabul qilindi!</b>\n"
+                              f"💰 Balansga qo'shildi: {requested_amount:,} so'm\n"
+                              f"💳 Joriy balans: {get_balance(user_id):,.0f} so'm"),
+                        parse_mode="HTML", reply_markup=main_menu()
+                    )
+                    return
+            except Exception as exc:
+                log.warning("Uzcard tekshiruv xatosi: %s", exc)
+    finally:
+        if user_data.get("state") == "uzcard_waiting" and int(user_data.get("uzcard_final_amount") or 0) == final_amount:
+            c = main_conn()
+            try:
+                c.execute("UPDATE uzcard_auto_payments SET status='expired' WHERE final_amount=? AND status='pending'", (final_amount,))
+                c.commit()
+            finally:
+                c.close()
+            user_data.pop("state", None)
+            user_data.pop("uzcard_final_amount", None)
+            user_data.pop("uzcard_requested_amount", None)
+            try:
+                await pay_msg.edit_text("⏳ To'lov vaqti tugadi. Balansga pul qo'shilmadi. Qaytadan urinib ko'ring.")
+            except Exception:
+                pass
+
+
+async def uzcard_cancel(update, context):
+    q = update.callback_query
+    amount = context.user_data.get("uzcard_final_amount")
+    if amount:
+        c = main_conn()
+        try:
+            c.execute("UPDATE uzcard_auto_payments SET status='cancelled' WHERE final_amount=? AND user_id=? AND status='pending'", (int(amount), int(q.from_user.id)))
+            c.commit()
+        finally:
+            c.close()
+    context.user_data.pop("state", None)
+    context.user_data.pop("uzcard_final_amount", None)
+    context.user_data.pop("uzcard_requested_amount", None)
+    try:
+        await q.message.delete()
+    except Exception:
+        pass
+    await q.answer("To'lov bekor qilindi.", show_alert=False)
 
 
 # ============================================================
@@ -4993,6 +5204,24 @@ async def text_handler(update, context):
         return
 
     # ========================================================
+    # UZCARD AUTO TOP-UP AMOUNT
+    # ========================================================
+
+    if state == "uzcard_amount":
+        try:
+            raw_amount = text.replace(",", "").replace(" ", "").replace("so'm", "").replace("so‘m", "")
+            amount = Decimal(raw_amount)
+        except (InvalidOperation, ValueError):
+            await update.message.reply_text("❌ Summani raqamda yuboring. Masalan: 50000")
+            return
+        if amount != amount.to_integral_value() or amount < 3000 or amount > 1000000000:
+            await update.message.reply_text("❌ Minimal summa 3 000 so'm. Butun son kiriting.")
+            return
+        context.user_data["state"] = None
+        await uzcard_wait_payment(update, context, int(amount))
+        return
+
+    # ========================================================
     # DEPOSIT
     # ========================================================
 
@@ -5173,9 +5402,9 @@ async def text_handler(update, context):
             context.user_data.get("server_id", "")
         ).strip()
 
-        if not BAY2GAME_API_KEY:
+        if not PLAYPAY_API_KEY:
             await update.message.reply_text(
-                "❌ Xizmat vaqtincha sozlanmagan. Iltimos, keyinroq qayta urinib ko'ring."
+                "❌ ID tekshirish xizmati sozlanmagan. Administrator PLAYPAY_API_KEY ni Render Environment'ga qo'shishi kerak."
             )
             context.user_data["state"] = None
             return
@@ -5188,7 +5417,8 @@ async def text_handler(update, context):
             playpay_check_id,
             game_id,
             player_id,
-            server_id if server_id else None
+            server_id if server_id else None,
+            context.user_data.get("charname") or None
         )
 
         if not isinstance(data, dict):
@@ -5201,7 +5431,7 @@ async def text_handler(update, context):
         if data.get("ok") is False:
             error = str(data.get("error") or data.get("message") or "Tekshiruv xatosi")
             await update.message.reply_text(
-                f"❌ ID tekshirilmadi.\n\n{error}"
+                "❌ ID tekshirilmadi.\n\nID yoki server ma'lumotlarini tekshirib, qayta urinib ko'ring."
             )
             context.user_data["state"] = None
             return
@@ -5355,30 +5585,71 @@ async def photo_handler(update, context):
 
     c = conn()
 
-    cur = c.execute(
-        """
-        INSERT INTO payments
-        (
-            user_id,
-            requested_amount,
-            photo_id,
-            status,
-            created_at
-        )
-        VALUES (?,?,?,'pending',?)
-        """,
-        (
-            u.id,
-            float(amount),
-            photo_id,
-            datetime.now().isoformat()
-        )
-    )
+    try:
+        # Eski va yangi DB sxemalarini qo'llab-quvvatlaymiz:
+        # eski bazada amount NOT NULL bo'lsa ham, ikkala summa ustuniga qiymat yoziladi.
+        payment_columns = {
+            str(r["name"])
+            for r in c.execute("PRAGMA table_info(payments)").fetchall()
+        }
 
-    pid = cur.lastrowid
+        payment_values = {
+            "user_id": int(u.id),
+            "amount": float(amount),
+            "requested_amount": float(amount),
+            "approved_amount": 0.0,
+            "photo_id": str(photo_id),
+            "status": "pending",
+            "created_at": datetime.now().isoformat(),
+            "approved_at": None,
+        }
 
-    c.commit()
-    c.close()
+        insert_columns = [
+            name for name in payment_values
+            if name in payment_columns
+        ]
+
+        required_columns = {"user_id", "photo_id", "status", "created_at"}
+        if not required_columns.issubset(set(insert_columns)):
+            raise RuntimeError(
+                "payments jadvalida kerakli ustunlar yo'q: "
+                + ", ".join(sorted(required_columns - set(insert_columns)))
+            )
+
+        # Ustunlar, placeholderlar va qiymatlar bir ro'yxatdan tuziladi:
+        # parametrlar soni SQL placeholderlari soniga doim teng bo'ladi.
+        columns_sql = ",".join('"' + name.replace('"', '""') + '"' for name in insert_columns)
+        placeholders = ",".join("?" for _ in insert_columns)
+        values = tuple(payment_values[name] for name in insert_columns)
+
+        cur = c.execute(
+            f"INSERT INTO payments ({columns_sql}) VALUES ({placeholders})",
+            values
+        )
+        pid = cur.lastrowid
+        if pid is None:
+            row = c.execute("SELECT id FROM payments WHERE user_id=? AND photo_id=? ORDER BY id DESC LIMIT 1", (u.id, photo_id)).fetchone()
+            pid = row["id"] if row else None
+        if pid is None:
+            raise RuntimeError("To'lov yozildi, lekin payment ID olinmadi")
+
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        log.exception("Balans to'ldirish chekini bazaga yozishda xatolik: %s", e)
+        await update.message.reply_text(
+            "❌ Chekni bazaga saqlashda xatolik yuz berdi. "
+            "Chek yuborilmadi, iltimos qayta urinib ko'ring yoki adminga yozing."
+        )
+        return
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
 
     await update.message.reply_text(
         "✅ Chek adminga yuborildi.\n\n"
@@ -7130,10 +7401,10 @@ async def check_orders(context):
         """
         SELECT *
         FROM orders
-        WHERE status IN
-        ('processing','pending')
-          AND playpay_order_id IS NOT NULL
-          AND playpay_order_id!=''
+        WHERE LOWER(status) IN ('processing','pending','in_progress')
+          AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) IS NOT NULL
+          AND COALESCE(NULLIF(provider_order_id,''), NULLIF(playpay_order_id,'')) != ''
+          AND COALESCE(provider,'bay2game') = 'bay2game'
         ORDER BY id ASC
         LIMIT 30
         """
@@ -7147,7 +7418,7 @@ async def check_orders(context):
 
             status, data = await asyncio.to_thread(
                 get_playpay_order,
-                r["playpay_order_id"]
+                (r["provider_order_id"] if r["provider_order_id"] else r["playpay_order_id"])
             )
 
             if not data.get("ok"):
@@ -7159,12 +7430,15 @@ async def check_orders(context):
                 data
             )
 
-            new_status = order.get(
-                "status",
-                r["status"]
-            )
+            new_status = str(order.get("status", r["status"]) or r["status"]).lower()
+            if new_status in ("completed", "complete", "done", "success"):
+                new_status = "success"
+            elif new_status in ("failed", "failure", "rejected", "cancelled", "canceled"):
+                new_status = "failed"
+            elif new_status in ("pending", "processing", "in_progress", "queued"):
+                new_status = "processing" if new_status != "pending" else "pending"
 
-            if new_status == r["status"]:
+            if new_status == str(r["status"]).lower():
 
                 continue
 
@@ -7192,22 +7466,6 @@ async def check_orders(context):
                 f"📦 Buyurtma #{r['id']}\n\n"
                 f"📊 Yangi status: {new_status}"
             )
-            try:
-                await context.bot.send_message(
-                    chat_id=bot_admin_id(context),
-                    text=(
-                        f"🔔 BUYURTMA HOLATI O'ZGARDI #{r['id']}\n\n"
-                        f"👤 Foydalanuvchi ID: {r['user_id']}\n"
-                        f"🎮 O'yin ID: {r['game_id']}\n"
-                        f"📦 Paket: {r['product_name']}\n"
-                        f"🆔 Player ID: {r['player_id']}\n"
-                        f"🔢 Provayder ID: {r['playpay_order_id']}\n"
-                        f"📊 Yangi holat: {new_status}\n"
-                        f"🕒 Vaqt: {datetime.now(ZoneInfo('Asia/Tashkent')).strftime('%Y-%m-%d %H:%M:%S')}"
-                    )
-                )
-            except Exception:
-                log.exception("Admin status xabari yuborilmadi")
 
         except Exception as e:
 
@@ -7650,6 +7908,11 @@ async def callback_router(update, context):
 
     d = q.data
 
+    if d == "uzcard":
+        return await uzcard_start(update, context)
+    if d == "cancel_pay":
+        return await uzcard_cancel(update, context)
+
     # Foydalanuvchilar o'rtasida pul o'tkazish
     if d == "transfer_start":
         ensure_user(q.from_user)
@@ -8065,6 +8328,24 @@ def main():
     me = rr.json()["result"]
     MAIN_BOT_ID = int(me["id"])
     MAIN_BOT_USERNAME = me.get("username", "")
+
+    # WEB_APP_URL berilsa Telegram bot menyusiga Mini App tugmasi avtomatik ulanadi.
+    web_app_url = os.getenv("WEB_APP_URL", "").strip()
+    if web_app_url.startswith("https://"):
+        try:
+            menu_result = _requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/setChatMenuButton",
+                json={"menu_button": {"type": "web_app", "text": "Donuz Mini App", "web_app": {"url": web_app_url}}},
+                timeout=20,
+            ).json()
+            if menu_result.get("ok"):
+                print("[WEB] Telegram Mini App menyu tugmasi sozlandi")
+            else:
+                log.warning("Mini App menyu tugmasi sozlanmadi: %s", menu_result.get("description"))
+        except Exception as exc:
+            log.warning("Mini App menyu tugmasi xatosi: %s", type(exc).__name__)
+    else:
+        log.warning("WEB_APP_URL HTTPS manzili kiritilmagan; BotFather orqali Mini App URL sozlang")
 
     # Existing child bots are started by the job queue after polling starts.
 
